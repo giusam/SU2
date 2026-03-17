@@ -149,6 +149,13 @@ def build_next_level(prev_level, result):
 
 
 def make_hh_definition(level, scale):
+    """
+    DEFINITION_DV come dict, compatibile con cfg.dump().
+    Per Hicks-Henne:
+      PARAM = [surface_flag, x_location]
+      1.0 = upper
+      0.0 = lower
+    """
     kinds = []
     scales = []
     markers = []
@@ -242,11 +249,14 @@ def write_level_config(base_config, level, opts):
     cfg["DV_VALUE_NEW"] = [0.0] * level.ndv
     cfg["DV_VALUE_OLD"] = [0.0] * level.ndv
 
+    # mesh sorgente locale al livello
     _prepare_local_mesh(cfg, level)
 
+    # restart assoluto solo se presente
     if "RESTART_FILENAME" in cfg and cfg["RESTART_FILENAME"]:
         cfg["RESTART_FILENAME"] = _resolve_from_cfg_dir(base_config, cfg["RESTART_FILENAME"])
 
+    # mesh deformata locale al livello
     mesh_out_base = "mesh_out"
     if "MESH_OUT_FILENAME" in cfg and cfg["MESH_OUT_FILENAME"]:
         mesh_out_base = str(cfg["MESH_OUT_FILENAME"])
@@ -304,29 +314,35 @@ def _read_history_values(history_file):
 def _find_final_mesh(level):
     """
     Cerca la mesh deformata finale prodotta dal livello.
+
     Priorità:
-    1) nella root del livello
-    2) nelle sottocartelle DESIGNS
+    1) mesh deformata nelle sottocartelle DESIGNS
+    2) mesh deformata nella root del livello
+    3) qualsiasi mesh .su2 come fallback
     """
-    candidates = []
+    design_deform = glob.glob(
+        os.path.join(level.workdir, "DESIGNS", "**", "*_deform.su2"),
+        recursive=True,
+    )
+    if design_deform:
+        return sorted(design_deform)[-1]
 
-    # root del livello
-    candidates.extend(glob.glob(os.path.join(level.workdir, "*_deform.su2")))
-    candidates.extend(glob.glob(os.path.join(level.workdir, "*.su2")))
+    design_all = glob.glob(
+        os.path.join(level.workdir, "DESIGNS", "**", "*.su2"),
+        recursive=True,
+    )
+    if design_all:
+        return sorted(design_all)[-1]
 
-    # sottocartelle di design
-    candidates.extend(glob.glob(os.path.join(level.workdir, "DESIGNS", "**", "*_deform.su2"), recursive=True))
-    candidates.extend(glob.glob(os.path.join(level.workdir, "DESIGNS", "**", "*.su2"), recursive=True))
+    root_deform = glob.glob(os.path.join(level.workdir, "*_deform.su2"))
+    if root_deform:
+        return sorted(root_deform)[-1]
 
-    if not candidates:
-        return None
+    root_all = glob.glob(os.path.join(level.workdir, "*.su2"))
+    if root_all:
+        return sorted(root_all)[-1]
 
-    # preferisci mesh deformate
-    deform_candidates = [c for c in candidates if c.endswith("_deform.su2")]
-    if deform_candidates:
-        return sorted(deform_candidates)[-1]
-
-    return sorted(candidates)[-1]
+    return None
 
 
 def collect_level_result(level):

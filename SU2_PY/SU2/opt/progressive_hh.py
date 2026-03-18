@@ -361,7 +361,7 @@ def should_refine(history, opts, level_id):
     if opts["trigger"] == "MAX_ITER":
         return True
 
-    if opts["trigger"] == "WINDOW_DROP":
+    if opts["trigger"] == "STAGNATION_TRIGGER":
         w = opts["window"]
         tol = opts["tol"]
 
@@ -373,7 +373,7 @@ def should_refine(history, opts, level_id):
         rel_drop = abs(j_old - j_new) / max(abs(j_new), 1.0e-14)
         return rel_drop < tol
 
-    if opts["trigger"] == "ANDERSON":
+    if opts["trigger"] == "SLOPE_EFFICIENCY_TRIGGER":
         w = max(1, int(opts["window"]))
         r = float(opts["tol"])
 

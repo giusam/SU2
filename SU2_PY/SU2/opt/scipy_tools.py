@@ -400,7 +400,7 @@ def obj_f(x, project):
         trigger = str(opts.get("trigger", "")).upper()
         history = project.trigger_history
 
-        if trigger == "WINDOW_DROP":
+        if trigger == "STAGNATION_TRIGGER":
             w = max(1, int(opts["window"]))
             tol = float(opts["tol"])
 
@@ -410,17 +410,17 @@ def obj_f(x, project):
                 rel_drop = abs(j_old - j_new) / max(abs(j_new), 1.0e-14)
 
                 sys.stdout.write(
-                    "[PROGRESSIVE_HH] WINDOW_DROP ONLINE | "
+                    "[PROGRESSIVE_HH] STAGNATION ONLINE | "
                     f"rel_drop={rel_drop:.6e} threshold={tol:.6e}\n"
                 )
 
                 if rel_drop < tol:
                     sys.stdout.write(
-                        "[PROGRESSIVE_HH] Window-drop trigger -> STOP\n"
+                        "[PROGRESSIVE_HH] Stagnation trigger -> STOP\n"
                     )
                     raise RefinementTriggered()
 
-        elif trigger == "ANDERSON":
+        elif trigger == "SLOPE_EFFICIENCY_TRIGGER":
             w = max(1, int(opts["window"]))
             r = float(opts["tol"])
 
@@ -441,20 +441,20 @@ def obj_f(x, project):
 
                     if max_slope <= 1.0e-16:
                         sys.stdout.write(
-                            "[PROGRESSIVE_HH] Anderson trigger (flat history) -> STOP\n"
+                            "[PROGRESSIVE_HH] Efficiency trigger (flat history) -> STOP\n"
                         )
                         raise RefinementTriggered()
 
                     ratio = current_slope / max_slope
 
                     sys.stdout.write(
-                        "[PROGRESSIVE_HH] ANDERSON ONLINE | "
+                        "[PROGRESSIVE_HH] SLOPE_EFFICIENCY ONLINE | "
                         f"ratio={ratio:.6e} threshold={r:.6e}\n"
                     )
 
                     if ratio < r:
                         sys.stdout.write(
-                            "[PROGRESSIVE_HH] Anderson trigger -> STOP\n"
+                            "[PROGRESSIVE_HH] Efficiency trigger -> STOP\n"
                         )
                         raise RefinementTriggered()
 

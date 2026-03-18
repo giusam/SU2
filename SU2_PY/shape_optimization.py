@@ -124,30 +124,6 @@ def run_single_level(
     state = SU2.io.State()
     state.find_files(config)
 
-    if (
-        config.get("TIME_DOMAIN", "NO") == "YES"
-        and config.get("RESTART_SOL", "NO") == "YES"
-        and gradient != "CONTINUOUS_ADJOINT"
-    ):
-        restart_name_parts = config["RESTART_FILENAME"].split(".")
-        if restart_name_parts[-1] == ".dat":
-            restart_name = ".".join(restart_name_parts[:-1])
-        else:
-            restart_name = config["RESTART_FILENAME"]
-
-        restart_filename = restart_name + "_" + str(int(config["RESTART_ITER"]) - 1).zfill(5) + ".dat"
-
-        if not os.path.isfile(restart_filename):
-            sys.exit("Error: Restart file <" + restart_filename + "> not found.")
-
-        state["FILES"]["RESTART_FILE_1"] = restart_filename
-
-        if config.get("TIME_MARCHING", "NO") == "DUAL_TIME_STEPPING-2ND_ORDER":
-            restart_filename = restart_name + "_" + str(int(config["RESTART_ITER"]) - 2).zfill(5) + ".dat"
-            if not os.path.isfile(restart_filename):
-                sys.exit("Error: Restart file <" + restart_filename + "> not found.")
-            state["FILES"]["RESTART_FILE_2"] = restart_filename
-
     if projectname and os.path.exists(projectname):
         project = SU2.io.load_data(projectname)
         project.config = config
@@ -180,6 +156,20 @@ def progressive_hh_shape_optimization(
 ):
     base_config = SU2.io.Config(filename)
     hh_opts = get_progressive_hh_options(base_config)
+
+    # =============================================================
+    # CLEAN ALL PREVIOUS LEVEL_* FOLDERS
+    # =============================================================
+    old_levels = [
+        d for d in os.listdir(".")
+        if os.path.isdir(d) and d.startswith("LEVEL_")
+    ]
+
+    if old_levels:
+        sys.stdout.write("\n[PROGRESSIVE_HH] Cleaning previous LEVEL_* folders\n")
+        for d in old_levels:
+            sys.stdout.write(f"[PROGRESSIVE_HH] Removing {d}\n")
+            shutil.rmtree(d)
 
     level = build_initial_level(base_config, hh_opts)
     final_project = None

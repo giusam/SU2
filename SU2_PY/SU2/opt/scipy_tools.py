@@ -396,44 +396,67 @@ def obj_f(x, project):
 
     opts = getattr(project, "trigger_opts", None)
 
-    if opts and opts.get("trigger", "") == "ANDERSON":
-        w = max(1, int(opts["window"]))
-        r = float(opts["tol"])
+    if opts:
+        trigger = str(opts.get("trigger", "")).upper()
         history = project.trigger_history
 
-        if len(history) >= w + 2:
-            smooth = []
-            for i in range(w - 1, len(history)):
-                avg = sum(history[i - w + 1 : i + 1]) / float(w)
-                smooth.append(avg)
+        if trigger == "WINDOW_DROP":
+            w = max(1, int(opts["window"]))
+            tol = float(opts["tol"])
 
-            slopes = []
-            for i in range(1, len(smooth)):
-                dj = smooth[i - 1] - smooth[i]
-                slopes.append(max(dj, 0.0))
-
-            if slopes:
-                max_slope = max(slopes)
-                current_slope = slopes[-1]
-
-                if max_slope <= 1.0e-16:
-                    sys.stdout.write(
-                        "[PROGRESSIVE_HH] Anderson trigger (flat history) -> STOP\n"
-                    )
-                    raise RefinementTriggered()
-
-                ratio = current_slope / max_slope
+            if len(history) >= w + 1:
+                j_old = history[-w - 1]
+                j_new = history[-1]
+                rel_drop = abs(j_old - j_new) / max(abs(j_new), 1.0e-14)
 
                 sys.stdout.write(
-                    "[PROGRESSIVE_HH] ANDERSON ONLINE | "
-                    f"ratio={ratio:.6e} threshold={r:.6e}\n"
+                    "[PROGRESSIVE_HH] WINDOW_DROP ONLINE | "
+                    f"rel_drop={rel_drop:.6e} threshold={tol:.6e}\n"
                 )
 
-                if ratio < r:
+                if rel_drop < tol:
                     sys.stdout.write(
-                        "[PROGRESSIVE_HH] Anderson trigger -> STOP\n"
+                        "[PROGRESSIVE_HH] Window-drop trigger -> STOP\n"
                     )
                     raise RefinementTriggered()
+
+        elif trigger == "ANDERSON":
+            w = max(1, int(opts["window"]))
+            r = float(opts["tol"])
+
+            if len(history) >= w + 2:
+                smooth = []
+                for i in range(w - 1, len(history)):
+                    avg = sum(history[i - w + 1 : i + 1]) / float(w)
+                    smooth.append(avg)
+
+                slopes = []
+                for i in range(1, len(smooth)):
+                    dj = smooth[i - 1] - smooth[i]
+                    slopes.append(max(dj, 0.0))
+
+                if slopes:
+                    max_slope = max(slopes)
+                    current_slope = slopes[-1]
+
+                    if max_slope <= 1.0e-16:
+                        sys.stdout.write(
+                            "[PROGRESSIVE_HH] Anderson trigger (flat history) -> STOP\n"
+                        )
+                        raise RefinementTriggered()
+
+                    ratio = current_slope / max_slope
+
+                    sys.stdout.write(
+                        "[PROGRESSIVE_HH] ANDERSON ONLINE | "
+                        f"ratio={ratio:.6e} threshold={r:.6e}\n"
+                    )
+
+                    if ratio < r:
+                        sys.stdout.write(
+                            "[PROGRESSIVE_HH] Anderson trigger -> STOP\n"
+                        )
+                        raise RefinementTriggered()
 
     return obj
 

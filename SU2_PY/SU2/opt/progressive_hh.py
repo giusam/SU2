@@ -249,14 +249,11 @@ def write_level_config(base_config, level, opts):
     cfg["DV_VALUE_NEW"] = [0.0] * level.ndv
     cfg["DV_VALUE_OLD"] = [0.0] * level.ndv
 
-    # mesh sorgente locale al livello
     _prepare_local_mesh(cfg, level)
 
-    # restart assoluto solo se presente
     if "RESTART_FILENAME" in cfg and cfg["RESTART_FILENAME"]:
         cfg["RESTART_FILENAME"] = _resolve_from_cfg_dir(base_config, cfg["RESTART_FILENAME"])
 
-    # mesh deformata locale al livello
     mesh_out_base = "mesh_out"
     if "MESH_OUT_FILENAME" in cfg and cfg["MESH_OUT_FILENAME"]:
         mesh_out_base = str(cfg["MESH_OUT_FILENAME"])
@@ -375,5 +372,34 @@ def should_refine(history, opts, level_id):
         j_new = history[-1]
         rel_drop = abs(j_old - j_new) / max(abs(j_new), 1.0e-14)
         return rel_drop < tol
+
+    if opts["trigger"] == "ANDERSON":
+        w = max(1, int(opts["window"]))
+        r = float(opts["tol"])
+
+        if len(history) < w + 2:
+            return False
+
+        smooth = []
+        for i in range(w - 1, len(history)):
+            avg = sum(history[i - w + 1 : i + 1]) / float(w)
+            smooth.append(avg)
+
+        slopes = []
+        for i in range(1, len(smooth)):
+            dj = smooth[i - 1] - smooth[i]
+            slopes.append(max(dj, 0.0))
+
+        if not slopes:
+            return False
+
+        current_slope = slopes[-1]
+        max_slope = max(slopes)
+
+        if max_slope <= 1.0e-16:
+            return True
+
+        slope_ratio = current_slope / max_slope
+        return slope_ratio < r
 
     return False

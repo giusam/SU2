@@ -79,6 +79,7 @@ def run_single_level(
     optimization="SLSQP",
     quiet=False,
     nzones=1,
+    trigger_opts=None,
 ):
     config = SU2.io.Config(filename)
 
@@ -130,6 +131,9 @@ def run_single_level(
     else:
         project = SU2.opt.Project(config, state)
 
+    if trigger_opts is not None:
+        project.trigger_opts = dict(trigger_opts)
+
     if optimization == "SLSQP":
         SU2.opt.SLSQP(project, x0, xb, its, accu)
     if optimization == "CG":
@@ -157,9 +161,6 @@ def progressive_hh_shape_optimization(
     base_config = SU2.io.Config(filename)
     hh_opts = get_progressive_hh_options(base_config)
 
-    # =============================================================
-    # CLEAN ALL PREVIOUS LEVEL_* FOLDERS
-    # =============================================================
     old_levels = [
         d for d in os.listdir(".")
         if os.path.isdir(d) and d.startswith("LEVEL_")
@@ -194,6 +195,11 @@ def progressive_hh_shape_optimization(
                 optimization,
                 quiet,
                 nzones,
+                trigger_opts={
+                    "trigger": hh_opts["trigger"],
+                    "window": hh_opts["window"],
+                    "tol": hh_opts["tol"],
+                },
             )
         finally:
             os.chdir(cwd)

@@ -35,6 +35,10 @@ from .. import eval as su2eval
 from numpy import array, zeros
 
 
+class RefinementTriggered(Exception):
+    pass
+
+
 # -------------------------------------------------------------------
 #  Scipy SLSQP
 # -------------------------------------------------------------------
@@ -57,21 +61,17 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
        result - the outputs from scipy.fmin_slsqp
     """
 
-    # import scipy optimizer
     from scipy.optimize import fmin_slsqp
 
-    # handle input cases
     if x0 is None:
         x0 = []
     if xb is None:
         xb = []
 
-    # function handles
     func = obj_f
     f_eqcons = con_ceq
     f_ieqcons = con_cieq
 
-    # gradient handles
     if project.config.get("GRADIENT_METHOD", "NONE") == "NONE":
         fprime = None
         fprime_eqcons = None
@@ -81,16 +81,13 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
         fprime_eqcons = con_dceq
         fprime_ieqcons = con_dcieq
 
-    # number of design variables
     dv_size = project.config["DEFINITION_DV"]["SIZE"]
     n_dv = sum(dv_size)
     project.n_dv = n_dv
 
-    # Initial guess
     if not x0:
         x0 = [0.0] * n_dv
 
-    # prescale x0
     dv_scales = project.config["DEFINITION_DV"]["SCALE"]
     k = 0
     for i, dv_scl in enumerate(dv_scales):
@@ -98,20 +95,16 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
             x0[k] = x0[k] / dv_scl
             k = k + 1
 
-    # scale accuracy
     obj = project.config["OPT_OBJECTIVE"]
     obj_scale = []
     for this_obj in obj.keys():
         obj_scale = obj_scale + [obj[this_obj]["SCALE"]]
 
-    # Only scale the accuracy for single-objective problems:
     if len(obj.keys()) == 1:
         accu = accu * obj_scale[0]
 
-    # scale accuracy
     eps = 1.0e-04
 
-    # optimizer summary
     sys.stdout.write("Sequential Least SQuares Programming (SLSQP) parameters:\n")
     sys.stdout.write(
         "Number of design variables: " + str(len(dv_size)) + " ( " + str(n_dv) + " ) \n"
@@ -124,25 +117,41 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
         "Lower and upper bound for each independent variable: " + str(xb) + "\n\n"
     )
 
-    # Run Optimizer
-    outputs = fmin_slsqp(
-        x0=x0,
-        func=func,
-        f_eqcons=f_eqcons,
-        f_ieqcons=f_ieqcons,
-        fprime=fprime,
-        fprime_eqcons=fprime_eqcons,
-        fprime_ieqcons=fprime_ieqcons,
-        args=(project,),
-        bounds=xb,
-        iter=its,
-        iprint=2,
-        full_output=True,
-        acc=accu,
-        epsilon=eps,
+    project.trigger_history = []
+    if not hasattr(project, "trigger_opts"):
+        project.trigger_opts = {
+            "trigger": "",
+            "window": 1,
+            "tol": 0.1,
+        }
+
+    sys.stdout.write(
+        "[DEBUG] trigger_opts = " + str(project.trigger_opts) + "\n"
     )
 
-    # Done
+    try:
+        outputs = fmin_slsqp(
+            x0=x0,
+            func=func,
+            f_eqcons=f_eqcons,
+            f_ieqcons=f_ieqcons,
+            fprime=fprime,
+            fprime_eqcons=fprime_eqcons,
+            fprime_ieqcons=fprime_ieqcons,
+            args=(project,),
+            bounds=xb,
+            iter=its,
+            iprint=2,
+            full_output=True,
+            acc=accu,
+            epsilon=eps,
+        )
+    except RefinementTriggered:
+        sys.stdout.write(
+            "[PROGRESSIVE_HH] Optimization stopped early due to refinement trigger\n"
+        )
+        outputs = None
+
     return outputs
 
 
@@ -168,45 +177,35 @@ def scipy_cg(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
        result - the outputs from scipy.fmin_slsqp
     """
 
-    # import scipy optimizer
     from scipy.optimize import fmin_cg
 
-    # handle input cases
     if x0 is None:
         x0 = []
     if xb is None:
         xb = []
 
-    # function handles
     func = obj_f
 
-    # gradient handles
     if project.config.get("GRADIENT_METHOD", "NONE") == "NONE":
         fprime = None
     else:
         fprime = obj_df
 
-    # number of design variables
     n_dv = len(project.config["DEFINITION_DV"]["KIND"])
     project.n_dv = n_dv
 
-    # Initial guess
     if not x0:
         x0 = [0.0] * n_dv
 
-    # prescale x0
     dv_scales = project.config["DEFINITION_DV"]["SCALE"]
     x0 = [x0[i] / dv_scl for i, dv_scl in enumerate(dv_scales)]
 
-    # scale accuracy
     obj = project.config["OPT_OBJECTIVE"]
     obj_scale = obj[obj.keys()[0]]["SCALE"]
     accu = accu * obj_scale
 
-    # scale accuracy
     eps = 1.0e-04
 
-    # optimizer summary
     sys.stdout.write("Conjugate gradient (CG) parameters:\n")
     sys.stdout.write("Number of design variables: " + str(n_dv) + "\n")
     sys.stdout.write("Objective function scaling factor: " + str(obj_scale) + "\n")
@@ -217,10 +216,8 @@ def scipy_cg(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
         "Lower and upper bound for each independent variable: " + str(xb) + "\n\n"
     )
 
-    # Evaluate the objective function (only 1st iteration)
     obj_f(x0, project)
 
-    # Run Optimizer
     outputs = fmin_cg(
         x0=x0,
         f=func,
@@ -234,7 +231,6 @@ def scipy_cg(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
         retall=True,
     )
 
-    # Done
     return outputs
 
 
@@ -260,45 +256,35 @@ def scipy_bfgs(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
        result - the outputs from scipy.fmin_slsqp
     """
 
-    # import scipy optimizer
     from scipy.optimize import fmin_bfgs
 
-    # handle input cases
     if x0 is None:
         x0 = []
     if xb is None:
         xb = []
 
-    # function handles
     func = obj_f
 
-    # gradient handles
     if project.config.get("GRADIENT_METHOD", "NONE") == "NONE":
         fprime = None
     else:
         fprime = obj_df
 
-    # number of design variables
     n_dv = len(project.config["DEFINITION_DV"]["KIND"])
     project.n_dv = n_dv
 
-    # Initial guess
     if not x0:
         x0 = [0.0] * n_dv
 
-    # prescale x0
     dv_scales = project.config["DEFINITION_DV"]["SCALE"]
     x0 = [x0[i] / dv_scl for i, dv_scl in enumerate(dv_scales)]
 
-    # scale accuracy
     obj = project.config["OPT_OBJECTIVE"]
     obj_scale = obj[obj.keys()[0]]["SCALE"]
     accu = accu * obj_scale
 
-    # scale accuracy
     eps = 1.0e-04
 
-    # optimizer summary
     sys.stdout.write("Broyden-Fletcher-Goldfarb-Shanno (BFGS) parameters:\n")
     sys.stdout.write("Number of design variables: " + str(n_dv) + "\n")
     sys.stdout.write("Objective function scaling factor: " + str(obj_scale) + "\n")
@@ -309,10 +295,8 @@ def scipy_bfgs(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
         "Lower and upper bound for each independent variable: " + str(xb) + "\n\n"
     )
 
-    # Evaluate the objective function (only 1st iteration)
     obj_f(x0, project)
 
-    # Run Optimizer
     outputs = fmin_bfgs(
         x0=x0,
         f=func,
@@ -326,7 +310,6 @@ def scipy_bfgs(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
         retall=True,
     )
 
-    # Done
     return outputs
 
 
@@ -347,47 +330,36 @@ def scipy_powell(project, x0=None, xb=None, its=100, accu=1e-10, grads=False):
        result - the outputs from scipy.fmin_slsqp
     """
 
-    # import scipy optimizer
     from scipy.optimize import fmin_powell
 
-    # handle input cases
     if x0 is None:
         x0 = []
 
-    # function handles
     func = obj_f
 
-    # number of design variables
     n_dv = len(project.config["DEFINITION_DV"]["KIND"])
     project.n_dv = n_dv
 
-    # Initial guess
     if not x0:
         x0 = [0.0] * n_dv
 
-    # prescale x0
     dv_scales = project.config["DEFINITION_DV"]["SCALE"]
     x0 = [x0[i] / dv_scl for i, dv_scl in enumerate(dv_scales)]
 
-    # scale accuracy
     obj = project.config["OPT_OBJECTIVE"]
     obj_scale = obj[obj.keys()[0]]["SCALE"]
     accu = accu * obj_scale
 
-    # scale accuracy
     eps = 1.0e-04
 
-    # optimizer summary
     sys.stdout.write("Powells method parameters:\n")
     sys.stdout.write("Number of design variables: " + str(n_dv) + "\n")
     sys.stdout.write("Objective function scaling factor: " + str(obj_scale) + "\n")
     sys.stdout.write("Maximum number of iterations: " + str(its) + "\n")
     sys.stdout.write("Requested accuracy: " + str(accu) + "\n")
 
-    # Evaluate the objective function (only 1st iteration)
     obj_f(x0, project)
 
-    # Run Optimizer
     outputs = fmin_powell(
         x0=x0,
         func=func,
@@ -399,7 +371,6 @@ def scipy_powell(project, x0=None, xb=None, its=100, accu=1e-10, grads=False):
         retall=True,
     )
 
-    # Done
     return outputs
 
 
@@ -417,6 +388,52 @@ def obj_f(x, project):
     obj = 0
     for this_obj in obj_list:
         obj = obj + this_obj
+
+    if not hasattr(project, "trigger_history"):
+        project.trigger_history = []
+
+    project.trigger_history.append(obj)
+
+    opts = getattr(project, "trigger_opts", None)
+
+    if opts and opts.get("trigger", "") == "ANDERSON":
+        w = max(1, int(opts["window"]))
+        r = float(opts["tol"])
+        history = project.trigger_history
+
+        if len(history) >= w + 2:
+            smooth = []
+            for i in range(w - 1, len(history)):
+                avg = sum(history[i - w + 1 : i + 1]) / float(w)
+                smooth.append(avg)
+
+            slopes = []
+            for i in range(1, len(smooth)):
+                dj = smooth[i - 1] - smooth[i]
+                slopes.append(max(dj, 0.0))
+
+            if slopes:
+                max_slope = max(slopes)
+                current_slope = slopes[-1]
+
+                if max_slope <= 1.0e-16:
+                    sys.stdout.write(
+                        "[PROGRESSIVE_HH] Anderson trigger (flat history) -> STOP\n"
+                    )
+                    raise RefinementTriggered()
+
+                ratio = current_slope / max_slope
+
+                sys.stdout.write(
+                    "[PROGRESSIVE_HH] ANDERSON ONLINE | "
+                    f"ratio={ratio:.6e} threshold={r:.6e}\n"
+                )
+
+                if ratio < r:
+                    sys.stdout.write(
+                        "[PROGRESSIVE_HH] Anderson trigger -> STOP\n"
+                    )
+                    raise RefinementTriggered()
 
     return obj
 

@@ -62,7 +62,7 @@ def get_progressive_hh_options(config):
         "max_iter_per_level": int(
             config.get("PROGRESSIVE_HH_MAX_ITER_PER_LEVEL", config.OPT_ITERATIONS)
         ),
-        "marker": "Airfoil",
+        "marker": str(config.get("DV_MARKER", "Airfoil")),
         "scale": scale,
     }
 
@@ -148,7 +148,7 @@ def build_next_level(prev_level, result):
     )
 
 
-def make_hh_definition(level, scale):
+def make_hh_definition(level, scale, marker_name):
     """
     DEFINITION_DV come dict, compatibile con cfg.dump().
     Per Hicks-Henne:
@@ -166,7 +166,7 @@ def make_hh_definition(level, scale):
     for xc in level.upper:
         kinds.append("HICKS_HENNE")
         scales.append(scale)
-        markers.append(["AIRFOIL"])
+        markers.append([str(marker_name)])
         ffdtags.append([""])
         params.append([1.0, float(xc)])
         sizes.append(1)
@@ -174,7 +174,7 @@ def make_hh_definition(level, scale):
     for xc in level.lower:
         kinds.append("HICKS_HENNE")
         scales.append(scale)
-        markers.append(["AIRFOIL"])
+        markers.append([str(marker_name)])
         ffdtags.append([""])
         params.append([0.0, float(xc)])
         sizes.append(1)
@@ -241,9 +241,10 @@ def write_level_config(base_config, level, opts):
     cfg["DEFINITION_DV"] = make_hh_definition(
         level,
         scale=opts["scale"],
+        marker_name=opts["marker"],
     )
 
-    cfg["DV_MARKER"] = "Airfoil"
+    cfg["DV_MARKER"] = str(opts["marker"])
     cfg["DV_KIND"] = "HICKS_HENNE"
 
     cfg["DV_VALUE_NEW"] = [0.0] * level.ndv
@@ -361,7 +362,7 @@ def should_refine(history, opts, level_id):
     if opts["trigger"] == "MAX_ITER":
         return True
 
-    if opts["trigger"] == "STAGNATION_TRIGGER":
+    if opts["trigger"] in ["WINDOW_DROP", "STAGNATION_TRIGGER"]:
         w = opts["window"]
         tol = opts["tol"]
 
@@ -373,7 +374,7 @@ def should_refine(history, opts, level_id):
         rel_drop = abs(j_old - j_new) / max(abs(j_new), 1.0e-14)
         return rel_drop < tol
 
-    if opts["trigger"] == "SLOPE_EFFICIENCY_TRIGGER":
+    if opts["trigger"] in ["ANDERSON", "SLOPE_EFFICIENCY_TRIGGER"]:
         w = max(1, int(opts["window"]))
         r = float(opts["tol"])
 

@@ -195,11 +195,15 @@ def progressive_hh_shape_optimization(
                 optimization,
                 quiet,
                 nzones,
-                trigger_opts={
-                    "trigger": hh_opts["trigger"],
-                    "window": hh_opts["window"],
-                    "tol": hh_opts["tol"],
-                },
+                trigger_opts=(
+                    None
+                    if ilevel == hh_opts["nlevels"] - 1
+                    else {
+                        "trigger": hh_opts["trigger"],
+                        "window": hh_opts["window"],
+                        "tol": hh_opts["tol"],
+                    }
+                ),
             )
         finally:
             os.chdir(cwd)

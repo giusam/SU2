@@ -53,8 +53,6 @@ def get_progressive_hh_options(config):
         "enabled": _as_bool(config.get("PROGRESSIVE_HH", "NO")),
         "nlevels": int(config.get("PROGRESSIVE_HH_NLEVELS", 1)),
         "n0": int(config.get("PROGRESSIVE_HH_N0", 3)),
-        "xmin": float(config.get("PROGRESSIVE_HH_XMIN", 0.05)),
-        "xmax": float(config.get("PROGRESSIVE_HH_XMAX", 0.95)),
         "surface_mode": str(config.get("PROGRESSIVE_HH_SURFACE", "BOTH")).upper(),
         "trigger": str(config.get("PROGRESSIVE_HH_TRIGGER", "MAX_ITER")).upper(),
         "window": int(config.get("PROGRESSIVE_HH_WINDOW", 5)),
@@ -67,15 +65,40 @@ def get_progressive_hh_options(config):
     }
 
 
-def initial_centers(n0, xmin, xmax):
-    if n0 <= 1:
-        return [0.5 * (xmin + xmax)]
+def initial_centers(n0):
+    """
+    Uniform interior points in (0,1):
+    x_i = (i+1)/(n0+1)
+    """
+    if n0 <= 0:
+        return []
 
-    dx = (xmax - xmin) / float(n0 - 1)
-    return [xmin + i * dx for i in range(n0)]
+    return [(i + 1) / float(n0 + 1) for i in range(n0)]
 
 
 def refine_uniform(centers):
+    """
+    Refinement using virtual boundaries at 0 and 1.
+    Add midpoints of:
+    [0, x1], [x1,x2], ..., [xn,1]
+    without ever adding 0 or 1 as centers.
+    """
+    if not centers:
+        return []
+
+    centers = sorted(centers)
+    extended = [0.0] + centers + [1.0]
+
+    new_points = []
+    for i in range(len(extended) - 1):
+        xm = 0.5 * (extended[i] + extended[i + 1])
+        if 0.0 < xm < 1.0:
+            new_points.append(xm)
+
+    return sorted(set(centers + new_points))
+
+
+def _resolve_from_cfg_dir(base_config, filename):
     if len(centers) <= 1:
         return list(centers)
 
@@ -110,10 +133,10 @@ def build_initial_level(base_config, opts):
     lower = []
 
     if opts["surface_mode"] in ("UPPER", "BOTH"):
-        upper = initial_centers(opts["n0"], opts["xmin"], opts["xmax"])
+        upper = initial_centers(opts["n0"])
 
     if opts["surface_mode"] in ("LOWER", "BOTH"):
-        lower = initial_centers(opts["n0"], opts["xmin"], opts["xmax"])
+        lower = initial_centers(opts["n0"])
 
     initial_mesh = None
     if "MESH_FILENAME" in base_config and base_config["MESH_FILENAME"]:
@@ -194,8 +217,6 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH",
         "PROGRESSIVE_HH_NLEVELS",
         "PROGRESSIVE_HH_N0",
-        "PROGRESSIVE_HH_XMIN",
-        "PROGRESSIVE_HH_XMAX",
         "PROGRESSIVE_HH_SURFACE",
         "PROGRESSIVE_HH_TRIGGER",
         "PROGRESSIVE_HH_MAX_ITER_PER_LEVEL",

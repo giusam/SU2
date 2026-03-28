@@ -433,30 +433,42 @@ def obj_f(x, project):
                 slopes = []
                 for i in range(1, len(smooth)):
                     dj = smooth[i - 1] - smooth[i]
-                    slopes.append(max(dj, 0.0))
+                    slopes.append(dj)
 
                 if slopes:
-                    max_slope = max(slopes)
-                    current_slope = slopes[-1]
+                    current_slope_raw = slopes[-1]
 
-                    if max_slope <= 1.0e-16:
+                    # If the last step is not improving, do NOT trigger refinement.
+                    # We simply skip the slope-efficiency check on this iteration.
+                    if current_slope_raw <= 0.0:
                         sys.stdout.write(
-                            "[PROGRESSIVE_HH] Efficiency trigger (flat history) -> STOP\n"
+                            "[PROGRESSIVE_HH] SLOPE_EFFICIENCY ONLINE | "
+                            "last step not improving, skip trigger check\n"
                         )
-                        raise RefinementTriggered()
+                    else:
+                        positive_slopes = [s for s in slopes if s > 0.0]
 
-                    ratio = current_slope / max_slope
+                        if positive_slopes:
+                            max_slope = max(positive_slopes)
 
-                    sys.stdout.write(
-                        "[PROGRESSIVE_HH] SLOPE_EFFICIENCY ONLINE | "
-                        f"ratio={ratio:.6e} threshold={r:.6e}\n"
-                    )
+                            if max_slope <= 1.0e-16:
+                                sys.stdout.write(
+                                    "[PROGRESSIVE_HH] Efficiency trigger (flat positive history) -> STOP\n"
+                                )
+                                raise RefinementTriggered()
 
-                    if ratio < r:
-                        sys.stdout.write(
-                            "[PROGRESSIVE_HH] Efficiency trigger -> STOP\n"
-                        )
-                        raise RefinementTriggered()
+                            ratio = current_slope_raw / max_slope
+
+                            sys.stdout.write(
+                                "[PROGRESSIVE_HH] SLOPE_EFFICIENCY ONLINE | "
+                                f"ratio={ratio:.6e} threshold={r:.6e}\n"
+                            )
+
+                            if ratio < r:
+                                sys.stdout.write(
+                                    "[PROGRESSIVE_HH] Efficiency trigger -> STOP\n"
+                                )
+                                raise RefinementTriggered()
 
     return obj
 

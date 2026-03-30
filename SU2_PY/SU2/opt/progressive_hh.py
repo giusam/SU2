@@ -55,8 +55,12 @@ def get_progressive_hh_options(config):
         "n0": int(config.get("PROGRESSIVE_HH_N0", 3)),
         "surface_mode": str(config.get("PROGRESSIVE_HH_SURFACE", "BOTH")).upper(),
         "trigger": str(config.get("PROGRESSIVE_HH_TRIGGER", "MAX_ITER")).upper(),
-        "window": int(config.get("PROGRESSIVE_HH_WINDOW", 5)),
-        "tol": float(config.get("PROGRESSIVE_HH_TOL", 1e-3)),
+        "window": int(config.get("PROGRESSIVE_HH_WINDOW", 1)),
+        "tol": float(config.get("PROGRESSIVE_HH_TOL", 0.2)),
+        "slope_filter_tol": float(config.get("PROGRESSIVE_HH_SLOPE_FILTER_TOL", 0.02)),
+        "stag_tol": float(config.get("PROGRESSIVE_HH_STAG_TOL", 1.0e-3)),
+        "stag_band": float(config.get("PROGRESSIVE_HH_STAG_BAND", 0.02)),
+        "stag_window": int(config.get("PROGRESSIVE_HH_STAG_WINDOW", 3)),
         "max_iter_per_level": int(
             config.get("PROGRESSIVE_HH_MAX_ITER_PER_LEVEL", config.OPT_ITERATIONS)
         ),
@@ -96,18 +100,6 @@ def refine_uniform(centers):
             new_points.append(xm)
 
     return sorted(set(centers + new_points))
-
-
-def _resolve_from_cfg_dir(base_config, filename):
-    if len(centers) <= 1:
-        return list(centers)
-
-    refined = []
-    for i in range(len(centers) - 1):
-        refined.append(centers[i])
-        refined.append(0.5 * (centers[i] + centers[i + 1]))
-    refined.append(centers[-1])
-    return refined
 
 
 def _resolve_from_cfg_dir(base_config, filename):
@@ -222,6 +214,10 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH_MAX_ITER_PER_LEVEL",
         "PROGRESSIVE_HH_WINDOW",
         "PROGRESSIVE_HH_TOL",
+        "PROGRESSIVE_HH_SLOPE_FILTER_TOL",
+        "PROGRESSIVE_HH_STAG_TOL",
+        "PROGRESSIVE_HH_STAG_BAND",
+        "PROGRESSIVE_HH_STAG_WINDOW",
     ]
 
     for key in progressive_keys:
@@ -231,8 +227,7 @@ def _remove_progressive_keys(cfg):
 
 def _prepare_local_mesh(cfg, level):
     """
-    Copia nella cartella del livello la mesh sorgente del livello stesso
-    (iniziale o finale del livello precedente) e usa un basename locale.
+    Copy the mesh source into the level folder and use a local basename.
     """
     if not level.mesh_source:
         return
@@ -257,7 +252,12 @@ def write_level_config(base_config, level, opts):
 
     _remove_progressive_keys(cfg)
 
-    cfg["OPT_ITERATIONS"] = opts["max_iter_per_level"]
+    # Intermediate levels use the reduced iteration budget,
+    # final level uses the original OPT_ITERATIONS from the base config.
+    if level.level_id == opts["nlevels"] - 1:
+        cfg["OPT_ITERATIONS"] = int(base_config["OPT_ITERATIONS"])
+    else:
+        cfg["OPT_ITERATIONS"] = opts["max_iter_per_level"]
 
     cfg["DEFINITION_DV"] = make_hh_definition(
         level,
@@ -289,7 +289,6 @@ def write_level_config(base_config, level, opts):
     out_cfg = os.path.join(level.workdir, level.config_filename)
     cfg.dump(out_cfg)
     return out_cfg
-
 
 def _find_history_file(level):
     candidates = []
@@ -332,12 +331,11 @@ def _read_history_values(history_file):
 
 def _find_final_mesh(level):
     """
-    Cerca la mesh deformata finale prodotta dal livello.
-
-    Priorità:
-    1) mesh deformata nelle sottocartelle DESIGNS
-    2) mesh deformata nella root del livello
-    3) qualsiasi mesh .su2 come fallback
+    Find the final deformed mesh produced by the level.
+    Priority:
+    1) deformed mesh in DESIGNS
+    2) deformed mesh in root
+    3) any .su2 mesh as fallback
     """
     design_deform = glob.glob(
         os.path.join(level.workdir, "DESIGNS", "**", "*_deform.su2"),
@@ -377,51 +375,14 @@ def collect_level_result(level):
 
 
 def should_refine(history, opts, level_id):
+    """
+    Offline refinement logic is only kept for MAX_ITER.
+    All other triggers are now handled online in scipy_tools.py.
+    """
     if level_id >= opts["nlevels"] - 1:
         return False
 
     if opts["trigger"] == "MAX_ITER":
         return True
-
-    if opts["trigger"] in ["WINDOW_DROP", "STAGNATION_TRIGGER"]:
-        w = opts["window"]
-        tol = opts["tol"]
-
-        if len(history) < w + 1:
-            return False
-
-        j_old = history[-w - 1]
-        j_new = history[-1]
-        rel_drop = abs(j_old - j_new) / max(abs(j_new), 1.0e-14)
-        return rel_drop < tol
-
-    if opts["trigger"] in ["ANDERSON", "SLOPE_EFFICIENCY_TRIGGER"]:
-        w = max(1, int(opts["window"]))
-        r = float(opts["tol"])
-
-        if len(history) < w + 2:
-            return False
-
-        smooth = []
-        for i in range(w - 1, len(history)):
-            avg = sum(history[i - w + 1 : i + 1]) / float(w)
-            smooth.append(avg)
-
-        slopes = []
-        for i in range(1, len(smooth)):
-            dj = smooth[i - 1] - smooth[i]
-            slopes.append(max(dj, 0.0))
-
-        if not slopes:
-            return False
-
-        current_slope = slopes[-1]
-        max_slope = max(slopes)
-
-        if max_slope <= 1.0e-16:
-            return True
-
-        slope_ratio = current_slope / max_slope
-        return slope_ratio < r
 
     return False

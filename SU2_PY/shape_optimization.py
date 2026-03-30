@@ -20,6 +20,38 @@ from SU2.opt.progressive_hh import (
 )
 
 
+def _build_online_trigger_opts(hh_opts, ilevel):
+    """
+    Build the trigger options passed to scipy_tools.py for online triggering.
+    The last level is never refined online.
+    """
+    if ilevel == hh_opts["nlevels"] - 1:
+        return None
+
+    trigger = hh_opts["trigger"]
+
+    if trigger == "MAX_ITER":
+        return None
+
+    if trigger == "SLOPE_EFFICIENCY_TRIGGER":
+        return {
+            "trigger": trigger,
+            "window": hh_opts["window"],
+            "tol": hh_opts["tol"],
+            "filter_tol": hh_opts["slope_filter_tol"],
+        }
+
+    if trigger == "STAGNATION_TRIGGER":
+        return {
+            "trigger": trigger,
+            "stag_tol": hh_opts["stag_tol"],
+            "stag_band": hh_opts["stag_band"],
+            "stag_window": hh_opts["stag_window"],
+        }
+
+    return None
+
+
 def main():
     parser = OptionParser()
     parser.add_option("-f", "--file", dest="filename", help="read config from FILE", metavar="FILE")
@@ -133,6 +165,10 @@ def run_single_level(
 
     if trigger_opts is not None:
         project.trigger_opts = dict(trigger_opts)
+    else:
+        project.trigger_opts = None
+
+    project.refinement_triggered = False
 
     if optimization == "SLSQP":
         SU2.opt.SLSQP(project, x0, xb, its, accu)
@@ -184,10 +220,12 @@ def progressive_hh_shape_optimization(
         sys.stdout.write(f"[PROGRESSIVE_HH] Lower centers: {level.lower}\n")
         sys.stdout.write(f"[PROGRESSIVE_HH] Mesh source: {level.mesh_source}\n")
 
+        trigger_opts = _build_online_trigger_opts(hh_opts, ilevel)
+
         cwd = os.getcwd()
         try:
             os.chdir(level.workdir)
-            run_single_level(
+            project = run_single_level(
                 os.path.basename(cfg_path),
                 os.path.basename(level_project),
                 partitions,
@@ -195,15 +233,7 @@ def progressive_hh_shape_optimization(
                 optimization,
                 quiet,
                 nzones,
-                trigger_opts=(
-                    None
-                    if ilevel == hh_opts["nlevels"] - 1
-                    else {
-                        "trigger": hh_opts["trigger"],
-                        "window": hh_opts["window"],
-                        "tol": hh_opts["tol"],
-                    }
-                ),
+                trigger_opts=trigger_opts,
             )
         finally:
             os.chdir(cwd)
@@ -211,7 +241,14 @@ def progressive_hh_shape_optimization(
         final_project = level_project
         result = collect_level_result(level)
 
-        if not should_refine(result["history"], hh_opts, ilevel):
+        # Online trigger logic for SLOPE/STAGNATION.
+        # Offline logic only remains for MAX_ITER.
+        if hh_opts["trigger"] == "MAX_ITER":
+            refine_now = should_refine(result["history"], hh_opts, ilevel)
+        else:
+            refine_now = bool(getattr(project, "refinement_triggered", False))
+
+        if not refine_now:
             sys.stdout.write(f"[PROGRESSIVE_HH] Stop after level {ilevel}\n")
             break
 

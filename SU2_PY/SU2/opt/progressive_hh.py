@@ -67,6 +67,9 @@ def get_progressive_hh_options(config):
         ),
         "refinement": str(config.get("PROGRESSIVE_HH_REFINEMENT", "UNIFORM")).upper(),
         "growth_ratio": float(config.get("PROGRESSIVE_HH_GROWTH_RATIO", 2.0)),
+        "adaptive_no_adjacent": _as_bool(
+            config.get("PROGRESSIVE_HH_ADAPTIVE_NO_ADJACENT", "NO")
+        ),
         "marker": str(config.get("DV_MARKER", "Airfoil")),
         "scale": scale,
     }
@@ -79,7 +82,6 @@ def initial_centers(n0):
     """
     if n0 <= 0:
         return []
-
     return [(i + 1) / float(n0 + 1) for i in range(n0)]
 
 
@@ -103,6 +105,162 @@ def refine_uniform(centers):
             new_points.append(xm)
 
     return sorted(set(centers + new_points))
+
+
+def _surface_candidates(centers, grads, side_name):
+    """
+    Build midpoint candidates for one surface and assign an adaptive indicator.
+
+    Indicator:
+      - interior midpoint between i and i+1:
+            0.5 * (|g_i| + |g_{i+1}|)
+      - edge intervals [0,c0] and [cn,1]:
+            |g_0| or |g_n|
+    """
+    centers = sorted(list(centers))
+    if not centers or grads is None or len(grads) != len(centers):
+        return []
+
+    grads = [float(g) for g in grads]
+    extended = [0.0] + centers + [1.0]
+    n = len(centers)
+
+    candidates = []
+
+    for i in range(len(extended) - 1):
+        xm = 0.5 * (extended[i] + extended[i + 1])
+        if not (0.0 < xm < 1.0):
+            continue
+
+        if n == 1:
+            indicator = abs(grads[0])
+        elif i == 0:
+            indicator = abs(grads[0])
+        elif i == n:
+            indicator = abs(grads[-1])
+        else:
+            indicator = 0.5 * (abs(grads[i - 1]) + abs(grads[i]))
+
+        candidates.append(
+            {
+                "side": side_name,
+                "x": xm,
+                "indicator": float(indicator),
+                "interval_id": i,
+            }
+        )
+
+    return candidates
+
+
+def _compute_adaptive_nadd(current_ndv, ncandidates, growth_ratio):
+    if ncandidates <= 0:
+        return 0
+
+    growth_ratio = float(growth_ratio)
+    if growth_ratio <= 1.0:
+        target_ndv = current_ndv + 1
+    else:
+        target_ndv = int(math.ceil(growth_ratio * current_ndv))
+
+    nadd = max(1, target_ndv - current_ndv)
+    nadd = min(nadd, ncandidates)
+    return nadd
+
+
+def _select_top_candidates(candidates, nadd, no_adjacent=False):
+    if nadd <= 0 or not candidates:
+        return []
+
+    ranked = sorted(candidates, key=lambda c: (-c["indicator"], c["x"]))
+
+    if not no_adjacent:
+        return ranked[:nadd]
+
+    selected = []
+    used = {"UPPER": set(), "LOWER": set()}
+
+    for c in ranked:
+        side = c["side"]
+        i = c["interval_id"]
+
+        if i in used[side] or (i - 1) in used[side] or (i + 1) in used[side]:
+            print(
+                "[PROGRESSIVE_HH] ADAPTIVE rejected (adjacent) | "
+                f"side={side} x={c['x']:.6f}"
+            )
+            continue
+
+        selected.append(c)
+        used[side].add(i)
+
+        if len(selected) == nadd:
+            return selected
+
+    print(
+        "[PROGRESSIVE_HH] ADAPTIVE fallback | "
+        f"selected={len(selected)} < target={nadd} -> relaxing constraint"
+    )
+
+    for c in ranked:
+        if c not in selected:
+            selected.append(c)
+        if len(selected) == nadd:
+            break
+
+    return selected
+
+
+def refine_adaptive(prev_level, result, opts):
+    final_grad = result.get("final_grad", None)
+    current_ndv = prev_level.ndv
+
+    if final_grad is None or len(final_grad) != current_ndv:
+        print("[PROGRESSIVE_HH] ADAPTIVE refine | invalid final_grad -> fallback to UNIFORM")
+        return refine_uniform(prev_level.upper), refine_uniform(prev_level.lower)
+
+    n_up = len(prev_level.upper)
+    grad_upper = final_grad[:n_up]
+    grad_lower = final_grad[n_up:]
+
+    candidates = (
+        _surface_candidates(prev_level.upper, grad_upper, "UPPER")
+        + _surface_candidates(prev_level.lower, grad_lower, "LOWER")
+    )
+
+    if not candidates:
+        print("[PROGRESSIVE_HH] ADAPTIVE refine | no candidates -> fallback to UNIFORM")
+        return refine_uniform(prev_level.upper), refine_uniform(prev_level.lower)
+
+    nadd = _compute_adaptive_nadd(
+        current_ndv, len(candidates), opts["growth_ratio"]
+    )
+
+    chosen = _select_top_candidates(
+        candidates, nadd, opts.get("adaptive_no_adjacent", False)
+    )
+
+    new_upper = sorted(prev_level.upper)
+    new_lower = sorted(prev_level.lower)
+
+    for c in chosen:
+        if c["side"] == "UPPER":
+            new_upper.append(c["x"])
+        else:
+            new_lower.append(c["x"])
+
+    print(
+        f"[PROGRESSIVE_HH] ADAPTIVE refine | add={nadd} "
+        f"no_adj={opts.get('adaptive_no_adjacent')}"
+    )
+
+    for c in chosen:
+        print(
+            "[PROGRESSIVE_HH] ADAPTIVE selected | "
+            f"side={c['side']} x={c['x']:.6f} I={c['indicator']:.6e}"
+        )
+
+    return sorted(set(new_upper)), sorted(set(new_lower))
 
 
 def _resolve_from_cfg_dir(base_config, filename):
@@ -148,156 +306,6 @@ def build_initial_level(base_config, opts):
     )
 
 
-def _surface_candidates(centers, grads, side_name):
-    """
-    Build midpoint candidates for one surface and assign an adaptive indicator.
-
-    Indicator:
-      - interior midpoint between i and i+1:
-            0.5 * (|g_i| + |g_{i+1}|)
-      - edge intervals [0,c0] and [cn,1]:
-            |g_0| or |g_n|
-    """
-    centers = sorted(list(centers))
-    if not centers:
-        return []
-
-    if grads is None or len(grads) != len(centers):
-        return []
-
-    grads = [float(g) for g in grads]
-    extended = [0.0] + centers + [1.0]
-
-    candidates = []
-    n = len(centers)
-
-    for i in range(len(extended) - 1):
-        xm = 0.5 * (extended[i] + extended[i + 1])
-        if not (0.0 < xm < 1.0):
-            continue
-
-        if n == 1:
-            indicator = abs(grads[0])
-        elif i == 0:
-            indicator = abs(grads[0])
-        elif i == n:
-            indicator = abs(grads[-1])
-        else:
-            indicator = 0.5 * (abs(grads[i - 1]) + abs(grads[i]))
-
-        candidates.append(
-            {
-                "side": side_name,
-                "x": xm,
-                "indicator": float(indicator),
-                "interval_id": i,
-            }
-        )
-
-    return candidates
-
-
-def _compute_adaptive_nadd(current_ndv, ncandidates, growth_ratio):
-    if ncandidates <= 0:
-        return 0
-
-    growth_ratio = float(growth_ratio)
-    if growth_ratio <= 1.0:
-        target_ndv = current_ndv + 1
-    else:
-        target_ndv = int(math.ceil(growth_ratio * current_ndv))
-
-    nadd = max(1, target_ndv - current_ndv)
-    nadd = min(nadd, ncandidates)
-    return nadd
-
-
-def _select_top_candidates(candidates, nadd):
-    if nadd <= 0 or not candidates:
-        return []
-
-    ranked = sorted(
-        candidates,
-        key=lambda c: (-c["indicator"], c["x"]),
-    )
-
-    return ranked[:nadd]
-
-
-def refine_adaptive(prev_level, result, opts):
-    """
-    Adaptive HH refinement based on final active-DV gradients.
-
-    The total number of new design variables is chosen from the growth ratio:
-        target_ndv = ceil(growth_ratio * current_ndv)
-
-    Candidate midpoint indicator:
-        I_mid = 0.5 * (|g_i| + |g_{i+1}|)
-    """
-    final_grad = result.get("final_grad", None)
-    current_ndv = prev_level.ndv
-
-    if final_grad is None:
-        print("[PROGRESSIVE_HH] ADAPTIVE refine | final_grad missing -> fallback to UNIFORM")
-        return refine_uniform(prev_level.upper), refine_uniform(prev_level.lower)
-
-    if len(final_grad) != current_ndv:
-        print(
-            "[PROGRESSIVE_HH] ADAPTIVE refine | gradient size mismatch "
-            f"({len(final_grad)} != {current_ndv}) -> fallback to UNIFORM"
-        )
-        return refine_uniform(prev_level.upper), refine_uniform(prev_level.lower)
-
-    n_up = len(prev_level.upper)
-    n_low = len(prev_level.lower)
-
-    grad_upper = final_grad[:n_up]
-    grad_lower = final_grad[n_up:n_up + n_low]
-
-    upper_candidates = _surface_candidates(prev_level.upper, grad_upper, "UPPER")
-    lower_candidates = _surface_candidates(prev_level.lower, grad_lower, "LOWER")
-    all_candidates = upper_candidates + lower_candidates
-
-    if not all_candidates:
-        print("[PROGRESSIVE_HH] ADAPTIVE refine | no candidates -> fallback to UNIFORM")
-        return refine_uniform(prev_level.upper), refine_uniform(prev_level.lower)
-
-    nadd = _compute_adaptive_nadd(
-        current_ndv=current_ndv,
-        ncandidates=len(all_candidates),
-        growth_ratio=opts["growth_ratio"],
-    )
-
-    chosen = _select_top_candidates(all_candidates, nadd)
-
-    new_upper = sorted(prev_level.upper)
-    new_lower = sorted(prev_level.lower)
-
-    for c in chosen:
-        if c["side"] == "UPPER":
-            new_upper.append(c["x"])
-        else:
-            new_lower.append(c["x"])
-
-    new_upper = sorted(set(new_upper))
-    new_lower = sorted(set(new_lower))
-
-    print(
-        "[PROGRESSIVE_HH] ADAPTIVE refine | "
-        f"growth_ratio={opts['growth_ratio']:.6f} "
-        f"target_add={nadd} "
-        f"candidates={len(all_candidates)}"
-    )
-
-    for c in chosen:
-        print(
-            "[PROGRESSIVE_HH] ADAPTIVE selected | "
-            f"side={c['side']} x={c['x']:.6f} I={c['indicator']:.6e}"
-        )
-
-    return new_upper, new_lower
-
-
 def build_next_level(prev_level, result, opts):
     next_id = prev_level.level_id + 1
 
@@ -305,18 +313,16 @@ def build_next_level(prev_level, result, opts):
     if next_mesh is None:
         next_mesh = prev_level.mesh_source
 
-    refinement = opts.get("refinement", "UNIFORM").upper()
-
-    if refinement == "ADAPTIVE":
-        next_upper, next_lower = refine_adaptive(prev_level, result, opts)
+    if opts["refinement"] == "ADAPTIVE":
+        upper, lower = refine_adaptive(prev_level, result, opts)
     else:
-        next_upper = refine_uniform(prev_level.upper)
-        next_lower = refine_uniform(prev_level.lower)
+        upper = refine_uniform(prev_level.upper)
+        lower = refine_uniform(prev_level.lower)
 
     return HHLevel(
         level_id=next_id,
-        upper=next_upper,
-        lower=next_lower,
+        upper=upper,
+        lower=lower,
         workdir=f"LEVEL_{next_id}",
         config_filename=f"config_level{next_id}.cfg",
         project_filename=f"project_level{next_id}.pkl",
@@ -381,6 +387,7 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH_STAG_WINDOW",
         "PROGRESSIVE_HH_REFINEMENT",
         "PROGRESSIVE_HH_GROWTH_RATIO",
+        "PROGRESSIVE_HH_ADAPTIVE_NO_ADJACENT",
     ]
 
     for key in progressive_keys:

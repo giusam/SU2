@@ -270,6 +270,10 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
     project.refinement_triggered = False
     project.trigger_state = None
 
+    # Store the last objective gradient seen by scipy
+    project.last_obj_grad = None
+    project.last_obj_grad_x = None
+
     if not hasattr(project, "trigger_opts"):
         project.trigger_opts = None
 
@@ -507,6 +511,10 @@ def obj_df(x, project):
             dobj[idv] = dobj[idv] + this_dv_dobj
             idv += 1
     dobj = array(dobj)
+
+    # Store the last objective gradient evaluated by scipy
+    project.last_obj_grad = dobj.tolist()
+    project.last_obj_grad_x = list(x)
 
     return dobj
 

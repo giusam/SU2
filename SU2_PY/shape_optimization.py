@@ -240,6 +240,18 @@ def progressive_hh_shape_optimization(
 
         final_project = level_project
         result = collect_level_result(level)
+        result["final_grad"] = getattr(project, "last_obj_grad", None)
+        result["final_grad_x"] = getattr(project, "last_obj_grad_x", None)
+
+        if result["final_grad"] is None:
+            sys.stdout.write("[PROGRESSIVE_HH] final_grad not available\n")
+        else:
+            sys.stdout.write(
+                f"[PROGRESSIVE_HH] final_grad captured | size = {len(result['final_grad'])}\n"
+            )
+            sys.stdout.write(
+                f"[PROGRESSIVE_HH] final_grad entries = {result['final_grad']}\n"
+            )
 
         # Online trigger logic for SLOPE/STAGNATION.
         # Offline logic only remains for MAX_ITER.
@@ -256,7 +268,7 @@ def progressive_hh_shape_optimization(
             sys.stdout.write(f"[PROGRESSIVE_HH] Reached maximum level {ilevel}\n")
             break
 
-        level = build_next_level(level, result)
+        level = build_next_level(level, result, hh_opts)
 
     if projectname and final_project and os.path.exists(final_project):
         shutil.copy(final_project, projectname)

@@ -6,6 +6,7 @@ import copy
 import csv
 import glob
 import shutil
+import contextlib
 
 import SU2
 
@@ -107,6 +108,225 @@ def refine_uniform(centers):
     return sorted(set(centers + new_points))
 
 
+def get_midpoint_candidates(centers):
+    """
+    Return only midpoint candidate locations for one surface.
+    """
+    centers = sorted(list(centers))
+    if not centers:
+        return []
+
+    extended = [0.0] + centers + [1.0]
+    candidates = []
+
+    for i in range(len(extended) - 1):
+        xm = 0.5 * (extended[i] + extended[i + 1])
+        if 0.0 < xm < 1.0:
+            candidates.append(
+                {
+                    "x": xm,
+                    "interval_id": i,
+                }
+            )
+
+    return candidates
+
+
+def _find_real_adjoint_dir(level_dir):
+    candidates = sorted(
+        glob.glob(os.path.join(level_dir, "DESIGNS", "DSN_*", "ADJOINT_DRAG"))
+    )
+    if not candidates:
+        raise FileNotFoundError(f"No ADJOINT_DRAG found in {level_dir}")
+    return candidates[-1]
+
+
+def _build_extended_dot_config(cfg_level, real_dot_cfg, mesh_name, all_upper, all_lower):
+    cfg_dot = SU2.io.Config(copy.deepcopy(dict(cfg_level)))
+
+    if "NUMBER_PART" in real_dot_cfg:
+        cfg_dot["NUMBER_PART"] = int(real_dot_cfg["NUMBER_PART"])
+    elif "NUMBER_PART" not in cfg_dot:
+        cfg_dot["NUMBER_PART"] = 1
+
+    if "NZONES" in real_dot_cfg:
+        cfg_dot["NZONES"] = int(real_dot_cfg["NZONES"])
+    elif "NZONES" not in cfg_dot:
+        cfg_dot["NZONES"] = 1
+
+    cfg_dot["MATH_PROBLEM"] = "DISCRETE_ADJOINT"
+    cfg_dot["GRADIENT_METHOD"] = "DISCRETE_ADJOINT"
+    cfg_dot["OBJECTIVE_FUNCTION"] = "DRAG"
+    cfg_dot["RESTART_SOL"] = "NO"
+    cfg_dot["CONSOLE"] = "NONE"
+
+    cfg_dot["MESH_FILENAME"] = mesh_name
+    if "MULTIPOINT_MESH_FILENAME" in cfg_dot and cfg_dot["MULTIPOINT_MESH_FILENAME"]:
+        cfg_dot["MULTIPOINT_MESH_FILENAME"] = f"({mesh_name})"
+
+    old_def = copy.deepcopy(cfg_level["DEFINITION_DV"])
+
+    marker_template = old_def["MARKER"][0]
+    ffd_template = old_def["FFDTAG"][0]
+    scale_template = old_def["SCALE"][0]
+
+    kinds = []
+    scales = []
+    markers = []
+    ffdtags = []
+    params = []
+    sizes = []
+
+    for x in all_upper:
+        kinds.append("HICKS_HENNE")
+        scales.append(scale_template)
+        markers.append(copy.deepcopy(marker_template))
+        ffdtags.append(copy.deepcopy(ffd_template))
+        params.append([1.0, float(x)])
+        sizes.append(1)
+
+    for x in all_lower:
+        kinds.append("HICKS_HENNE")
+        scales.append(scale_template)
+        markers.append(copy.deepcopy(marker_template))
+        ffdtags.append(copy.deepcopy(ffd_template))
+        params.append([0.0, float(x)])
+        sizes.append(1)
+
+    cfg_dot["DEFINITION_DV"] = {
+        "KIND": kinds,
+        "SCALE": scales,
+        "MARKER": markers,
+        "FFDTAG": ffdtags,
+        "PARAM": params,
+        "SIZE": sizes,
+    }
+
+    ndv = len(all_upper) + len(all_lower)
+    cfg_dot["DV_VALUE_NEW"] = [0.0] * ndv
+    cfg_dot["DV_VALUE_OLD"] = [0.0] * ndv
+
+    return cfg_dot
+
+
+def _make_projection_state(mesh_name):
+    state = SU2.io.State()
+    state.FUNCTIONS = {}
+    state.GRADIENTS = {}
+
+    state.FILES["MESH"] = mesh_name
+    state.FILES["DIRECT"] = "solution_flow.dat"
+    state.FILES["FLOW_META"] = "flow.meta"
+
+    return state
+
+
+def _compute_dot_candidate_scores(level, opts):
+    cfg_path = os.path.join(level.workdir, level.config_filename)
+    cfg_level = SU2.io.Config(cfg_path)
+
+    active_upper = list(level.upper)
+    active_lower = list(level.lower)
+
+    cand_upper_raw = get_midpoint_candidates(active_upper)
+    cand_lower_raw = get_midpoint_candidates(active_lower)
+
+    cand_upper = [c["x"] for c in cand_upper_raw]
+    cand_lower = [c["x"] for c in cand_lower_raw]
+
+    if not cand_upper and not cand_lower:
+        return []
+
+    all_upper = active_upper + cand_upper
+    all_lower = active_lower + cand_lower
+
+    real_adj_dir = _find_real_adjoint_dir(level.workdir)
+    real_dot_cfg = SU2.io.Config(os.path.join(real_adj_dir, "config_DOT_AD.cfg"))
+    mesh_name = str(real_dot_cfg["MESH_FILENAME"])
+
+    real_design_dir = os.path.dirname(real_adj_dir)
+    dot_test_dir = os.path.join(level.workdir, "DOT_ONLY_TEST")
+
+    if os.path.isdir(dot_test_dir):
+        shutil.rmtree(dot_test_dir)
+
+    shutil.copytree(real_adj_dir, dot_test_dir, symlinks=False)
+
+    adj_restart_src = os.path.join(real_design_dir, "solution_adj_cd.dat")
+    adj_restart_dst = os.path.join(dot_test_dir, "solution_adj_cd.dat")
+
+    if not os.path.exists(adj_restart_src):
+        raise FileNotFoundError(f"Missing adjoint restart file: {adj_restart_src}")
+
+    shutil.copy2(adj_restart_src, adj_restart_dst)
+
+    cfg_dot = _build_extended_dot_config(
+        cfg_level, real_dot_cfg, mesh_name, all_upper, all_lower
+    )
+    state = _make_projection_state(mesh_name)
+
+    cwd = os.getcwd()
+    try:
+        os.chdir(dot_test_dir)
+        with open(os.devnull, "w") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                info = SU2.run.projection(cfg_dot, state)
+    finally:
+        os.chdir(cwd)
+
+    gradients = info.get("GRADIENTS", {})
+    grad_drag = gradients.get("DRAG", None)
+
+    if grad_drag is None:
+        raise RuntimeError("DRAG gradient not found in DOT projection output")
+
+    n_active = len(active_upper) + len(active_lower)
+    grad_candidate = grad_drag[n_active:]
+
+    expected_ncand = len(cand_upper) + len(cand_lower)
+    if len(grad_candidate) != expected_ncand:
+        raise RuntimeError(
+            f"DOT candidate gradient size mismatch: got {len(grad_candidate)}, expected {expected_ncand}"
+        )
+
+    candidates = []
+    k = 0
+
+    for c in cand_upper_raw:
+        candidates.append(
+            {
+                "side": "UPPER",
+                "x": float(c["x"]),
+                "indicator": abs(float(grad_candidate[k])),
+                "interval_id": c["interval_id"],
+            }
+        )
+        k += 1
+
+    for c in cand_lower_raw:
+        candidates.append(
+            {
+                "side": "LOWER",
+                "x": float(c["x"]),
+                "indicator": abs(float(grad_candidate[k])),
+                "interval_id": c["interval_id"],
+            }
+        )
+        k += 1
+
+    print(
+        f"[PROGRESSIVE_HH] DOT candidate scoring | active_ndv={n_active} "
+        f"candidate_ndv={expected_ncand}"
+    )
+    for c in candidates:
+        print(
+            "[PROGRESSIVE_HH] DOT candidate | "
+            f"side={c['side']} x={c['x']:.6f} I={c['indicator']:.6e}"
+        )
+
+    return candidates
+
+
 def _surface_candidates(centers, grads, side_name):
     """
     Build midpoint candidates for one surface and assign an adaptive indicator.
@@ -122,15 +342,14 @@ def _surface_candidates(centers, grads, side_name):
         return []
 
     grads = [float(g) for g in grads]
-    extended = [0.0] + centers + [1.0]
+    base_candidates = get_midpoint_candidates(centers)
     n = len(centers)
 
     candidates = []
 
-    for i in range(len(extended) - 1):
-        xm = 0.5 * (extended[i] + extended[i + 1])
-        if not (0.0 < xm < 1.0):
-            continue
+    for c in base_candidates:
+        i = c["interval_id"]
+        xm = c["x"]
 
         if n == 1:
             indicator = abs(grads[0])
@@ -185,10 +404,6 @@ def _select_top_candidates(candidates, nadd, no_adjacent=False):
         i = c["interval_id"]
 
         if i in used[side] or (i - 1) in used[side] or (i + 1) in used[side]:
-            print(
-                "[PROGRESSIVE_HH] ADAPTIVE rejected (adjacent) | "
-                f"side={side} x={c['x']:.6f}"
-            )
             continue
 
         selected.append(c)
@@ -196,11 +411,6 @@ def _select_top_candidates(candidates, nadd, no_adjacent=False):
 
         if len(selected) == nadd:
             return selected
-
-    print(
-        "[PROGRESSIVE_HH] ADAPTIVE fallback | "
-        f"selected={len(selected)} < target={nadd} -> relaxing constraint"
-    )
 
     for c in ranked:
         if c not in selected:
@@ -212,24 +422,19 @@ def _select_top_candidates(candidates, nadd, no_adjacent=False):
 
 
 def refine_adaptive(prev_level, result, opts):
-    final_grad = result.get("final_grad", None)
     current_ndv = prev_level.ndv
 
-    if final_grad is None or len(final_grad) != current_ndv:
-        print("[PROGRESSIVE_HH] ADAPTIVE refine | invalid final_grad -> fallback to UNIFORM")
+    try:
+        candidates = _compute_dot_candidate_scores(prev_level, opts)
+    except Exception as err:
+        print(
+            "[PROGRESSIVE_HH] ADAPTIVE DOT refine failed -> fallback to UNIFORM | "
+            f"{err}"
+        )
         return refine_uniform(prev_level.upper), refine_uniform(prev_level.lower)
 
-    n_up = len(prev_level.upper)
-    grad_upper = final_grad[:n_up]
-    grad_lower = final_grad[n_up:]
-
-    candidates = (
-        _surface_candidates(prev_level.upper, grad_upper, "UPPER")
-        + _surface_candidates(prev_level.lower, grad_lower, "LOWER")
-    )
-
     if not candidates:
-        print("[PROGRESSIVE_HH] ADAPTIVE refine | no candidates -> fallback to UNIFORM")
+        print("[PROGRESSIVE_HH] ADAPTIVE DOT refine | no candidates -> fallback to UNIFORM")
         return refine_uniform(prev_level.upper), refine_uniform(prev_level.lower)
 
     nadd = _compute_adaptive_nadd(
@@ -250,13 +455,13 @@ def refine_adaptive(prev_level, result, opts):
             new_lower.append(c["x"])
 
     print(
-        f"[PROGRESSIVE_HH] ADAPTIVE refine | add={nadd} "
+        f"[PROGRESSIVE_HH] ADAPTIVE DOT refine | add={nadd} "
         f"no_adj={opts.get('adaptive_no_adjacent')}"
     )
 
     for c in chosen:
         print(
-            "[PROGRESSIVE_HH] ADAPTIVE selected | "
+            "[PROGRESSIVE_HH] ADAPTIVE DOT selected | "
             f"side={c['side']} x={c['x']:.6f} I={c['indicator']:.6e}"
         )
 
@@ -422,8 +627,6 @@ def write_level_config(base_config, level, opts):
 
     _remove_progressive_keys(cfg)
 
-    # Intermediate levels use the reduced iteration budget,
-    # final level uses the original OPT_ITERATIONS from the base config.
     if level.level_id == opts["nlevels"] - 1:
         cfg["OPT_ITERATIONS"] = int(base_config["OPT_ITERATIONS"])
     else:
@@ -444,7 +647,9 @@ def write_level_config(base_config, level, opts):
     _prepare_local_mesh(cfg, level)
 
     if "RESTART_FILENAME" in cfg and cfg["RESTART_FILENAME"]:
-        cfg["RESTART_FILENAME"] = _resolve_from_cfg_dir(base_config, cfg["RESTART_FILENAME"])
+        cfg["RESTART_FILENAME"] = _resolve_from_cfg_dir(
+            base_config, cfg["RESTART_FILENAME"]
+        )
 
     mesh_out_base = "mesh_out"
     if "MESH_OUT_FILENAME" in cfg and cfg["MESH_OUT_FILENAME"]:

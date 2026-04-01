@@ -241,7 +241,6 @@ def progressive_hh_shape_optimization(
         final_project = level_project
         result = collect_level_result(level)
         result["final_grad"] = getattr(project, "last_obj_grad", None)
-        result["final_grad_x"] = getattr(project, "last_obj_grad_x", None)
 
         if result["final_grad"] is None:
             sys.stdout.write("[PROGRESSIVE_HH] final_grad not available\n")
@@ -253,8 +252,6 @@ def progressive_hh_shape_optimization(
                 f"[PROGRESSIVE_HH] final_grad entries = {result['final_grad']}\n"
             )
 
-        # Online trigger logic for SLOPE/STAGNATION.
-        # Offline logic only remains for MAX_ITER.
         if hh_opts["trigger"] == "MAX_ITER":
             refine_now = should_refine(result["history"], hh_opts, ilevel)
         else:

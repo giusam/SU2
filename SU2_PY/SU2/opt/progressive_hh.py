@@ -221,7 +221,7 @@ def _make_projection_state(mesh_name):
     return state
 
 
-def _compute_dot_candidate_scores(level, opts):
+def _compute_dot_candidate_scores(level):
     cfg_path = os.path.join(level.workdir, level.config_filename)
     cfg_level = SU2.io.Config(cfg_path)
 
@@ -274,14 +274,13 @@ def _compute_dot_candidate_scores(level, opts):
     finally:
         os.chdir(cwd)
 
-    gradients = info.get("GRADIENTS", {})
-    grad_drag = gradients.get("DRAG", None)
-
-    if grad_drag is None:
-        raise RuntimeError("DRAG gradient not found in DOT projection output")
+    grad_drag = info["GRADIENTS"]["DRAG"]
 
     n_active = len(active_upper) + len(active_lower)
     grad_candidate = grad_drag[n_active:]
+
+    if len(grad_candidate) == 0:
+        raise RuntimeError("DOT returned empty candidate gradient")
 
     expected_ncand = len(cand_upper) + len(cand_lower)
     if len(grad_candidate) != expected_ncand:
@@ -315,58 +314,13 @@ def _compute_dot_candidate_scores(level, opts):
         k += 1
 
     print(
-        f"[PROGRESSIVE_HH] DOT candidate scoring | active_ndv={n_active} "
+        f"[PROGRESSIVE_HH] Candidate scoring | active_ndv={n_active} "
         f"candidate_ndv={expected_ncand}"
     )
     for c in candidates:
         print(
-            "[PROGRESSIVE_HH] DOT candidate | "
+            "[PROGRESSIVE_HH] Candidate | "
             f"side={c['side']} x={c['x']:.6f} I={c['indicator']:.6e}"
-        )
-
-    return candidates
-
-
-def _surface_candidates(centers, grads, side_name):
-    """
-    Build midpoint candidates for one surface and assign an adaptive indicator.
-
-    Indicator:
-      - interior midpoint between i and i+1:
-            0.5 * (|g_i| + |g_{i+1}|)
-      - edge intervals [0,c0] and [cn,1]:
-            |g_0| or |g_n|
-    """
-    centers = sorted(list(centers))
-    if not centers or grads is None or len(grads) != len(centers):
-        return []
-
-    grads = [float(g) for g in grads]
-    base_candidates = get_midpoint_candidates(centers)
-    n = len(centers)
-
-    candidates = []
-
-    for c in base_candidates:
-        i = c["interval_id"]
-        xm = c["x"]
-
-        if n == 1:
-            indicator = abs(grads[0])
-        elif i == 0:
-            indicator = abs(grads[0])
-        elif i == n:
-            indicator = abs(grads[-1])
-        else:
-            indicator = 0.5 * (abs(grads[i - 1]) + abs(grads[i]))
-
-        candidates.append(
-            {
-                "side": side_name,
-                "x": xm,
-                "indicator": float(indicator),
-                "interval_id": i,
-            }
         )
 
     return candidates
@@ -425,10 +379,10 @@ def refine_adaptive(prev_level, result, opts):
     current_ndv = prev_level.ndv
 
     try:
-        candidates = _compute_dot_candidate_scores(prev_level, opts)
+        candidates = _compute_dot_candidate_scores(prev_level)
     except Exception as err:
         print(
-            "[PROGRESSIVE_HH] ADAPTIVE DOT refine failed -> fallback to UNIFORM | "
+            "[PROGRESSIVE_HH] WARNING: ADAPTIVE DOT refine failed -> fallback to UNIFORM | "
             f"{err}"
         )
         return refine_uniform(prev_level.upper), refine_uniform(prev_level.lower)
@@ -461,7 +415,7 @@ def refine_adaptive(prev_level, result, opts):
 
     for c in chosen:
         print(
-            "[PROGRESSIVE_HH] ADAPTIVE DOT selected | "
+            "[PROGRESSIVE_HH] ADAPTIVE selected | "
             f"side={c['side']} x={c['x']:.6f} I={c['indicator']:.6e}"
         )
 

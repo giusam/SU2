@@ -110,3 +110,4 @@ ninja-win.zip
 ninja.exe
 .gitignore
 Docs/html
+SU2_PY/candidate_dot_only.py

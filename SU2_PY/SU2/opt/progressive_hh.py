@@ -10,6 +10,7 @@ import contextlib
 
 import numpy as np
 import SU2
+from SU2.opt.hh_spring import apply_hh_spring_after_selection
 
 
 class HHLevel:
@@ -77,6 +78,8 @@ def get_progressive_hh_options(config):
         ).upper(),
         "marker": str(config.get("DV_MARKER", "Airfoil")),
         "scale": scale,
+        "spring_enabled": _as_bool(config.get("PROGRESSIVE_HH_SPRING", "NO")),
+        "spring_A": float(config.get("PROGRESSIVE_HH_SPRING_A", 20.0)),
     }
 
 
@@ -400,7 +403,11 @@ def _compute_dot_candidate_scores(level, opts):
     cand_lower = [c["x"] for c in cand_lower_raw]
 
     if not cand_upper and not cand_lower:
-        return []
+        return {
+            "candidates": [],
+            "active_upper_scores": [],
+            "active_lower_scores": [],
+        }
 
     all_upper = active_upper + cand_upper
     all_lower = active_lower + cand_lower
@@ -418,6 +425,9 @@ def _compute_dot_candidate_scores(level, opts):
     grad_obj = _run_dot_for_function(level.workdir, cfg_dot, state, obj_name)
 
     n_active = len(active_upper) + len(active_lower)
+    n_upper_active = len(active_upper)
+
+    grad_active = grad_obj[:n_active]
     grad_candidate = grad_obj[n_active:]
 
     if len(grad_candidate) == 0:
@@ -433,7 +443,7 @@ def _compute_dot_candidate_scores(level, opts):
 
     if indicator_mode == "IKKT":
         constraint_names = _extract_constraint_names(cfg_level)
-        constraint_grads = []
+        constraint_grads_full = []
 
         for cname in constraint_names:
             cname = cname.upper()
@@ -452,20 +462,25 @@ def _compute_dot_candidate_scores(level, opts):
                     )
                     continue
 
-            grad_c_candidate = grad_c[n_active:]
-
-            if len(grad_c_candidate) != expected_ncand:
+            if len(grad_c) != len(grad_obj):
                 raise RuntimeError(
-                    f"{cname} candidate gradient size mismatch: "
-                    f"got {len(grad_c_candidate)}, expected {expected_ncand}"
+                    f"{cname} full gradient size mismatch: "
+                    f"got {len(grad_c)}, expected {len(grad_obj)}"
                 )
 
-            constraint_grads.append(grad_c_candidate)
+            constraint_grads_full.append(grad_c)
 
-        residual = _compute_ikkt_residual_vector(grad_candidate, constraint_grads)
-        candidate_indicator = np.abs(residual).tolist()
+        residual_full = _compute_ikkt_residual_vector(grad_obj, constraint_grads_full)
+        active_indicator = np.abs(np.asarray(residual_full[:n_active], dtype=float)).tolist()
+        candidate_indicator = np.abs(
+            np.asarray(residual_full[n_active:], dtype=float)
+        ).tolist()
     else:
+        active_indicator = np.abs(np.asarray(grad_active, dtype=float)).tolist()
         candidate_indicator = np.abs(np.asarray(grad_candidate, dtype=float)).tolist()
+
+    active_upper_scores = active_indicator[:n_upper_active]
+    active_lower_scores = active_indicator[n_upper_active:]
 
     candidates = []
     k = 0
@@ -504,7 +519,11 @@ def _compute_dot_candidate_scores(level, opts):
             f"side={c['side']} x={c['x']:.6f} I={c['indicator']:.6e}"
         )
 
-    return candidates
+    return {
+        "candidates": candidates,
+        "active_upper_scores": active_upper_scores,
+        "active_lower_scores": active_lower_scores,
+    }
 
 
 def _compute_adaptive_nadd(current_ndv, ncandidates, growth_ratio):
@@ -560,7 +579,10 @@ def refine_adaptive(prev_level, result, opts):
     current_ndv = prev_level.ndv
 
     try:
-        candidates = _compute_dot_candidate_scores(prev_level, opts)
+        scoring = _compute_dot_candidate_scores(prev_level, opts)
+        candidates = scoring.get("candidates", [])
+        active_upper_scores = scoring.get("active_upper_scores", [])
+        active_lower_scores = scoring.get("active_lower_scores", [])
     except Exception as err:
         print(
             "[PROGRESSIVE_HH] WARNING: ADAPTIVE refine failed -> fallback to UNIFORM | "
@@ -580,18 +602,62 @@ def refine_adaptive(prev_level, result, opts):
         candidates, nadd, opts.get("adaptive_no_adjacent", False)
     )
 
-    new_upper = sorted(prev_level.upper)
-    new_lower = sorted(prev_level.lower)
+    spring_debug = None
 
-    for c in chosen:
-        if c["side"] == "UPPER":
-            new_upper.append(c["x"])
-        else:
-            new_lower.append(c["x"])
+    if opts.get("spring_enabled", False):
+        old_upper = sorted(prev_level.upper)
+        old_lower = sorted(prev_level.lower)
+
+        new_upper, new_lower = apply_hh_spring_after_selection(
+            prev_level,
+            chosen,
+            active_upper_scores,
+            active_lower_scores,
+            opts,
+        )
+
+        def _spacing_stats(xs):
+            xs = sorted(xs)
+            if len(xs) < 2:
+                return None
+
+            dx = []
+            for i in range(len(xs) - 1):
+                dx.append(xs[i + 1] - xs[i])
+
+            return {
+                "min": min(dx),
+                "max": max(dx),
+                "ratio": max(dx) / min(dx),
+            }
+
+        spring_debug = {
+            "old_upper": old_upper,
+            "old_lower": old_lower,
+            "selected_upper": [c["x"] for c in chosen if c["side"] == "UPPER"],
+            "selected_lower": [c["x"] for c in chosen if c["side"] == "LOWER"],
+            "new_upper": new_upper,
+            "new_lower": new_lower,
+            "upper_spacing": _spacing_stats(new_upper),
+            "lower_spacing": _spacing_stats(new_lower),
+        }
+    else:
+        new_upper = sorted(prev_level.upper)
+        new_lower = sorted(prev_level.lower)
+
+        for c in chosen:
+            if c["side"] == "UPPER":
+                new_upper.append(c["x"])
+            else:
+                new_lower.append(c["x"])
+
+        new_upper = sorted(set(new_upper))
+        new_lower = sorted(set(new_lower))
 
     print(
         f"[PROGRESSIVE_HH] ADAPTIVE refine | add={nadd} "
-        f"no_adj={opts.get('adaptive_no_adjacent')}"
+        f"no_adj={opts.get('adaptive_no_adjacent')} "
+        f"spring={opts.get('spring_enabled')}"
     )
 
     for c in chosen:
@@ -599,6 +665,31 @@ def refine_adaptive(prev_level, result, opts):
             "[PROGRESSIVE_HH] ADAPTIVE selected | "
             f"side={c['side']} x={c['x']:.6f} I={c['indicator']:.6e}"
         )
+
+    if spring_debug is not None:
+        if spring_debug["upper_spacing"] is not None:
+            print(
+                "[PROGRESSIVE_HH][SPRING] UPPER spacing | "
+                f"min={spring_debug['upper_spacing']['min']:.6f} "
+                f"max={spring_debug['upper_spacing']['max']:.6f} "
+                f"ratio={spring_debug['upper_spacing']['ratio']:.2f}"
+            )
+
+        if spring_debug["lower_spacing"] is not None:
+            print(
+                "[PROGRESSIVE_HH][SPRING] LOWER spacing | "
+                f"min={spring_debug['lower_spacing']['min']:.6f} "
+                f"max={spring_debug['lower_spacing']['max']:.6f} "
+                f"ratio={spring_debug['lower_spacing']['ratio']:.2f}"
+            )
+
+        print("[PROGRESSIVE_HH][SPRING] Upper before:", spring_debug["old_upper"])
+        print("[PROGRESSIVE_HH][SPRING] Upper selected:", spring_debug["selected_upper"])
+        print("[PROGRESSIVE_HH][SPRING] Upper after :", spring_debug["new_upper"])
+
+        print("[PROGRESSIVE_HH][SPRING] Lower before:", spring_debug["old_lower"])
+        print("[PROGRESSIVE_HH][SPRING] Lower selected:", spring_debug["selected_lower"])
+        print("[PROGRESSIVE_HH][SPRING] Lower after :", spring_debug["new_lower"])
 
     return sorted(set(new_upper)), sorted(set(new_lower))
 
@@ -722,6 +813,8 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH_GROWTH_RATIO",
         "PROGRESSIVE_HH_ADAPTIVE_NO_ADJACENT",
         "PROGRESSIVE_HH_ADAPTIVE_INDICATOR",
+        "PROGRESSIVE_HH_SPRING",
+        "PROGRESSIVE_HH_SPRING_A",
     ]
 
     for key in progressive_keys:

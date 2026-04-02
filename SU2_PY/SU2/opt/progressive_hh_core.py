@@ -63,9 +63,6 @@ def get_progressive_hh_options(config):
         ),
         "refinement": str(config.get("PROGRESSIVE_HH_REFINEMENT", "UNIFORM")).upper(),
         "growth_ratio": float(config.get("PROGRESSIVE_HH_GROWTH_RATIO", 2.0)),
-        "adaptive_no_adjacent": _as_bool(
-            config.get("PROGRESSIVE_HH_ADAPTIVE_NO_ADJACENT", "NO")
-        ),
         "adaptive_indicator": str(
             config.get("PROGRESSIVE_HH_ADAPTIVE_INDICATOR", "ABS_GRAD")
         ).upper(),
@@ -113,38 +110,12 @@ def _compute_adaptive_nadd(current_ndv, ncandidates, growth_ratio):
     return nadd
 
 
-def _select_top_candidates(candidates, nadd, no_adjacent=False):
+def _select_top_candidates(candidates, nadd):
     if nadd <= 0 or not candidates:
         return []
 
     ranked = sorted(candidates, key=lambda c: (-c["indicator"], c["x"]))
-
-    if not no_adjacent:
-        return ranked[:nadd]
-
-    selected = []
-    used = {"UPPER": set(), "LOWER": set()}
-
-    for c in ranked:
-        side = c["side"]
-        i = c["interval_id"]
-
-        if i in used[side] or (i - 1) in used[side] or (i + 1) in used[side]:
-            continue
-
-        selected.append(c)
-        used[side].add(i)
-
-        if len(selected) == nadd:
-            return selected
-
-    for c in ranked:
-        if c not in selected:
-            selected.append(c)
-        if len(selected) == nadd:
-            break
-
-    return selected
+    return ranked[:nadd]
 
 
 def refine_adaptive(prev_level, result, opts):
@@ -170,9 +141,7 @@ def refine_adaptive(prev_level, result, opts):
         current_ndv, len(candidates), opts["growth_ratio"]
     )
 
-    chosen = _select_top_candidates(
-        candidates, nadd, opts.get("adaptive_no_adjacent", False)
-    )
+    chosen = _select_top_candidates(candidates, nadd)
 
     spring_debug = None
 
@@ -228,7 +197,6 @@ def refine_adaptive(prev_level, result, opts):
 
     print(
         f"[PROGRESSIVE_HH] ADAPTIVE refine | add={nadd} "
-        f"no_adj={opts.get('adaptive_no_adjacent')} "
         f"spring={opts.get('spring_enabled')}"
     )
 

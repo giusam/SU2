@@ -8,6 +8,7 @@ import contextlib
 
 import numpy as np
 import SU2
+from scipy.optimize import lsq_linear
 
 
 def get_midpoint_candidates(centers):
@@ -66,6 +67,52 @@ def _find_real_adjoint_assets(level_dir, func_name):
         raise FileNotFoundError(f"Missing adjoint restart file: {restart_path}")
 
     return adjoint_dir, restart_path
+
+
+def _find_latest_design_with_geometry(level_dir, func_name=None):
+    """
+    Return the most recent DSN_* directory that contains usable geometry data.
+    """
+    designs = sorted(glob.glob(os.path.join(level_dir, "DESIGNS", "DSN_*")))
+    if not designs:
+        raise FileNotFoundError(
+            f"No DSN_* folders found in {os.path.join(level_dir, 'DESIGNS')}"
+        )
+
+    func_name = None if func_name is None else str(func_name).upper()
+
+    for dsn_dir in reversed(designs):
+        geo_dirs = [
+            os.path.join(dsn_dir, "GEOMETRY"),
+            os.path.join(dsn_dir, "geometry"),
+        ]
+
+        has_geometry_dir = any(os.path.isdir(g) for g in geo_dirs)
+
+        if func_name is None:
+            if has_geometry_dir:
+                return dsn_dir
+            continue
+
+        matched_files = []
+        for pattern in [
+            f"*{func_name}*",
+            f"*{func_name.lower()}*",
+            "*of_grad*",
+            "*grad*",
+            "*history*",
+            "*values*",
+        ]:
+            matched_files.extend(glob.glob(os.path.join(dsn_dir, pattern)))
+            for gdir in geo_dirs:
+                matched_files.extend(glob.glob(os.path.join(gdir, pattern)))
+
+        if has_geometry_dir or matched_files:
+            return dsn_dir
+
+    raise FileNotFoundError(
+        f"No DSN_* folder with usable geometry data found in {os.path.join(level_dir, 'DESIGNS')}"
+    )
 
 
 def _build_extended_dot_config(cfg_level, real_dot_cfg, mesh_name, all_upper, all_lower):
@@ -210,6 +257,59 @@ def _extract_constraint_names(cfg):
     return names
 
 
+def _extract_constraint_signs(cfg, constraint_names):
+    """
+    Build lambda bounds consistent with the paper:
+
+      - maximum-bound inequality  -> lambda >= 0
+      - minimum-bound inequality  -> lambda <= 0
+      - equality constraints      -> lambda free
+
+    Assumed SU2 convention:
+      SIGN "<"  -> upper / maximum bound
+      SIGN ">"  -> lower / minimum bound
+    """
+    lb = []
+    ub = []
+
+    opt_con = cfg.get("OPT_CONSTRAINT", {})
+    equality = {}
+    inequality = {}
+
+    if isinstance(opt_con, dict):
+        equality = opt_con.get("EQUALITY", {}) or {}
+        inequality = opt_con.get("INEQUALITY", {}) or {}
+
+    for cname in constraint_names:
+        cname = str(cname).upper()
+
+        if cname in equality:
+            lb.append(-np.inf)
+            ub.append(np.inf)
+            continue
+
+        entry = inequality.get(cname, None)
+
+        if not isinstance(entry, dict):
+            lb.append(-np.inf)
+            ub.append(np.inf)
+            continue
+
+        sign = str(entry.get("SIGN", "")).strip()
+
+        if sign == "<":
+            lb.append(0.0)
+            ub.append(np.inf)
+        elif sign == ">":
+            lb.append(-np.inf)
+            ub.append(0.0)
+        else:
+            lb.append(-np.inf)
+            ub.append(np.inf)
+
+    return np.asarray(lb, dtype=float), np.asarray(ub, dtype=float)
+
+
 def _run_dot_for_function(level_dir, cfg_dot, state, func_name):
     func_name = str(func_name).upper()
 
@@ -243,6 +343,9 @@ def _run_dot_for_function(level_dir, cfg_dot, state, func_name):
 def _run_geo_gradient_for_function(level_dir, cfg_dot, func_name):
     func_name = str(func_name).upper()
 
+    geo_src_design = _find_latest_design_with_geometry(level_dir, func_name)
+    print(f"[PROGRESSIVE_HH] GEOMETRY source design for {func_name}: {geo_src_design}")
+
     geo_test_dir = os.path.join(level_dir, f"GEO_ONLY_{func_name}")
 
     if os.path.isdir(geo_test_dir):
@@ -257,13 +360,21 @@ def _run_geo_gradient_for_function(level_dir, cfg_dot, func_name):
 
     mesh_name = str(cfg_geo["MESH_FILENAME"])
     mesh_src = os.path.join(level_dir, mesh_name)
-    mesh_dst = os.path.join(geo_test_dir, mesh_name)
 
     if not os.path.exists(mesh_src):
-        raise FileNotFoundError(f"Missing mesh for geometry run: {mesh_src}")
+        alt_meshes = glob.glob(os.path.join(geo_src_design, "*.su2"))
+        if not alt_meshes:
+            raise FileNotFoundError(
+                f"Missing mesh for geometry run: {mesh_src}, and no fallback mesh in {geo_src_design}"
+            )
+        mesh_src = sorted(alt_meshes)[-1]
+
+    mesh_dst = os.path.join(geo_test_dir, os.path.basename(mesh_src))
 
     if os.path.abspath(mesh_src) != os.path.abspath(mesh_dst):
         shutil.copy2(mesh_src, mesh_dst)
+
+    cfg_geo["MESH_FILENAME"] = os.path.basename(mesh_dst)
 
     cwd = os.getcwd()
     try:
@@ -277,7 +388,7 @@ def _run_geo_gradient_for_function(level_dir, cfg_dot, func_name):
     return info["GRADIENTS"][func_name]
 
 
-def _compute_ikkt_residual_vector(g_obj, constraint_grads):
+def _compute_ikkt_residual_vector(g_obj, constraint_grads, lambda_bounds=None):
     g = np.asarray(g_obj, dtype=float)
 
     if not constraint_grads:
@@ -286,7 +397,20 @@ def _compute_ikkt_residual_vector(g_obj, constraint_grads):
     A = np.column_stack([np.asarray(cg, dtype=float) for cg in constraint_grads])
 
     try:
-        lam, _, _, _ = np.linalg.lstsq(A, g, rcond=None)
+        if lambda_bounds is None:
+            res = lsq_linear(A, g, bounds=(-np.inf, np.inf), lsmr_tol="auto")
+        else:
+            lb, ub = lambda_bounds
+            res = lsq_linear(A, g, bounds=(lb, ub), lsmr_tol="auto")
+
+        lam = res.x
+
+        print("[PROGRESSIVE_HH] IKKT lambdas =", lam.tolist())
+        if lambda_bounds is not None:
+            lb, ub = lambda_bounds
+            print("[PROGRESSIVE_HH] IKKT lambda lower bounds =", lb.tolist())
+            print("[PROGRESSIVE_HH] IKKT lambda upper bounds =", ub.tolist())
+
         r = g - A @ lam
     except Exception:
         r = g.copy()
@@ -348,6 +472,7 @@ def _compute_dot_candidate_scores(level, opts):
 
     if indicator_mode == "IKKT":
         constraint_names = _extract_constraint_names(cfg_level)
+        lambda_bounds = _extract_constraint_signs(cfg_level, constraint_names)
         constraint_grads_full = []
 
         for cname in constraint_names:
@@ -375,7 +500,12 @@ def _compute_dot_candidate_scores(level, opts):
 
             constraint_grads_full.append(grad_c)
 
-        residual_full = _compute_ikkt_residual_vector(grad_obj, constraint_grads_full)
+        residual_full = _compute_ikkt_residual_vector(
+            grad_obj,
+            constraint_grads_full,
+            lambda_bounds=lambda_bounds,
+        )
+
         active_indicator = np.abs(np.asarray(residual_full[:n_active], dtype=float)).tolist()
         candidate_indicator = np.abs(
             np.asarray(residual_full[n_active:], dtype=float)

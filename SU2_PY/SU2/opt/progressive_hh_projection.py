@@ -35,21 +35,7 @@ def get_midpoint_candidates(centers):
 def _find_real_adjoint_assets(level_dir, func_name):
     func_name = str(func_name).upper()
 
-    folder_map = {
-        "DRAG": "ADJOINT_DRAG",
-        "MOMENT_Z": "ADJOINT_MOMENT_Z",
-    }
-
-    restart_map = {
-        "DRAG": "solution_adj_cd.dat",
-        "MOMENT_Z": "solution_adj_cmz.dat",
-    }
-
-    if func_name not in folder_map or func_name not in restart_map:
-        raise FileNotFoundError(f"No adjoint asset mapping defined for {func_name}")
-
-    adjoint_folder_name = folder_map[func_name]
-    restart_name = restart_map[func_name]
+    adjoint_folder_name = f"ADJOINT_{func_name}"
 
     candidates = sorted(
         glob.glob(os.path.join(level_dir, "DESIGNS", "DSN_*", adjoint_folder_name))
@@ -62,11 +48,7 @@ def _find_real_adjoint_assets(level_dir, func_name):
     adjoint_dir = candidates[-1]
     design_dir = os.path.dirname(adjoint_dir)
 
-    restart_path = os.path.join(design_dir, restart_name)
-    if not os.path.exists(restart_path):
-        raise FileNotFoundError(f"Missing adjoint restart file: {restart_path}")
-
-    return adjoint_dir, restart_path
+    return adjoint_dir, design_dir
 
 
 def _find_latest_design_with_geometry(level_dir, func_name=None):
@@ -268,34 +250,92 @@ def _extract_constraint_signs(cfg, constraint_names):
     Assumed SU2 convention:
       SIGN "<"  -> upper / maximum bound
       SIGN ">"  -> lower / minimum bound
+      SIGN "="  -> equality
     """
     lb = []
     ub = []
 
     opt_con = cfg.get("OPT_CONSTRAINT", {})
-    equality = {}
-    inequality = {}
 
+    # -------------------------------------------------
+    # Case 1: structured dict
+    # -------------------------------------------------
     if isinstance(opt_con, dict):
         equality = opt_con.get("EQUALITY", {}) or {}
         inequality = opt_con.get("INEQUALITY", {}) or {}
 
+        for cname in constraint_names:
+            cname = str(cname).upper()
+
+            if cname in equality:
+                lb.append(-np.inf)
+                ub.append(np.inf)
+                continue
+
+            entry = inequality.get(cname, None)
+
+            if not isinstance(entry, dict):
+                lb.append(-np.inf)
+                ub.append(np.inf)
+                continue
+
+            sign = str(entry.get("SIGN", "")).strip()
+
+            if sign == "<":
+                lb.append(0.0)
+                ub.append(np.inf)
+            elif sign == ">":
+                lb.append(-np.inf)
+                ub.append(0.0)
+            elif sign == "=":
+                lb.append(-np.inf)
+                ub.append(np.inf)
+            else:
+                lb.append(-np.inf)
+                ub.append(np.inf)
+
+        return np.asarray(lb, dtype=float), np.asarray(ub, dtype=float)
+
+    # -------------------------------------------------
+    # Case 2: raw string, e.g.
+    # ( MOMENT_Z < 0.092 )*0.01; (AIRFOIL_AREA>0.0778)*0.01; (LIFT=0.824)*0.01
+    # -------------------------------------------------
+    sign_map = {}
+
+    raw = str(opt_con).strip()
+    if raw:
+        parts = [p.strip() for p in raw.split(";") if p.strip()]
+
+        for part in parts:
+            # take content inside first parentheses if present
+            if "(" in part and ")" in part:
+                inside = part[part.find("(") + 1 : part.find(")")]
+            else:
+                inside = part
+
+            inside = inside.strip()
+
+            # detect sign
+            sign = None
+            if "<" in inside:
+                sign = "<"
+                lhs = inside.split("<", 1)[0].strip()
+            elif ">" in inside:
+                sign = ">"
+                lhs = inside.split(">", 1)[0].strip()
+            elif "=" in inside:
+                sign = "="
+                lhs = inside.split("=", 1)[0].strip()
+            else:
+                continue
+
+            cname = lhs.replace(",", " ").split()[0].strip().upper()
+            if cname:
+                sign_map[cname] = sign
+
     for cname in constraint_names:
         cname = str(cname).upper()
-
-        if cname in equality:
-            lb.append(-np.inf)
-            ub.append(np.inf)
-            continue
-
-        entry = inequality.get(cname, None)
-
-        if not isinstance(entry, dict):
-            lb.append(-np.inf)
-            ub.append(np.inf)
-            continue
-
-        sign = str(entry.get("SIGN", "")).strip()
+        sign = sign_map.get(cname, None)
 
         if sign == "<":
             lb.append(0.0)
@@ -303,6 +343,9 @@ def _extract_constraint_signs(cfg, constraint_names):
         elif sign == ">":
             lb.append(-np.inf)
             ub.append(0.0)
+        elif sign == "=":
+            lb.append(-np.inf)
+            ub.append(np.inf)
         else:
             lb.append(-np.inf)
             ub.append(np.inf)
@@ -313,7 +356,7 @@ def _extract_constraint_signs(cfg, constraint_names):
 def _run_dot_for_function(level_dir, cfg_dot, state, func_name):
     func_name = str(func_name).upper()
 
-    adjoint_dir, adjoint_restart = _find_real_adjoint_assets(level_dir, func_name)
+    adjoint_dir, design_dir = _find_real_adjoint_assets(level_dir, func_name)
 
     dot_test_dir = os.path.join(level_dir, f"DOT_ONLY_{func_name}")
 
@@ -322,8 +365,13 @@ def _run_dot_for_function(level_dir, cfg_dot, state, func_name):
 
     shutil.copytree(adjoint_dir, dot_test_dir, symlinks=False)
 
-    restart_dst = os.path.join(dot_test_dir, os.path.basename(adjoint_restart))
-    shutil.copy2(adjoint_restart, restart_dst)
+    restart_candidates = glob.glob(os.path.join(design_dir, "solution_adj_*.dat"))
+    if not restart_candidates:
+        raise FileNotFoundError(f"No adjoint restart files found in {design_dir}")
+
+    for restart_src in restart_candidates:
+        restart_dst = os.path.join(dot_test_dir, os.path.basename(restart_src))
+        shutil.copy2(restart_src, restart_dst)
 
     cfg_fun = SU2.io.Config(copy.deepcopy(dict(cfg_dot)))
     cfg_fun["OBJECTIVE_FUNCTION"] = func_name
@@ -392,30 +440,50 @@ def _compute_ikkt_residual_vector(g_obj, constraint_grads, lambda_bounds=None):
     g = np.asarray(g_obj, dtype=float)
 
     if not constraint_grads:
-        return g.copy()
+        return g.copy(), np.zeros(0)
 
     A = np.column_stack([np.asarray(cg, dtype=float) for cg in constraint_grads])
 
     try:
         if lambda_bounds is None:
-            res = lsq_linear(A, g, bounds=(-np.inf, np.inf), lsmr_tol="auto")
+            lb = np.full(A.shape[1], -np.inf)
+            ub = np.full(A.shape[1], np.inf)
+            res = lsq_linear(A, g, bounds=(lb, ub), lsmr_tol="auto")
         else:
             lb, ub = lambda_bounds
             res = lsq_linear(A, g, bounds=(lb, ub), lsmr_tol="auto")
 
         lam = res.x
+        residual = g - A @ lam
 
-        print("[PROGRESSIVE_HH] IKKT lambdas =", lam.tolist())
-        if lambda_bounds is not None:
-            lb, ub = lambda_bounds
-            print("[PROGRESSIVE_HH] IKKT lambda lower bounds =", lb.tolist())
-            print("[PROGRESSIVE_HH] IKKT lambda upper bounds =", ub.tolist())
+        # =========================
+        # IKKT DEBUG BLOCK
+        # =========================
+        g_norm = np.linalg.norm(g)
+        r_norm = np.linalg.norm(residual)
+        rel_res = r_norm / max(g_norm, 1e-16)
 
-        r = g - A @ lam
+        print("\n[IKKT DEBUG]")
+        print(f"||g||           = {g_norm:.6e}")
+        print(f"||r||           = {r_norm:.6e}")
+        print(f"relative resid  = {rel_res:.6e}")
+        print(f"lambdas         = {lam.tolist()}")
+        print(f"lambda lower    = {lb.tolist()}")
+        print(f"lambda upper    = {ub.tolist()}")
+
+        for j, cg in enumerate(constraint_grads):
+            contrib = abs(lam[j]) * np.linalg.norm(cg)
+            print(f"||lambda[{j}] * gradC[{j}]|| = {contrib:.6e}")
+
+        g_reconstructed = A @ lam
+        print(f"||A lambda||    = {np.linalg.norm(g_reconstructed):.6e}")
+        # =========================
+
     except Exception:
-        r = g.copy()
+        residual = g.copy()
+        lam = np.zeros(A.shape[1])
 
-    return r
+    return residual, lam
 
 
 def _compute_dot_candidate_scores(level, opts):
@@ -500,7 +568,7 @@ def _compute_dot_candidate_scores(level, opts):
 
             constraint_grads_full.append(grad_c)
 
-        residual_full = _compute_ikkt_residual_vector(
+        residual_full, lam = _compute_ikkt_residual_vector(
             grad_obj,
             constraint_grads_full,
             lambda_bounds=lambda_bounds,

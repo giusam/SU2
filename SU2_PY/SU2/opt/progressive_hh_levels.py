@@ -33,20 +33,58 @@ def _resolve_from_cfg_dir(base_config, filename):
 
     return os.path.abspath(os.path.join(cfg_dir, filename))
 
+def _parse_initial_points(value):
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    raw = raw.strip("()[]")
+    if not raw:
+        return []
+
+    pts = [float(x.strip()) for x in raw.split(",") if x.strip()]
+    pts = sorted(pts)
+
+    for x in pts:
+        if not (0.0 < x < 1.0):
+            raise ValueError(
+                f"Invalid HH initial point {x} (must satisfy 0 < x < 1)"
+            )
+
+    return pts
 
 def build_initial_level(base_config, opts):
     upper = []
     lower = []
 
+    upper_manual = _parse_initial_points(
+        base_config.get("PROGRESSIVE_HH_INITIAL_UPPER", None)
+    )
+    lower_manual = _parse_initial_points(
+        base_config.get("PROGRESSIVE_HH_INITIAL_LOWER", None)
+    )
+
     if opts["surface_mode"] in ("UPPER", "BOTH"):
-        upper = initial_centers(opts["n0"])
+        if upper_manual is not None:
+            upper = upper_manual
+        else:
+            upper = initial_centers(opts["n0"])
 
     if opts["surface_mode"] in ("LOWER", "BOTH"):
-        lower = initial_centers(opts["n0"])
+        if lower_manual is not None:
+            lower = lower_manual
+        else:
+            lower = initial_centers(opts["n0"])
 
     initial_mesh = None
     if "MESH_FILENAME" in base_config and base_config["MESH_FILENAME"]:
         initial_mesh = _resolve_from_cfg_dir(base_config, base_config["MESH_FILENAME"])
+
+    print(f"[PROGRESSIVE_HH] Initial upper centers = {upper}")
+    print(f"[PROGRESSIVE_HH] Initial lower centers = {lower}")
 
     return HHLevel(
         level_id=0,
@@ -122,6 +160,8 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH",
         "PROGRESSIVE_HH_NLEVELS",
         "PROGRESSIVE_HH_N0",
+        "PROGRESSIVE_HH_INITIAL_UPPER",
+        "PROGRESSIVE_HH_INITIAL_LOWER",
         "PROGRESSIVE_HH_SURFACE",
         "PROGRESSIVE_HH_TRIGGER",
         "PROGRESSIVE_HH_MAX_ITER_PER_LEVEL",

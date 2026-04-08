@@ -75,6 +75,15 @@ def _check_slope_trigger(project, obj_value, opts):
     """
     _init_trigger_state(project)
 
+    warmup_iter = int(opts.get("warmup_iter", 0))
+
+    if len(project.trigger_history) <= warmup_iter:
+        sys.stdout.write(
+            "[PROGRESSIVE_HH] SLOPE_EFFICIENCY ONLINE | "
+            f"warmup phase ({len(project.trigger_history)}/{warmup_iter})\n"
+        )
+        return
+
     w = max(1, int(opts.get("window", 1)))
     r = float(opts.get("tol", 0.2))
     filter_tol = float(opts.get("filter_tol", 0.02))
@@ -149,7 +158,14 @@ def _check_stagnation_trigger(project, obj_value, opts):
       - trigger when counter reaches stag_window
     """
     _init_trigger_state(project)
+    warmup_iter = int(opts.get("warmup_iter", 0))
 
+    if len(project.trigger_history) <= warmup_iter:
+        sys.stdout.write(
+            "[PROGRESSIVE_HH] STAGNATION ONLINE | "
+            f"warmup phase ({len(project.trigger_history)}/{warmup_iter})\n"
+        )
+        return
     eps = 1.0e-14
     stag_tol = float(opts.get("stag_tol", 1.0e-3))
     stag_band = float(opts.get("stag_band", 0.02))

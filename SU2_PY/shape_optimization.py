@@ -29,6 +29,7 @@ def _build_online_trigger_opts(hh_opts, ilevel):
         return None
 
     trigger = hh_opts["trigger"]
+    warmup_iter = 0 if ilevel == 0 else hh_opts["warmup_iter"]
 
     if trigger == "MAX_ITER":
         return None
@@ -39,6 +40,7 @@ def _build_online_trigger_opts(hh_opts, ilevel):
             "window": hh_opts["window"],
             "tol": hh_opts["tol"],
             "filter_tol": hh_opts["slope_filter_tol"],
+            "warmup_iter": warmup_iter,
         }
 
     if trigger == "STAGNATION_TRIGGER":
@@ -47,6 +49,7 @@ def _build_online_trigger_opts(hh_opts, ilevel):
             "stag_tol": hh_opts["stag_tol"],
             "stag_band": hh_opts["stag_band"],
             "stag_window": hh_opts["stag_window"],
+            "warmup_iter": warmup_iter,
         }
 
     return None

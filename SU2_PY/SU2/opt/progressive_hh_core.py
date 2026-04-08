@@ -58,6 +58,7 @@ def get_progressive_hh_options(config):
         "stag_tol": float(config.get("PROGRESSIVE_HH_STAG_TOL", 1.0e-3)),
         "stag_band": float(config.get("PROGRESSIVE_HH_STAG_BAND", 0.02)),
         "stag_window": int(config.get("PROGRESSIVE_HH_STAG_WINDOW", 3)),
+        "warmup_iter": int(config.get("PROGRESSIVE_HH_WARMUP_ITER", 0)),
         "max_iter_per_level": int(
             config.get("PROGRESSIVE_HH_MAX_ITER_PER_LEVEL", config.OPT_ITERATIONS)
         ),

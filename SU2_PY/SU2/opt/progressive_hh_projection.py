@@ -19,9 +19,12 @@ def get_midpoint_candidates(centers):
     extended = [0.0] + centers + [1.0]
     candidates = []
 
+    X_MAX = 0.97
+
     for i in range(len(extended) - 1):
         xm = 0.5 * (extended[i] + extended[i + 1])
-        if 0.0 < xm < 1.0:
+
+        if 0.0 < xm < X_MAX:
             candidates.append(
                 {
                     "x": xm,

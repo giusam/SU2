@@ -13,6 +13,7 @@ from SU2.opt.progressive_hh_core import (
     initial_centers,
     refine_uniform,
     refine_adaptive,
+    apply_post_opt_coefficient_spring,
 )
 
 
@@ -97,6 +98,38 @@ def build_initial_level(base_config, opts):
     )
 
 
+def _cap_uniform_refinement(prev_level, upper, lower, opts):
+    nfinal = opts.get("nfinal", None)
+    if nfinal is None:
+        return upper, lower
+
+    n_remaining = int(nfinal) - prev_level.ndv
+    if n_remaining <= 0:
+        return sorted(prev_level.upper), sorted(prev_level.lower)
+
+    old_upper = set(prev_level.upper)
+    old_lower = set(prev_level.lower)
+    add_upper = sorted(x for x in upper if x not in old_upper)
+    add_lower = sorted(x for x in lower if x not in old_lower)
+
+    additions = []
+    additions.extend(("UPPER", x) for x in add_upper)
+    additions.extend(("LOWER", x) for x in add_lower)
+    additions = sorted(additions, key=lambda item: (item[0], item[1]))
+
+    keep = additions[:n_remaining]
+    new_upper = sorted(prev_level.upper)
+    new_lower = sorted(prev_level.lower)
+
+    for side, x in keep:
+        if side == "UPPER":
+            new_upper.append(x)
+        else:
+            new_lower.append(x)
+
+    return sorted(set(new_upper)), sorted(set(new_lower))
+
+
 def build_next_level(prev_level, result, opts):
     next_id = prev_level.level_id + 1
 
@@ -104,11 +137,17 @@ def build_next_level(prev_level, result, opts):
     if next_mesh is None:
         next_mesh = prev_level.mesh_source
 
+    selection_metadata = None
+
     if opts["refinement"] == "ADAPTIVE":
         upper, lower = refine_adaptive(prev_level, result, opts)
+        selection_metadata = opts.get("_last_selection_metadata", None)
+        if selection_metadata is None:
+            upper, lower = _cap_uniform_refinement(prev_level, upper, lower, opts)
     else:
         upper = refine_uniform(prev_level.upper)
         lower = refine_uniform(prev_level.lower)
+        upper, lower = _cap_uniform_refinement(prev_level, upper, lower, opts)
 
     return HHLevel(
         level_id=next_id,
@@ -118,6 +157,56 @@ def build_next_level(prev_level, result, opts):
         config_filename=f"config_level{next_id}.cfg",
         project_filename=f"project_level{next_id}.pkl",
         mesh_source=next_mesh,
+        selection_metadata=selection_metadata,
+        post_opt_spring_pending=bool(
+            selection_metadata
+            and selection_metadata.get("post_opt_spring_pending", False)
+        ),
+        spring_reallocated=False,
+    )
+
+
+def build_spring_reallocated_level(prev_level, result, opts):
+    reallocated = apply_post_opt_coefficient_spring(prev_level, result, opts)
+    if reallocated is None:
+        print(
+            "[PROGRESSIVE_HH][SPRING] WARNING: could not build spring-reallocated level"
+        )
+        return None
+
+    upper, lower = reallocated
+    next_id = prev_level.level_id + 1
+
+    next_mesh = result.get("final_mesh", None)
+    if next_mesh is None:
+        next_mesh = prev_level.mesh_source
+
+    spring_metadata = {
+        "level_id": prev_level.level_id,
+        "ndv": prev_level.ndv,
+        "spring_timing": opts.get("spring_timing", "POST_OPT"),
+        "spring_score_mode": opts.get("spring_score_mode", "COEFFICIENT"),
+        "upper_before": sorted(prev_level.upper),
+        "lower_before": sorted(prev_level.lower),
+        "upper_after": sorted(upper),
+        "lower_after": sorted(lower),
+        "upper_coeff_abs": result.get("spring_upper_coeff_abs", []),
+        "lower_coeff_abs": result.get("spring_lower_coeff_abs", []),
+        "history_file": result.get("history_file"),
+        "final_mesh": result.get("final_mesh"),
+    }
+
+    return HHLevel(
+        level_id=next_id,
+        upper=upper,
+        lower=lower,
+        workdir=f"LEVEL_{next_id}",
+        config_filename=f"config_level{next_id}.cfg",
+        project_filename=f"project_level{next_id}.pkl",
+        mesh_source=next_mesh,
+        selection_metadata=spring_metadata,
+        post_opt_spring_pending=False,
+        spring_reallocated=True,
     )
 
 
@@ -160,6 +249,7 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH",
         "PROGRESSIVE_HH_NLEVELS",
         "PROGRESSIVE_HH_N0",
+        "PROGRESSIVE_HH_NFINAL",
         "PROGRESSIVE_HH_INITIAL_UPPER",
         "PROGRESSIVE_HH_INITIAL_LOWER",
         "PROGRESSIVE_HH_SURFACE",
@@ -168,15 +258,26 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH_WINDOW",
         "PROGRESSIVE_HH_TOL",
         "PROGRESSIVE_HH_SLOPE_FILTER_TOL",
+        "PROGRESSIVE_HH_TRIGGER_EPS",
+        "PROGRESSIVE_HH_SLOPE_PATIENCE",
         "PROGRESSIVE_HH_STAG_TOL",
         "PROGRESSIVE_HH_STAG_BAND",
         "PROGRESSIVE_HH_STAG_WINDOW",
         "PROGRESSIVE_HH_WARMUP_ITER",
         "PROGRESSIVE_HH_REFINEMENT",
         "PROGRESSIVE_HH_GROWTH_RATIO",
+        "PROGRESSIVE_HH_NADD_MODE",
+        "PROGRESSIVE_HH_FIXED_NADD",
+        "PROGRESSIVE_HH_BATCH_SIZE_MAX",
+        "PROGRESSIVE_HH_BATCH_SCORE_REL_TOL",
+        "PROGRESSIVE_HH_BATCH_MIN_SEPARATION",
+        "PROGRESSIVE_HH_BATCH_MAX_PER_SIDE",
+        "PROGRESSIVE_HH_CANDIDATE_SAMPLES",
         "PROGRESSIVE_HH_ADAPTIVE_INDICATOR",
         "PROGRESSIVE_HH_SPRING",
         "PROGRESSIVE_HH_SPRING_A",
+        "PROGRESSIVE_HH_SPRING_TIMING",
+        "PROGRESSIVE_HH_SPRING_SCORE_MODE",
     ]
 
     for key in progressive_keys:
@@ -208,7 +309,13 @@ def write_level_config(base_config, level, opts):
 
     _remove_progressive_keys(cfg)
 
-    if level.level_id == opts["nlevels"] - 1:
+    nfinal = opts.get("nfinal", None)
+    is_final_by_nlevels = (
+        nfinal is None and level.level_id >= opts["nlevels"] - 1
+    )
+    is_final_by_nfinal = nfinal is not None and level.ndv >= int(nfinal)
+
+    if is_final_by_nlevels or is_final_by_nfinal:
         cfg["OPT_ITERATIONS"] = int(base_config["OPT_ITERATIONS"])
     else:
         cfg["OPT_ITERATIONS"] = opts["max_iter_per_level"]
@@ -322,3 +429,100 @@ def collect_level_result(level):
         "history_file": history_file,
         "final_mesh": final_mesh,
     }
+
+
+def _format_centers(values):
+    return ";".join(f"{float(x):.12g}" for x in values)
+
+
+def append_selection_history_csv(
+    csv_path,
+    selection_metadata,
+    result,
+):
+    if not selection_metadata:
+        return
+
+    selected = selection_metadata.get("selected", [])
+    if not selected:
+        return
+
+    columns = [
+        "level_id",
+        "ndv_before",
+        "ndv_after",
+        "n_added",
+        "nadd_mode",
+        "trigger_mode",
+        "refinement",
+        "spring_enabled",
+        "side",
+        "x",
+        "indicator",
+        "indicator_ratio_to_best",
+        "interval_id",
+        "interval_left",
+        "interval_right",
+        "sample_index",
+        "sample_fraction",
+        "upper_before",
+        "lower_before",
+        "upper_after",
+        "lower_after",
+        "history_file",
+        "final_mesh",
+    ]
+
+    write_header = not os.path.exists(csv_path)
+
+    with open(csv_path, "a", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=columns)
+        if write_header:
+            writer.writeheader()
+
+        for c in selected:
+            writer.writerow(
+                {
+                    "level_id": selection_metadata.get("level_id"),
+                    "ndv_before": selection_metadata.get("ndv_before"),
+                    "ndv_after": selection_metadata.get("ndv_after"),
+                    "n_added": selection_metadata.get("n_added"),
+                    "nadd_mode": selection_metadata.get("nadd_mode"),
+                    "trigger_mode": selection_metadata.get("trigger_mode"),
+                    "refinement": selection_metadata.get("refinement"),
+                    "spring_enabled": "YES"
+                    if selection_metadata.get("spring_enabled")
+                    else "NO",
+                    "side": c.get("side"),
+                    "x": f"{float(c.get('x')):.12g}",
+                    "indicator": f"{float(c.get('indicator')):.12e}",
+                    "indicator_ratio_to_best": (
+                        f"{float(c.get('indicator_ratio_to_best')):.12e}"
+                    ),
+                    "interval_id": c.get("interval_id", ""),
+                    "interval_left": ""
+                    if c.get("interval_left") is None
+                    else f"{float(c.get('interval_left')):.12g}",
+                    "interval_right": ""
+                    if c.get("interval_right") is None
+                    else f"{float(c.get('interval_right')):.12g}",
+                    "sample_index": c.get("sample_index", ""),
+                    "sample_fraction": ""
+                    if c.get("sample_fraction") is None
+                    else f"{float(c.get('sample_fraction')):.12g}",
+                    "upper_before": _format_centers(
+                        selection_metadata.get("upper_before", [])
+                    ),
+                    "lower_before": _format_centers(
+                        selection_metadata.get("lower_before", [])
+                    ),
+                    "upper_after": _format_centers(
+                        selection_metadata.get("upper_after", [])
+                    ),
+                    "lower_after": _format_centers(
+                        selection_metadata.get("lower_after", [])
+                    ),
+                    "history_file": result.get("history_file"),
+                    "final_mesh": result.get("final_mesh"),
+                }
+            )

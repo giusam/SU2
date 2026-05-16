@@ -5,6 +5,7 @@
 #  \author T. Lukaczyk, F. Palacios
 #  \version 8.4.0 "Harrier"
 
+import math
 import sys
 
 from .. import eval as su2eval
@@ -144,6 +145,76 @@ def _check_slope_trigger(project, obj_value, opts):
     if ratio < r:
         project.refinement_triggered = True
         sys.stdout.write("[PROGRESSIVE_HH] Efficiency trigger -> STOP\n")
+        raise RefinementTriggered()
+
+
+def _check_slope_best_log_trigger(project, obj_value, opts):
+    _init_trigger_state(project)
+
+    state = project.trigger_state
+    state.setdefault("last_log_best", None)
+    state.setdefault("improvements", [])
+    state.setdefault("max_slope_seen", 0.0)
+    state.setdefault("bad_count", 0)
+
+    warmup_iter = int(opts.get("warmup_iter", 0))
+    window = max(1, int(opts.get("window", 1)))
+    tol = float(opts.get("tol", 0.2))
+    eps = float(opts.get("eps", 1.0e-300))
+    patience = max(1, int(opts.get("patience", 1)))
+
+    best_obj = state.get("best_obj", None)
+    if best_obj is None or obj_value < best_obj:
+        best_obj = obj_value
+        state["best_obj"] = best_obj
+
+    y_k = math.log(max(best_obj, eps))
+
+    if state["last_log_best"] is None:
+        state["last_log_best"] = y_k
+        return
+
+    delta_k = state["last_log_best"] - y_k
+    if delta_k < 0.0:
+        delta_k = 0.0
+    state["improvements"].append(delta_k)
+
+    if len(project.trigger_history) <= warmup_iter:
+        state["last_log_best"] = y_k
+        sys.stdout.write(
+            "[PROGRESSIVE_HH] SLOPE_EFFICIENCY_BEST_LOG | "
+            f"warmup phase ({len(project.trigger_history)}/{warmup_iter})\n"
+        )
+        return
+
+    if len(state["improvements"]) < window:
+        state["last_log_best"] = y_k
+        return
+
+    recent = state["improvements"][-window:]
+    recent_slope = sum(recent) / float(window)
+
+    if recent_slope > 0.0:
+        state["max_slope_seen"] = max(state["max_slope_seen"], recent_slope)
+
+    ratio = recent_slope / max(state["max_slope_seen"], eps)
+
+    sys.stdout.write(
+        "[PROGRESSIVE_HH] SLOPE_EFFICIENCY_BEST_LOG | "
+        f"ratio={ratio:.6e} threshold={tol:.6e} "
+        f"bad_count={state['bad_count']}/{patience}\n"
+    )
+
+    if ratio < tol:
+        state["bad_count"] += 1
+    else:
+        state["bad_count"] = 0
+
+    state["last_log_best"] = y_k
+
+    if state["bad_count"] >= patience:
+        project.refinement_triggered = True
+        sys.stdout.write("[PROGRESSIVE_HH] SLOPE_EFFICIENCY_BEST_LOG -> STOP\n")
         raise RefinementTriggered()
 
 
@@ -289,6 +360,8 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
     # Store the last objective gradient seen by scipy
     project.last_obj_grad = None
     project.last_obj_grad_x = None
+    project.last_dv_values = None
+    project.opt_dv_values = None
 
     if not hasattr(project, "trigger_opts"):
         project.trigger_opts = None
@@ -317,6 +390,14 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
             "[PROGRESSIVE_HH] Optimization stopped early due to refinement trigger\n"
         )
         outputs = None
+
+    if outputs is not None:
+        try:
+            project.opt_dv_values = [float(v) for v in outputs[0]]
+        except Exception:
+            project.opt_dv_values = getattr(project, "last_dv_values", None)
+    else:
+        project.opt_dv_values = getattr(project, "last_dv_values", None)
 
     return outputs
 
@@ -493,6 +574,8 @@ def scipy_powell(project, x0=None, xb=None, its=100, accu=1e-10, grads=False):
 
 
 def obj_f(x, project):
+    project.last_dv_values = [float(v) for v in x]
+
     obj_list = project.obj_f(x)
     obj = 0
     for this_obj in obj_list:
@@ -508,8 +591,11 @@ def obj_f(x, project):
     if opts:
         trigger = str(opts.get("trigger", "")).upper()
 
-        if trigger == "SLOPE_EFFICIENCY_TRIGGER":
+        if trigger in ("SLOPE_EFFICIENCY_TRIGGER", "SLOPE_EFFICIENCY_FILTERED"):
             _check_slope_trigger(project, obj, opts)
+
+        elif trigger == "SLOPE_EFFICIENCY_BEST_LOG":
+            _check_slope_best_log_trigger(project, obj, opts)
 
         elif trigger == "STAGNATION_TRIGGER":
             _check_stagnation_trigger(project, obj, opts)

@@ -14,18 +14,31 @@ from SU2.opt.progressive_hh import (
     get_progressive_hh_options,
     build_initial_level,
     build_next_level,
+    build_spring_reallocated_level,
     write_level_config,
     collect_level_result,
     should_refine,
+    append_selection_history_csv,
 )
 
 
-def _build_online_trigger_opts(hh_opts, ilevel):
+def _is_final_progressive_hh_level(hh_opts, ilevel, current_ndv=None):
+    nfinal = hh_opts.get("nfinal", None)
+    if nfinal is not None and current_ndv is not None:
+        return current_ndv >= int(nfinal)
+
+    if nfinal is None:
+        return ilevel >= hh_opts["nlevels"] - 1
+
+    return False
+
+
+def _build_online_trigger_opts(hh_opts, ilevel, current_ndv=None):
     """
     Build the trigger options passed to scipy_tools.py for online triggering.
     The last level is never refined online.
     """
-    if ilevel == hh_opts["nlevels"] - 1:
+    if _is_final_progressive_hh_level(hh_opts, ilevel, current_ndv=current_ndv):
         return None
 
     trigger = hh_opts["trigger"]
@@ -34,13 +47,23 @@ def _build_online_trigger_opts(hh_opts, ilevel):
     if trigger == "MAX_ITER":
         return None
 
-    if trigger == "SLOPE_EFFICIENCY_TRIGGER":
+    if trigger in ("SLOPE_EFFICIENCY_TRIGGER", "SLOPE_EFFICIENCY_FILTERED"):
         return {
             "trigger": trigger,
             "window": hh_opts["window"],
             "tol": hh_opts["tol"],
             "filter_tol": hh_opts["slope_filter_tol"],
             "warmup_iter": warmup_iter,
+        }
+
+    if trigger == "SLOPE_EFFICIENCY_BEST_LOG":
+        return {
+            "trigger": "SLOPE_EFFICIENCY_BEST_LOG",
+            "window": hh_opts["window"],
+            "tol": hh_opts["tol"],
+            "warmup_iter": warmup_iter,
+            "eps": hh_opts.get("trigger_eps", 1.0e-300),
+            "patience": hh_opts.get("slope_patience", 1),
         }
 
     if trigger == "STAGNATION_TRIGGER":
@@ -211,10 +234,15 @@ def progressive_hh_shape_optimization(
             sys.stdout.write(f"[PROGRESSIVE_HH] Removing {d}\n")
             shutil.rmtree(d)
 
+    selection_history_csv = "progressive_hh_selection_history.csv"
+    if os.path.exists(selection_history_csv):
+        os.remove(selection_history_csv)
+
     level = build_initial_level(base_config, hh_opts)
     final_project = None
 
-    for ilevel in range(hh_opts["nlevels"]):
+    ilevel = 0
+    while True:
         cfg_path = write_level_config(base_config, level, hh_opts)
         level_project = os.path.join(level.workdir, level.project_filename)
 
@@ -223,7 +251,11 @@ def progressive_hh_shape_optimization(
         sys.stdout.write(f"[PROGRESSIVE_HH] Lower centers: {level.lower}\n")
         sys.stdout.write(f"[PROGRESSIVE_HH] Mesh source: {level.mesh_source}\n")
 
-        trigger_opts = _build_online_trigger_opts(hh_opts, ilevel)
+        trigger_opts = _build_online_trigger_opts(
+            hh_opts,
+            ilevel,
+            current_ndv=level.ndv,
+        )
 
         cwd = os.getcwd()
         try:
@@ -243,6 +275,30 @@ def progressive_hh_shape_optimization(
 
         final_project = level_project
         result = collect_level_result(level)
+        result["dv_values"] = getattr(
+            project,
+            "opt_dv_values",
+            getattr(project, "last_dv_values", None),
+        )
+
+        if getattr(level, "post_opt_spring_pending", False):
+            spring_level = build_spring_reallocated_level(level, result, hh_opts)
+            if spring_level is not None:
+                level = spring_level
+                ilevel += 1
+                continue
+            sys.stdout.write(
+                "[PROGRESSIVE_HH][SPRING] WARNING: post-opt spring skipped; "
+                "continuing normal progressive logic\n"
+            )
+
+        if _is_final_progressive_hh_level(
+            hh_opts,
+            ilevel,
+            current_ndv=level.ndv,
+        ):
+            sys.stdout.write(f"[PROGRESSIVE_HH] Stop after final level {ilevel}\n")
+            break
 
         if hh_opts["trigger"] == "MAX_ITER":
             refine_now = should_refine(result["history"], hh_opts, ilevel)
@@ -253,11 +309,24 @@ def progressive_hh_shape_optimization(
             sys.stdout.write(f"[PROGRESSIVE_HH] Stop after level {ilevel}\n")
             break
 
-        if ilevel == hh_opts["nlevels"] - 1:
+        if hh_opts.get("nfinal", None) is None and ilevel == hh_opts["nlevels"] - 1:
             sys.stdout.write(f"[PROGRESSIVE_HH] Reached maximum level {ilevel}\n")
             break
 
+        ndv_before_refine = level.ndv
         level = build_next_level(level, result, hh_opts)
+        append_selection_history_csv(
+            selection_history_csv,
+            getattr(level, "selection_metadata", None),
+            result,
+        )
+        if hh_opts.get("nfinal", None) is not None and level.ndv <= ndv_before_refine:
+            sys.stdout.write(
+                "[PROGRESSIVE_HH] Stop: refinement did not increase NDV "
+                f"before reaching NFINAL={hh_opts['nfinal']}\n"
+            )
+            break
+        ilevel += 1
 
     if projectname and final_project and os.path.exists(final_project):
         shutil.copy(final_project, projectname)

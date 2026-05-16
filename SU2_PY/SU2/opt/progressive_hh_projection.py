@@ -11,7 +11,7 @@ import SU2
 from scipy.optimize import lsq_linear
 
 
-def get_midpoint_candidates(centers):
+def get_midpoint_candidates(centers, nsamples=1):
     centers = sorted(list(centers))
     if not centers:
         return []
@@ -20,19 +20,69 @@ def get_midpoint_candidates(centers):
     candidates = []
 
     X_MAX = 0.97
+    nsamples = int(nsamples)
+    if nsamples < 1:
+        raise ValueError("candidate sample count must be >= 1")
 
     for i in range(len(extended) - 1):
-        xm = 0.5 * (extended[i] + extended[i + 1])
+        x_left = float(extended[i])
+        x_right = float(extended[i + 1])
 
-        if 0.0 < xm < X_MAX:
-            candidates.append(
-                {
-                    "x": xm,
-                    "interval_id": i,
-                }
-            )
+        for j in range(1, nsamples + 1):
+            frac = float(j) / float(nsamples + 1)
+            x = x_left + frac * (x_right - x_left)
+
+            if 0.0 < x < X_MAX:
+                candidates.append(
+                    {
+                        "x": x,
+                        "interval_id": i,
+                        "interval_left": x_left,
+                        "interval_right": x_right,
+                        "sample_index": j,
+                        "sample_fraction": frac,
+                    }
+                )
 
     return candidates
+
+
+def _reduce_candidates_to_interval_best(candidates):
+    best_by_interval = {}
+
+    for c in candidates:
+        key = (c["side"], c["interval_id"])
+        current = best_by_interval.get(key)
+        candidate_key = (
+            float(c["indicator"]),
+            -float(c["x"]),
+        )
+
+        if current is None:
+            best_by_interval[key] = c
+            continue
+
+        current_key = (
+            float(current["indicator"]),
+            -float(current["x"]),
+        )
+        if candidate_key > current_key:
+            best_by_interval[key] = c
+
+    reduced = sorted(
+        best_by_interval.values(),
+        key=lambda c: (str(c["side"]), int(c["interval_id"]), float(c["x"])),
+    )
+
+    for c in reduced:
+        print(
+            "[PROGRESSIVE_HH] Candidate interval best | "
+            f"side={c['side']} "
+            f"interval=[{c['interval_left']:.6f},{c['interval_right']:.6f}] "
+            f"selected_x={c['x']:.6f} I={c['indicator']:.6e}"
+        )
+
+    return reduced
 
 
 def _find_real_adjoint_assets(level_dir, func_name):
@@ -495,9 +545,14 @@ def _compute_dot_candidate_scores(level, opts):
 
     active_upper = list(level.upper)
     active_lower = list(level.lower)
+    nsamples = int(opts.get("candidate_samples", 1))
 
-    cand_upper_raw = get_midpoint_candidates(active_upper)
-    cand_lower_raw = get_midpoint_candidates(active_lower)
+    cand_upper_raw = get_midpoint_candidates(active_upper, nsamples=nsamples)
+    cand_lower_raw = get_midpoint_candidates(active_lower, nsamples=nsamples)
+    for c in cand_upper_raw:
+        c["side"] = "UPPER"
+    for c in cand_lower_raw:
+        c["side"] = "LOWER"
 
     cand_upper = [c["x"] for c in cand_upper_raw]
     cand_lower = [c["x"] for c in cand_lower_raw]
@@ -524,11 +579,24 @@ def _compute_dot_candidate_scores(level, opts):
 
     grad_obj = _run_dot_for_function(level.workdir, cfg_dot, state, obj_name)
 
-    n_active = len(active_upper) + len(active_lower)
     n_upper_active = len(active_upper)
+    n_lower_active = len(active_lower)
+    n_upper_candidate = len(cand_upper)
+    n_lower_candidate = len(cand_lower)
+    n_active = n_upper_active + n_lower_active
 
-    grad_active = grad_obj[:n_active]
-    grad_candidate = grad_obj[n_active:]
+    i_upper_active_0 = 0
+    i_upper_candidate_0 = i_upper_active_0 + n_upper_active
+    i_lower_active_0 = i_upper_candidate_0 + n_upper_candidate
+    i_lower_candidate_0 = i_lower_active_0 + n_lower_active
+
+    grad_upper_active = grad_obj[i_upper_active_0:i_upper_candidate_0]
+    grad_upper_candidate = grad_obj[i_upper_candidate_0:i_lower_active_0]
+    grad_lower_active = grad_obj[i_lower_active_0:i_lower_candidate_0]
+    grad_lower_candidate = grad_obj[i_lower_candidate_0:]
+
+    grad_active = list(grad_upper_active) + list(grad_lower_active)
+    grad_candidate = list(grad_upper_candidate) + list(grad_lower_candidate)
 
     if len(grad_candidate) == 0:
         raise RuntimeError("DOT returned empty candidate gradient")
@@ -577,9 +645,22 @@ def _compute_dot_candidate_scores(level, opts):
             lambda_bounds=lambda_bounds,
         )
 
-        active_indicator = np.abs(np.asarray(residual_full[:n_active], dtype=float)).tolist()
+        residual_upper_active = residual_full[i_upper_active_0:i_upper_candidate_0]
+        residual_upper_candidate = residual_full[i_upper_candidate_0:i_lower_active_0]
+        residual_lower_active = residual_full[i_lower_active_0:i_lower_candidate_0]
+        residual_lower_candidate = residual_full[i_lower_candidate_0:]
+
+        active_indicator = np.abs(
+            np.asarray(
+                list(residual_upper_active) + list(residual_lower_active),
+                dtype=float,
+            )
+        ).tolist()
         candidate_indicator = np.abs(
-            np.asarray(residual_full[n_active:], dtype=float)
+            np.asarray(
+                list(residual_upper_candidate) + list(residual_lower_candidate),
+                dtype=float,
+            )
         ).tolist()
     else:
         active_indicator = np.abs(np.asarray(grad_active, dtype=float)).tolist()
@@ -587,46 +668,60 @@ def _compute_dot_candidate_scores(level, opts):
 
     active_upper_scores = active_indicator[:n_upper_active]
     active_lower_scores = active_indicator[n_upper_active:]
+    candidate_upper_scores = candidate_indicator[:n_upper_candidate]
+    candidate_lower_scores = candidate_indicator[n_upper_candidate:]
 
     candidates = []
-    k = 0
 
-    for c in cand_upper_raw:
+    for k, c in enumerate(cand_upper_raw):
         candidates.append(
             {
-                "side": "UPPER",
+                "side": c["side"],
                 "x": float(c["x"]),
-                "grad": float(grad_candidate[k]),
-                "indicator": float(candidate_indicator[k]),
+                "grad": float(grad_upper_candidate[k]),
+                "indicator": float(candidate_upper_scores[k]),
                 "interval_id": c["interval_id"],
+                "interval_left": float(c["interval_left"]),
+                "interval_right": float(c["interval_right"]),
+                "sample_index": int(c["sample_index"]),
+                "sample_fraction": float(c["sample_fraction"]),
             }
         )
-        k += 1
 
-    for c in cand_lower_raw:
+    for k, c in enumerate(cand_lower_raw):
         candidates.append(
             {
-                "side": "LOWER",
+                "side": c["side"],
                 "x": float(c["x"]),
-                "grad": float(grad_candidate[k]),
-                "indicator": float(candidate_indicator[k]),
+                "grad": float(grad_lower_candidate[k]),
+                "indicator": float(candidate_lower_scores[k]),
                 "interval_id": c["interval_id"],
+                "interval_left": float(c["interval_left"]),
+                "interval_right": float(c["interval_right"]),
+                "sample_index": int(c["sample_index"]),
+                "sample_fraction": float(c["sample_fraction"]),
             }
         )
-        k += 1
 
     print(
         f"[PROGRESSIVE_HH] Candidate scoring | mode={indicator_mode} "
-        f"active_ndv={n_active} candidate_ndv={expected_ncand}"
+        f"active_ndv={n_active} candidate_ndv={expected_ncand} samples={nsamples}"
     )
     for c in candidates:
         print(
             "[PROGRESSIVE_HH] Candidate | "
-            f"side={c['side']} x={c['x']:.6f} I={c['indicator']:.6e}"
+            f"side={c['side']} interval_id={c['interval_id']} "
+            f"interval=[{c['interval_left']:.6f},{c['interval_right']:.6f}] "
+            f"sample_index={c['sample_index']} "
+            f"sample_fraction={c['sample_fraction']:.6f} "
+            f"x={c['x']:.6f} I={c['indicator']:.6e}"
         )
 
+    reduced_candidates = _reduce_candidates_to_interval_best(candidates)
+
     return {
-        "candidates": candidates,
+        "candidates": reduced_candidates,
+        "raw_candidates": candidates,
         "active_upper_scores": active_upper_scores,
         "active_lower_scores": active_lower_scores,
     }

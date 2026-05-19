@@ -6,7 +6,10 @@ from SU2.opt.hh_spring import (
     apply_hh_spring_after_selection,
     spring_redistribute_centers,
 )
-from SU2.opt.progressive_hh_projection import _compute_dot_candidate_scores
+from SU2.opt.progressive_hh_projection import (
+    _check_min_center_spacing,
+    _compute_dot_candidate_scores,
+)
 
 
 class HHLevel:
@@ -102,11 +105,17 @@ def get_progressive_hh_options(config):
         config.get("PROGRESSIVE_HH_BATCH_MAX_PER_SIDE", None)
     )
     candidate_samples = int(config.get("PROGRESSIVE_HH_CANDIDATE_SAMPLES", 1))
+    min_center_spacing = float(
+        config.get("PROGRESSIVE_HH_MIN_CENTER_SPACING", 0.0)
+    )
     spring_timing = str(
         config.get("PROGRESSIVE_HH_SPRING_TIMING", "POST_OPT")
     ).upper()
     spring_score_mode = str(
         config.get("PROGRESSIVE_HH_SPRING_SCORE_MODE", "COEFFICIENT")
+    ).upper()
+    spring_post_action = str(
+        config.get("PROGRESSIVE_HH_SPRING_POST_ACTION", "REOPTIMIZE")
     ).upper()
 
     allowed_triggers = (
@@ -143,6 +152,13 @@ def get_progressive_hh_options(config):
             f"{spring_score_mode!r}; allowed values are {allowed_spring_score_modes}"
         )
 
+    allowed_spring_post_actions = ("REOPTIMIZE", "REFINE")
+    if spring_post_action not in allowed_spring_post_actions:
+        raise ValueError(
+            "Invalid PROGRESSIVE_HH_SPRING_POST_ACTION "
+            f"{spring_post_action!r}; allowed values are {allowed_spring_post_actions}"
+        )
+
     if fixed_nadd < 1:
         raise ValueError("PROGRESSIVE_HH_FIXED_NADD must be >= 1")
     if batch_size_max < 1:
@@ -155,6 +171,8 @@ def get_progressive_hh_options(config):
         raise ValueError("PROGRESSIVE_HH_BATCH_MAX_PER_SIDE must be NONE or >= 1")
     if candidate_samples < 1:
         raise ValueError("PROGRESSIVE_HH_CANDIDATE_SAMPLES must be >= 1")
+    if min_center_spacing < 0.0:
+        raise ValueError("PROGRESSIVE_HH_MIN_CENTER_SPACING must be >= 0.0")
 
     initial_ndv = 0
     if surface_mode in ("UPPER", "BOTH"):
@@ -205,6 +223,7 @@ def get_progressive_hh_options(config):
         "batch_min_separation": batch_min_separation,
         "batch_max_per_side": batch_max_per_side,
         "candidate_samples": candidate_samples,
+        "min_center_spacing": min_center_spacing,
         "adaptive_indicator": str(
             config.get("PROGRESSIVE_HH_ADAPTIVE_INDICATOR", "ABS_GRAD")
         ).upper(),
@@ -214,6 +233,7 @@ def get_progressive_hh_options(config):
         "spring_A": float(config.get("PROGRESSIVE_HH_SPRING_A", 20.0)),
         "spring_timing": spring_timing,
         "spring_score_mode": spring_score_mode,
+        "spring_post_action": spring_post_action,
     }
 
 
@@ -262,6 +282,59 @@ def _select_top_candidates(candidates, nadd):
     return ranked[:nadd]
 
 
+def _log_min_spacing_rejection(candidate, spacing_check, min_spacing):
+    print(
+        "[PROGRESSIVE_HH] Candidate rejected by min spacing | "
+        f"side={candidate['side']} x={float(candidate['x']):.6f} "
+        f"nearest={float(spacing_check['nearest']):.6f} "
+        f"dist={float(spacing_check['nearest_distance']):.6f} "
+        f"required={float(min_spacing):.6f}"
+    )
+
+
+def _selected_x_by_side(selected):
+    selected_by_side = {}
+    for c in selected:
+        side = str(c["side"])
+        selected_by_side.setdefault(side, []).append(float(c["x"]))
+    return selected_by_side
+
+
+def _passes_min_center_spacing(candidate, selected, active_centers_by_side, opts):
+    min_spacing = float(opts.get("min_center_spacing", 0.0))
+    if min_spacing <= 0.0:
+        return True
+
+    spacing_check = _check_min_center_spacing(
+        candidate["side"],
+        candidate["x"],
+        active_centers_by_side,
+        _selected_x_by_side(selected),
+        min_spacing,
+    )
+    if spacing_check["accepted"]:
+        return True
+
+    _log_min_spacing_rejection(candidate, spacing_check, min_spacing)
+    return False
+
+
+def _select_ranked_candidates_with_min_spacing(
+    ranked,
+    nadd,
+    active_centers_by_side,
+    opts,
+):
+    selected = []
+    for c in ranked:
+        if len(selected) >= nadd:
+            break
+        if not _passes_min_center_spacing(c, selected, active_centers_by_side, opts):
+            continue
+        selected.append(c)
+    return selected
+
+
 def select_adaptive_candidate_batch(
     candidates,
     max_batch_size,
@@ -269,6 +342,8 @@ def select_adaptive_candidate_batch(
     min_separation,
     max_per_side=None,
     n_remaining=None,
+    active_centers_by_side=None,
+    opts=None,
 ):
     if not candidates:
         return []
@@ -295,6 +370,8 @@ def select_adaptive_candidate_batch(
     threshold = score_rel_tol * best_indicator
     selected = []
     per_side = {}
+    active_centers_by_side = active_centers_by_side or {}
+    opts = opts or {}
 
     for c in ranked:
         if len(selected) >= max_batch_size:
@@ -308,6 +385,9 @@ def select_adaptive_candidate_batch(
             continue
 
         if max_per_side is not None and per_side.get(side, 0) >= max_per_side:
+            continue
+
+        if not _passes_min_center_spacing(c, selected, active_centers_by_side, opts):
             continue
 
         too_close = False
@@ -324,9 +404,16 @@ def select_adaptive_candidate_batch(
     return selected
 
 
-def select_candidates_by_nadd_mode(candidates, current_ndv, opts):
+def select_candidates_by_nadd_mode(
+    candidates,
+    current_ndv,
+    opts,
+    active_centers_by_side=None,
+):
     if not candidates:
         return []
+
+    active_centers_by_side = active_centers_by_side or {}
 
     nfinal = opts.get("nfinal", None)
     n_remaining = None
@@ -345,13 +432,25 @@ def select_candidates_by_nadd_mode(candidates, current_ndv, opts):
         )
         if n_remaining is not None:
             nadd = min(nadd, n_remaining)
-        return _select_top_candidates(candidates, nadd)
+        ranked = sorted(candidates, key=lambda c: (-c["indicator"], c["x"]))
+        return _select_ranked_candidates_with_min_spacing(
+            ranked,
+            nadd,
+            active_centers_by_side,
+            opts,
+        )
 
     if mode == "FIXED":
         nadd = int(opts.get("fixed_nadd", 1))
         if n_remaining is not None:
             nadd = min(nadd, n_remaining)
-        return _select_top_candidates(candidates, nadd)
+        ranked = sorted(candidates, key=lambda c: (-c["indicator"], c["x"]))
+        return _select_ranked_candidates_with_min_spacing(
+            ranked,
+            nadd,
+            active_centers_by_side,
+            opts,
+        )
 
     if mode == "SCORE_BATCH":
         return select_adaptive_candidate_batch(
@@ -361,6 +460,8 @@ def select_candidates_by_nadd_mode(candidates, current_ndv, opts):
             opts.get("batch_min_separation", 0.04),
             max_per_side=opts.get("batch_max_per_side", None),
             n_remaining=n_remaining,
+            active_centers_by_side=active_centers_by_side,
+            opts=opts,
         )
 
     raise ValueError(f"Unknown progressive HH candidate addition mode: {mode}")
@@ -383,10 +484,25 @@ def refine_adaptive(prev_level, result, opts):
         return refine_uniform(prev_level.upper), refine_uniform(prev_level.lower)
 
     if not candidates:
+        if scoring.get("spacing_filtered_empty", False):
+            print(
+                "[PROGRESSIVE_HH] ADAPTIVE refine | "
+                "no valid candidates after min-spacing filtering -> no refinement"
+            )
+            return sorted(prev_level.upper), sorted(prev_level.lower)
         print("[PROGRESSIVE_HH] ADAPTIVE refine | no candidates -> fallback to UNIFORM")
         return refine_uniform(prev_level.upper), refine_uniform(prev_level.lower)
 
-    chosen = select_candidates_by_nadd_mode(candidates, current_ndv, opts)
+    active_centers_by_side = {
+        "UPPER": sorted(prev_level.upper),
+        "LOWER": sorted(prev_level.lower),
+    }
+    chosen = select_candidates_by_nadd_mode(
+        candidates,
+        current_ndv,
+        opts,
+        active_centers_by_side=active_centers_by_side,
+    )
     nadd = len(chosen)
 
     if not chosen:
@@ -544,6 +660,12 @@ def refine_adaptive(prev_level, result, opts):
                 "interval_right": c.get("interval_right"),
                 "sample_index": c.get("sample_index"),
                 "sample_fraction": c.get("sample_fraction"),
+                "rejected_reason": c.get("rejected_reason", ""),
+                "nearest_center_or_boundary": c.get(
+                    "nearest_center_or_boundary", ""
+                ),
+                "nearest_distance": c.get("nearest_distance", ""),
+                "required_spacing": c.get("required_spacing", ""),
             }
             for i, c in enumerate(chosen)
         ],

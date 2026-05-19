@@ -281,16 +281,37 @@ def progressive_hh_shape_optimization(
             getattr(project, "last_dv_values", None),
         )
 
+        force_refine_after_spring = False
+
         if getattr(level, "post_opt_spring_pending", False):
-            spring_level = build_spring_reallocated_level(level, result, hh_opts)
-            if spring_level is not None:
-                level = spring_level
-                ilevel += 1
-                continue
-            sys.stdout.write(
-                "[PROGRESSIVE_HH][SPRING] WARNING: post-opt spring skipped; "
-                "continuing normal progressive logic\n"
+            spring_post_action = str(
+                hh_opts.get("spring_post_action", "REOPTIMIZE")
+            ).upper()
+            spring_level = build_spring_reallocated_level(
+                level,
+                result,
+                hh_opts,
+                reoptimize=(spring_post_action == "REOPTIMIZE"),
             )
+            if spring_level is not None:
+                sys.stdout.write(
+                    "[PROGRESSIVE_HH] POST_OPT spring applied | "
+                    f"post_action={spring_post_action}\n"
+                )
+                level = spring_level
+                if spring_post_action == "REOPTIMIZE":
+                    ilevel += 1
+                    continue
+                sys.stdout.write(
+                    "[PROGRESSIVE_HH] Skipping post-spring same-NDV optimization; "
+                    "proceeding directly to refinement.\n"
+                )
+                force_refine_after_spring = True
+            else:
+                sys.stdout.write(
+                    "[PROGRESSIVE_HH][SPRING] WARNING: post-opt spring skipped; "
+                    "continuing normal progressive logic\n"
+                )
 
         if _is_final_progressive_hh_level(
             hh_opts,
@@ -300,7 +321,9 @@ def progressive_hh_shape_optimization(
             sys.stdout.write(f"[PROGRESSIVE_HH] Stop after final level {ilevel}\n")
             break
 
-        if hh_opts["trigger"] == "MAX_ITER":
+        if force_refine_after_spring:
+            refine_now = True
+        elif hh_opts["trigger"] == "MAX_ITER":
             refine_now = should_refine(result["history"], hh_opts, ilevel)
         else:
             refine_now = bool(getattr(project, "refinement_triggered", False))

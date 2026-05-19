@@ -85,6 +85,96 @@ def _reduce_candidates_to_interval_best(candidates):
     return reduced
 
 
+def _check_min_center_spacing(
+    side,
+    x,
+    active_centers_by_side,
+    selected_candidates_by_side,
+    min_spacing,
+):
+    min_spacing = float(min_spacing)
+    if min_spacing <= 0.0:
+        return {
+            "accepted": True,
+            "nearest": None,
+            "nearest_distance": None,
+            "rejected_reason": "",
+        }
+
+    side = str(side)
+    x = float(x)
+    reference_values = []
+    reference_values.extend(
+        float(v) for v in active_centers_by_side.get(side, [])
+    )
+    reference_values.extend(
+        float(v) for v in selected_candidates_by_side.get(side, [])
+    )
+    reference_values.extend([0.0, 1.0])
+
+    nearest = None
+    nearest_distance = None
+    for value in reference_values:
+        dist = abs(x - value)
+        if nearest_distance is None or dist < nearest_distance:
+            nearest = value
+            nearest_distance = dist
+
+    if nearest_distance is not None and nearest_distance < min_spacing:
+        return {
+            "accepted": False,
+            "nearest": nearest,
+            "nearest_distance": nearest_distance,
+            "rejected_reason": "MIN_CENTER_SPACING",
+        }
+
+    return {
+        "accepted": True,
+        "nearest": nearest,
+        "nearest_distance": nearest_distance,
+        "rejected_reason": "",
+    }
+
+
+def _filter_candidates_by_min_spacing(
+    candidates,
+    active_centers_by_side,
+    min_spacing,
+):
+    min_spacing = float(min_spacing)
+    if min_spacing <= 0.0:
+        return candidates
+
+    selected_candidates_by_side = {}
+    filtered = []
+
+    for c in candidates:
+        check = _check_min_center_spacing(
+            c["side"],
+            c["x"],
+            active_centers_by_side,
+            selected_candidates_by_side,
+            min_spacing,
+        )
+        if check["accepted"]:
+            filtered.append(c)
+            continue
+
+        c["rejected_reason"] = check["rejected_reason"]
+        c["nearest_center_or_boundary"] = check["nearest"]
+        c["nearest_distance"] = check["nearest_distance"]
+        c["required_spacing"] = min_spacing
+        print(
+            "[PROGRESSIVE_HH] Candidate rejected by min spacing | "
+            f"side={c['side']} x={float(c['x']):.6f} "
+            f"nearest={float(check['nearest']):.6f} "
+            f"dist={float(check['nearest_distance']):.6f} "
+            f"required={min_spacing:.6f}"
+        )
+
+    return filtered
+
+
 def _find_real_adjoint_assets(level_dir, func_name):
     func_name = str(func_name).upper()
 
@@ -546,6 +636,12 @@ def _compute_dot_candidate_scores(level, opts):
     active_upper = list(level.upper)
     active_lower = list(level.lower)
     nsamples = int(opts.get("candidate_samples", 1))
+    min_spacing = float(opts.get("min_center_spacing", 0.0))
+
+    print(
+        "[PROGRESSIVE_HH] Candidate sampling | "
+        f"samples={nsamples} min_spacing={min_spacing:.6f}"
+    )
 
     cand_upper_raw = get_midpoint_candidates(active_upper, nsamples=nsamples)
     cand_lower_raw = get_midpoint_candidates(active_lower, nsamples=nsamples)
@@ -554,12 +650,31 @@ def _compute_dot_candidate_scores(level, opts):
     for c in cand_lower_raw:
         c["side"] = "LOWER"
 
+    active_centers_by_side = {
+        "UPPER": active_upper,
+        "LOWER": active_lower,
+    }
+    raw_candidates = cand_upper_raw + cand_lower_raw
+    raw_candidates = _filter_candidates_by_min_spacing(
+        raw_candidates,
+        active_centers_by_side,
+        min_spacing,
+    )
+    cand_upper_raw = [c for c in raw_candidates if c["side"] == "UPPER"]
+    cand_lower_raw = [c for c in raw_candidates if c["side"] == "LOWER"]
+
     cand_upper = [c["x"] for c in cand_upper_raw]
     cand_lower = [c["x"] for c in cand_lower_raw]
 
     if not cand_upper and not cand_lower:
+        if min_spacing > 0.0:
+            print(
+                "[PROGRESSIVE_HH] No valid candidates remain after "
+                "min-spacing filtering."
+            )
         return {
             "candidates": [],
+            "spacing_filtered_empty": min_spacing > 0.0,
             "active_upper_scores": [],
             "active_lower_scores": [],
         }

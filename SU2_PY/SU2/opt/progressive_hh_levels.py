@@ -166,7 +166,7 @@ def build_next_level(prev_level, result, opts):
     )
 
 
-def build_spring_reallocated_level(prev_level, result, opts):
+def build_spring_reallocated_level(prev_level, result, opts, reoptimize=True):
     reallocated = apply_post_opt_coefficient_spring(prev_level, result, opts)
     if reallocated is None:
         print(
@@ -186,6 +186,8 @@ def build_spring_reallocated_level(prev_level, result, opts):
         "ndv": prev_level.ndv,
         "spring_timing": opts.get("spring_timing", "POST_OPT"),
         "spring_score_mode": opts.get("spring_score_mode", "COEFFICIENT"),
+        "spring_post_action": opts.get("spring_post_action", "REOPTIMIZE"),
+        "post_spring_optimization_skipped": not reoptimize,
         "upper_before": sorted(prev_level.upper),
         "lower_before": sorted(prev_level.lower),
         "upper_after": sorted(upper),
@@ -195,6 +197,20 @@ def build_spring_reallocated_level(prev_level, result, opts):
         "history_file": result.get("history_file"),
         "final_mesh": result.get("final_mesh"),
     }
+
+    if not reoptimize:
+        return HHLevel(
+            level_id=prev_level.level_id,
+            upper=upper,
+            lower=lower,
+            workdir=prev_level.workdir,
+            config_filename=prev_level.config_filename,
+            project_filename=prev_level.project_filename,
+            mesh_source=next_mesh,
+            selection_metadata=spring_metadata,
+            post_opt_spring_pending=False,
+            spring_reallocated=True,
+        )
 
     return HHLevel(
         level_id=next_id,
@@ -273,11 +289,13 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH_BATCH_MIN_SEPARATION",
         "PROGRESSIVE_HH_BATCH_MAX_PER_SIDE",
         "PROGRESSIVE_HH_CANDIDATE_SAMPLES",
+        "PROGRESSIVE_HH_MIN_CENTER_SPACING",
         "PROGRESSIVE_HH_ADAPTIVE_INDICATOR",
         "PROGRESSIVE_HH_SPRING",
         "PROGRESSIVE_HH_SPRING_A",
         "PROGRESSIVE_HH_SPRING_TIMING",
         "PROGRESSIVE_HH_SPRING_SCORE_MODE",
+        "PROGRESSIVE_HH_SPRING_POST_ACTION",
     ]
 
     for key in progressive_keys:
@@ -465,6 +483,10 @@ def append_selection_history_csv(
         "interval_right",
         "sample_index",
         "sample_fraction",
+        "rejected_reason",
+        "nearest_center_or_boundary",
+        "nearest_distance",
+        "required_spacing",
         "upper_before",
         "lower_before",
         "upper_after",
@@ -510,6 +532,16 @@ def append_selection_history_csv(
                     "sample_fraction": ""
                     if c.get("sample_fraction") is None
                     else f"{float(c.get('sample_fraction')):.12g}",
+                    "rejected_reason": c.get("rejected_reason", ""),
+                    "nearest_center_or_boundary": ""
+                    if c.get("nearest_center_or_boundary") in (None, "")
+                    else f"{float(c.get('nearest_center_or_boundary')):.12g}",
+                    "nearest_distance": ""
+                    if c.get("nearest_distance") in (None, "")
+                    else f"{float(c.get('nearest_distance')):.12g}",
+                    "required_spacing": ""
+                    if c.get("required_spacing") in (None, "")
+                    else f"{float(c.get('required_spacing')):.12g}",
                     "upper_before": _format_centers(
                         selection_metadata.get("upper_before", [])
                     ),

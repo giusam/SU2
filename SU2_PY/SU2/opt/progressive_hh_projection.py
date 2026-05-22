@@ -683,8 +683,29 @@ def _compute_dot_candidate_scores(level, opts):
     all_lower = active_lower + cand_lower
 
     obj_name = str(cfg_level.get("OBJECTIVE_FUNCTION", "DRAG")).upper()
-    obj_adj_dir, _ = _find_real_adjoint_assets(level.workdir, obj_name)
-    real_dot_cfg = SU2.io.Config(os.path.join(obj_adj_dir, "config_DOT_AD.cfg"))
+    obj_adj_dir, design_dir = _find_real_adjoint_assets(level.workdir, obj_name)
+
+    dot_cfg_candidates = [
+        os.path.join(obj_adj_dir, "config_DOT_AD.cfg"),  # discrete adjoint
+        os.path.join(obj_adj_dir, "config_DOT.cfg"),     # continuous adjoint
+    ]
+
+    real_dot_cfg_path = None
+    for path in dot_cfg_candidates:
+        if os.path.isfile(path):
+            real_dot_cfg_path = path
+            break
+
+    if real_dot_cfg_path is None:
+        raise FileNotFoundError(
+            "No DOT config found in "
+            f"{obj_adj_dir}. Tried: "
+            + ", ".join(dot_cfg_candidates)
+        )
+
+    print(f"[PROGRESSIVE_HH] Using DOT config: {real_dot_cfg_path}")
+
+    real_dot_cfg = SU2.io.Config(real_dot_cfg_path)
     mesh_name = str(real_dot_cfg["MESH_FILENAME"])
 
     cfg_dot = _build_extended_dot_config(

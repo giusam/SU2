@@ -10,10 +10,103 @@ import sys
 
 from .. import eval as su2eval
 from numpy import array, zeros
+from SU2.opt.progressive_hh_core import (
+    expand_symmetric_dv,
+    full_to_reduced_symmetric,
+    reduce_symmetric_gradient,
+)
 
 
 class RefinementTriggered(Exception):
     pass
+
+
+def _get_symmetry(project):
+    symmetry = getattr(project, "progressive_hh_symmetry", None)
+    if symmetry is None:
+        symmetry = getattr(project, "progressive_hh_opts", None)
+    if not symmetry:
+        return {"mode": "NONE", "sign": -1.0}
+
+    return {
+        "mode": str(symmetry.get("mode", symmetry.get("symmetry_mode", "NONE"))).upper(),
+        "sign": float(symmetry.get("sign", symmetry.get("symmetry_sign", -1.0))),
+    }
+
+
+def _is_reduced_symmetry(project):
+    return _get_symmetry(project)["mode"] == "REDUCED"
+
+
+def _symmetry_pair_count(project):
+    n_full = sum(project.config["DEFINITION_DV"]["SIZE"])
+    if n_full % 2 != 0:
+        raise ValueError(
+            "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED requires an even full HH DV count"
+        )
+    return n_full // 2
+
+
+def _expand_if_needed(x, project):
+    if not _is_reduced_symmetry(project):
+        return x
+    symmetry = _get_symmetry(project)
+    return array(expand_symmetric_dv(x, symmetry["sign"]))
+
+
+def _reduce_grad_if_needed(g, project):
+    if not _is_reduced_symmetry(project):
+        return array(g)
+    symmetry = _get_symmetry(project)
+    n_pairs = _symmetry_pair_count(project)
+    return array(reduce_symmetric_gradient(g, n_pairs, symmetry["sign"]))
+
+
+def _reduce_jac_if_needed(J, project):
+    if not _is_reduced_symmetry(project):
+        return array(J)
+
+    n_pairs = _symmetry_pair_count(project)
+    symmetry = _get_symmetry(project)
+    return array(
+        [
+            reduce_symmetric_gradient(row, n_pairs, symmetry["sign"])
+            for row in J
+        ]
+    )
+
+
+def _validate_reduced_bounds(xb, n_pairs, sign):
+    if len(xb) != 2 * n_pairs:
+        raise ValueError(
+            "Reduced symmetry bound size mismatch: "
+            f"got {len(xb)}, expected {2 * n_pairs}"
+        )
+
+    tol = 1.0e-12
+    sign = float(sign)
+    if abs(sign) <= tol:
+        raise ValueError("PROGRESSIVE_HH_SYMMETRY_SIGN must be non-zero")
+
+    for i in range(n_pairs):
+        u_lo, u_hi = [float(v) for v in xb[i]]
+        l_lo, l_hi = [float(v) for v in xb[n_pairs + i]]
+
+        if sign > 0.0:
+            z_lo_from_lower = l_lo / sign
+            z_hi_from_lower = l_hi / sign
+        else:
+            z_lo_from_lower = l_hi / sign
+            z_hi_from_lower = l_lo / sign
+
+        if u_lo < z_lo_from_lower - tol or u_hi > z_hi_from_lower + tol:
+            raise ValueError(
+                "Incompatible upper/lower bounds for "
+                "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED at pair "
+                f"{i}: upper z bounds=({u_lo}, {u_hi}), "
+                f"lower-implied z bounds=({z_lo_from_lower}, {z_hi_from_lower}), "
+                f"sign={sign}"
+            )
 
 
 def _init_trigger_state(project):
@@ -319,7 +412,25 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
 
     dv_size = project.config["DEFINITION_DV"]["SIZE"]
     n_dv = sum(dv_size)
-    project.n_dv = n_dv
+    reduced_symmetry = _is_reduced_symmetry(project)
+    symmetry = _get_symmetry(project)
+    n_full = n_dv
+    n_pairs = None
+    if reduced_symmetry:
+        n_pairs = _symmetry_pair_count(project)
+        project.n_dv = n_pairs
+        if len(x0) not in (0, n_full):
+            raise ValueError(
+                "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED requires full-length x0: "
+                f"got {len(x0)}, expected {n_full}"
+            )
+        if len(xb) != n_full:
+            raise ValueError(
+                "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED requires full-length bounds: "
+                f"got {len(xb)}, expected {n_full}"
+            )
+    else:
+        project.n_dv = n_dv
 
     if not x0:
         x0 = [0.0] * n_dv
@@ -330,6 +441,14 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
         for j in range(dv_size[i]):
             x0[k] = x0[k] / dv_scl
             k = k + 1
+
+    if reduced_symmetry:
+        _validate_reduced_bounds(xb, n_pairs, symmetry["sign"])
+        z0 = full_to_reduced_symmetric(x0, n_pairs, symmetry["sign"])
+        xb_reduced = xb[:n_pairs]
+        x0_full_scaled = list(x0)
+        x0 = z0
+        xb = xb_reduced
 
     obj = project.config["OPT_OBJECTIVE"]
     obj_scale = []
@@ -342,9 +461,22 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
     eps = 1.0e-04
 
     sys.stdout.write("Sequential Least SQuares Programming (SLSQP) parameters:\n")
-    sys.stdout.write(
-        "Number of design variables: " + str(len(dv_size)) + " ( " + str(n_dv) + " ) \n"
-    )
+    if reduced_symmetry:
+        sys.stdout.write(
+            "Number of design variables: reduced "
+            + str(n_pairs)
+            + ", full "
+            + str(n_full)
+            + "\n"
+        )
+    else:
+        sys.stdout.write(
+            "Number of design variables: "
+            + str(len(dv_size))
+            + " ( "
+            + str(n_dv)
+            + " ) \n"
+        )
     sys.stdout.write("Objective function scaling factor: " + str(obj_scale) + "\n")
     sys.stdout.write("Maximum number of iterations: " + str(its) + "\n")
     sys.stdout.write("Requested accuracy: " + str(accu) + "\n")
@@ -360,8 +492,17 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
     # Store the last objective gradient seen by scipy
     project.last_obj_grad = None
     project.last_obj_grad_x = None
+    project.last_obj_grad_full = None
+    project.last_obj_grad_x_full = None
     project.last_dv_values = None
+    project.last_reduced_dv_values = None
     project.opt_dv_values = None
+    project.opt_reduced_dv_values = None
+
+    if reduced_symmetry:
+        project.last_dv_values = expand_symmetric_dv(x0, symmetry["sign"])
+        project.last_reduced_dv_values = [float(v) for v in x0]
+        project.initial_full_dv_values = x0_full_scaled
 
     if not hasattr(project, "trigger_opts"):
         project.trigger_opts = None
@@ -393,11 +534,22 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
 
     if outputs is not None:
         try:
-            project.opt_dv_values = [float(v) for v in outputs[0]]
+            if reduced_symmetry:
+                z_opt = [float(v) for v in outputs[0]]
+                project.opt_reduced_dv_values = z_opt
+                project.opt_dv_values = expand_symmetric_dv(z_opt, symmetry["sign"])
+            else:
+                project.opt_dv_values = [float(v) for v in outputs[0]]
         except Exception:
             project.opt_dv_values = getattr(project, "last_dv_values", None)
     else:
         project.opt_dv_values = getattr(project, "last_dv_values", None)
+        if reduced_symmetry:
+            project.opt_reduced_dv_values = getattr(
+                project,
+                "last_reduced_dv_values",
+                None,
+            )
 
     return outputs
 
@@ -409,6 +561,11 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
 
 def scipy_cg(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
     from scipy.optimize import fmin_cg
+
+    if _is_reduced_symmetry(project):
+        raise ValueError(
+            "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED currently supports only SLSQP"
+        )
 
     if x0 is None:
         x0 = []
@@ -473,6 +630,11 @@ def scipy_cg(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
 def scipy_bfgs(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
     from scipy.optimize import fmin_bfgs
 
+    if _is_reduced_symmetry(project):
+        raise ValueError(
+            "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED currently supports only SLSQP"
+        )
+
     if x0 is None:
         x0 = []
     if xb is None:
@@ -531,6 +693,11 @@ def scipy_bfgs(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
 def scipy_powell(project, x0=None, xb=None, its=100, accu=1e-10, grads=False):
     from scipy.optimize import fmin_powell
 
+    if _is_reduced_symmetry(project):
+        raise ValueError(
+            "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED currently supports only SLSQP"
+        )
+
     if x0 is None:
         x0 = []
 
@@ -574,9 +741,15 @@ def scipy_powell(project, x0=None, xb=None, its=100, accu=1e-10, grads=False):
 
 
 def obj_f(x, project):
-    project.last_dv_values = [float(v) for v in x]
+    x_eval = _expand_if_needed(x, project)
 
-    obj_list = project.obj_f(x)
+    if _is_reduced_symmetry(project):
+        project.last_reduced_dv_values = [float(v) for v in x]
+        project.last_dv_values = [float(v) for v in x_eval]
+    else:
+        project.last_dv_values = [float(v) for v in x]
+
+    obj_list = project.obj_f(x_eval)
     obj = 0
     for this_obj in obj_list:
         obj = obj + this_obj
@@ -604,7 +777,8 @@ def obj_f(x, project):
 
 
 def obj_df(x, project):
-    dobj_list = project.obj_df(x)
+    x_eval = _expand_if_needed(x, project)
+    dobj_list = project.obj_df(x_eval)
     dobj = [0.0] * len(dobj_list[0])
 
     for this_dobj in dobj_list:
@@ -612,17 +786,22 @@ def obj_df(x, project):
         for this_dv_dobj in this_dobj:
             dobj[idv] = dobj[idv] + this_dv_dobj
             idv += 1
-    dobj = array(dobj)
+    dobj_full = array(dobj)
+    dobj = _reduce_grad_if_needed(dobj_full, project)
 
     # Store the last objective gradient evaluated by scipy
     project.last_obj_grad = dobj.tolist()
     project.last_obj_grad_x = list(x)
+    if _is_reduced_symmetry(project):
+        project.last_obj_grad_full = dobj_full.tolist()
+        project.last_obj_grad_x_full = [float(v) for v in x_eval]
 
     return dobj
 
 
 def con_ceq(x, project):
-    cons = project.con_ceq(x)
+    x_eval = _expand_if_needed(x, project)
+    cons = project.con_ceq(x_eval)
 
     if cons:
         cons = array(cons)
@@ -633,11 +812,12 @@ def con_ceq(x, project):
 
 
 def con_dceq(x, project):
-    dcons = project.con_dceq(x)
+    x_eval = _expand_if_needed(x, project)
+    dcons = project.con_dceq(x_eval)
 
     dim = project.n_dv
     if dcons:
-        dcons = array(dcons)
+        dcons = _reduce_jac_if_needed(dcons, project)
     else:
         dcons = zeros([0, dim])
 
@@ -645,7 +825,8 @@ def con_dceq(x, project):
 
 
 def con_cieq(x, project):
-    cons = project.con_cieq(x)
+    x_eval = _expand_if_needed(x, project)
+    cons = project.con_cieq(x_eval)
 
     if cons:
         cons = array(cons)
@@ -656,11 +837,12 @@ def con_cieq(x, project):
 
 
 def con_dcieq(x, project):
-    dcons = project.con_dcieq(x)
+    x_eval = _expand_if_needed(x, project)
+    dcons = project.con_dcieq(x_eval)
 
     dim = project.n_dv
     if dcons:
-        dcons = array(dcons)
+        dcons = _reduce_jac_if_needed(dcons, project)
     else:
         dcons = zeros([0, dim])
 

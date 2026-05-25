@@ -175,6 +175,37 @@ def _filter_candidates_by_min_spacing(
     return filtered
 
 
+def _is_symmetric_reduced(opts):
+    return str(opts.get("symmetry_mode", "NONE")).upper() == "REDUCED"
+
+
+def _assert_symmetric_centers(upper, lower, tol=1.0e-12):
+    if len(upper) != len(lower):
+        raise ValueError(
+            "Symmetric reduced HH requires upper/lower center lists with "
+            f"the same length: {len(upper)} vs {len(lower)}"
+        )
+    for i, (xu, xl) in enumerate(zip(upper, lower)):
+        if abs(float(xu) - float(xl)) > tol:
+            raise ValueError(
+                "Symmetric reduced HH requires identical upper/lower centers; "
+                f"index {i}: upper={xu}, lower={xl}, tol={tol}"
+            )
+
+
+def _reduce_pair_values(upper_values, lower_values, sign):
+    if len(upper_values) != len(lower_values):
+        raise ValueError(
+            "Symmetric reduced value size mismatch: "
+            f"{len(upper_values)} vs {len(lower_values)}"
+        )
+    sign = float(sign)
+    return [
+        float(gu) + sign * float(gl)
+        for gu, gl in zip(upper_values, lower_values)
+    ]
+
+
 def _find_real_adjoint_assets(level_dir, func_name):
     func_name = str(func_name).upper()
 
@@ -629,7 +660,251 @@ def _compute_ikkt_residual_vector(g_obj, constraint_grads, lambda_bounds=None):
     return residual, lam
 
 
+def _compute_dot_candidate_scores_symmetric(level, opts):
+    cfg_path = os.path.join(level.workdir, level.config_filename)
+    cfg_level = SU2.io.Config(cfg_path)
+
+    active_upper = list(level.upper)
+    active_lower = list(level.lower)
+    _assert_symmetric_centers(active_upper, active_lower)
+    pair_centers = active_upper
+
+    nsamples = int(opts.get("candidate_samples", 1))
+    min_spacing = float(opts.get("min_center_spacing", 0.0))
+    sign = float(opts.get("symmetry_sign", -1.0))
+
+    print(
+        "[PROGRESSIVE_HH] Candidate sampling | "
+        f"samples={nsamples} min_spacing={min_spacing:.6f} symmetry=REDUCED"
+    )
+
+    cand_pair_raw = get_midpoint_candidates(pair_centers, nsamples=nsamples)
+    for c in cand_pair_raw:
+        c["side"] = "PAIR"
+
+    active_centers_by_side = {"PAIR": pair_centers}
+    cand_pair_raw = _filter_candidates_by_min_spacing(
+        cand_pair_raw,
+        active_centers_by_side,
+        min_spacing,
+    )
+
+    cand_pair = [c["x"] for c in cand_pair_raw]
+
+    if not cand_pair:
+        if min_spacing > 0.0:
+            print(
+                "[PROGRESSIVE_HH] No valid pair candidates remain after "
+                "min-spacing filtering."
+            )
+        return {
+            "candidates": [],
+            "spacing_filtered_empty": min_spacing > 0.0,
+            "active_upper_scores": [],
+            "active_lower_scores": [],
+            "active_pair_scores": [],
+        }
+
+    cand_upper = list(cand_pair)
+    cand_lower = list(cand_pair)
+    all_upper = active_upper + cand_upper
+    all_lower = active_lower + cand_lower
+
+    obj_name = str(cfg_level.get("OBJECTIVE_FUNCTION", "DRAG")).upper()
+    obj_adj_dir, design_dir = _find_real_adjoint_assets(level.workdir, obj_name)
+
+    dot_cfg_candidates = [
+        os.path.join(obj_adj_dir, "config_DOT_AD.cfg"),
+        os.path.join(obj_adj_dir, "config_DOT.cfg"),
+    ]
+
+    real_dot_cfg_path = None
+    for path in dot_cfg_candidates:
+        if os.path.isfile(path):
+            real_dot_cfg_path = path
+            break
+
+    if real_dot_cfg_path is None:
+        raise FileNotFoundError(
+            "No DOT config found in "
+            f"{obj_adj_dir}. Tried: "
+            + ", ".join(dot_cfg_candidates)
+        )
+
+    print(f"[PROGRESSIVE_HH] Using DOT config: {real_dot_cfg_path}")
+
+    real_dot_cfg = SU2.io.Config(real_dot_cfg_path)
+    mesh_name = str(real_dot_cfg["MESH_FILENAME"])
+
+    cfg_dot = _build_extended_dot_config(
+        cfg_level, real_dot_cfg, mesh_name, all_upper, all_lower
+    )
+    state = _make_projection_state(mesh_name)
+
+    grad_obj = _run_dot_for_function(level.workdir, cfg_dot, state, obj_name)
+
+    n_pair_active = len(pair_centers)
+    n_pair_candidate = len(cand_pair)
+    n_active = 2 * n_pair_active
+    expected_ncand = 2 * n_pair_candidate
+
+    i_upper_active_0 = 0
+    i_upper_candidate_0 = i_upper_active_0 + n_pair_active
+    i_lower_active_0 = i_upper_candidate_0 + n_pair_candidate
+    i_lower_candidate_0 = i_lower_active_0 + n_pair_active
+
+    grad_upper_active = grad_obj[i_upper_active_0:i_upper_candidate_0]
+    grad_upper_candidate = grad_obj[i_upper_candidate_0:i_lower_active_0]
+    grad_lower_active = grad_obj[i_lower_active_0:i_lower_candidate_0]
+    grad_lower_candidate = grad_obj[i_lower_candidate_0:]
+
+    if len(grad_upper_candidate) + len(grad_lower_candidate) == 0:
+        raise RuntimeError("DOT returned empty candidate gradient")
+
+    if len(grad_upper_candidate) + len(grad_lower_candidate) != expected_ncand:
+        raise RuntimeError(
+            "DOT candidate gradient size mismatch: "
+            f"got {len(grad_upper_candidate) + len(grad_lower_candidate)}, "
+            f"expected {expected_ncand}"
+        )
+
+    active_pair_grad = _reduce_pair_values(
+        grad_upper_active,
+        grad_lower_active,
+        sign,
+    )
+    candidate_pair_grad = _reduce_pair_values(
+        grad_upper_candidate,
+        grad_lower_candidate,
+        sign,
+    )
+
+    indicator_mode = opts.get("adaptive_indicator", "ABS_GRAD").upper()
+
+    if indicator_mode == "IKKT":
+        constraint_names = _extract_constraint_names(cfg_level)
+        lambda_bounds = _extract_constraint_signs(cfg_level, constraint_names)
+        constraint_grads_full = []
+
+        for cname in constraint_names:
+            cname = cname.upper()
+
+            try:
+                grad_c = _run_dot_for_function(level.workdir, cfg_dot, state, cname)
+                print(f"[PROGRESSIVE_HH] IKKT | {cname} via DOT")
+            except Exception:
+                try:
+                    grad_c = _run_geo_gradient_for_function(level.workdir, cfg_dot, cname)
+                    print(f"[PROGRESSIVE_HH] IKKT | {cname} via GEOMETRY")
+                except Exception:
+                    print(
+                        "[PROGRESSIVE_HH] IKKT warning | "
+                        f"{cname} gradient not available -> skipped"
+                    )
+                    continue
+
+            if len(grad_c) != len(grad_obj):
+                raise RuntimeError(
+                    f"{cname} full gradient size mismatch: "
+                    f"got {len(grad_c)}, expected {len(grad_obj)}"
+                )
+
+            constraint_grads_full.append(grad_c)
+
+        residual_full, lam = _compute_ikkt_residual_vector(
+            grad_obj,
+            constraint_grads_full,
+            lambda_bounds=lambda_bounds,
+        )
+
+        residual_upper_active = residual_full[i_upper_active_0:i_upper_candidate_0]
+        residual_upper_candidate = residual_full[i_upper_candidate_0:i_lower_active_0]
+        residual_lower_active = residual_full[i_lower_active_0:i_lower_candidate_0]
+        residual_lower_candidate = residual_full[i_lower_candidate_0:]
+
+        active_pair_indicator = np.abs(
+            np.asarray(
+                _reduce_pair_values(
+                    residual_upper_active,
+                    residual_lower_active,
+                    sign,
+                ),
+                dtype=float,
+            )
+        ).tolist()
+        candidate_pair_indicator = np.abs(
+            np.asarray(
+                _reduce_pair_values(
+                    residual_upper_candidate,
+                    residual_lower_candidate,
+                    sign,
+                ),
+                dtype=float,
+            )
+        ).tolist()
+    else:
+        active_pair_indicator = np.abs(
+            np.asarray(active_pair_grad, dtype=float)
+        ).tolist()
+        candidate_pair_indicator = np.abs(
+            np.asarray(candidate_pair_grad, dtype=float)
+        ).tolist()
+
+    candidates = []
+    for k, c in enumerate(cand_pair_raw):
+        upper_indicator = abs(float(grad_upper_candidate[k]))
+        lower_indicator = abs(float(grad_lower_candidate[k]))
+        candidates.append(
+            {
+                "side": "PAIR",
+                "x": float(c["x"]),
+                "grad": float(candidate_pair_grad[k]),
+                "indicator": float(candidate_pair_indicator[k]),
+                "upper_grad": float(grad_upper_candidate[k]),
+                "lower_grad": float(grad_lower_candidate[k]),
+                "upper_indicator": float(upper_indicator),
+                "lower_indicator": float(lower_indicator),
+                "interval_id": c["interval_id"],
+                "interval_left": float(c["interval_left"]),
+                "interval_right": float(c["interval_right"]),
+                "sample_index": int(c["sample_index"]),
+                "sample_fraction": float(c["sample_fraction"]),
+                "symmetry_mode": "REDUCED",
+                "upper_center": float(c["x"]),
+                "lower_center": float(c["x"]),
+            }
+        )
+
+    print(
+        f"[PROGRESSIVE_HH] Candidate scoring | mode={indicator_mode} "
+        f"active_ndv={n_active} candidate_ndv={expected_ncand} "
+        f"pair_candidates={n_pair_candidate} samples={nsamples}"
+    )
+    for c in candidates:
+        print(
+            "[PROGRESSIVE_HH] Candidate | "
+            f"side={c['side']} interval_id={c['interval_id']} "
+            f"interval=[{c['interval_left']:.6f},{c['interval_right']:.6f}] "
+            f"sample_index={c['sample_index']} "
+            f"sample_fraction={c['sample_fraction']:.6f} "
+            f"x={c['x']:.6f} I={c['indicator']:.6e}"
+        )
+
+    reduced_candidates = _reduce_candidates_to_interval_best(candidates)
+
+    return {
+        "candidates": reduced_candidates,
+        "raw_candidates": candidates,
+        "active_upper_scores": active_pair_indicator,
+        "active_lower_scores": active_pair_indicator,
+        "active_pair_scores": active_pair_indicator,
+    }
+
+
 def _compute_dot_candidate_scores(level, opts):
+    if _is_symmetric_reduced(opts):
+        return _compute_dot_candidate_scores_symmetric(level, opts)
+
     cfg_path = os.path.join(level.workdir, level.config_filename)
     cfg_level = SU2.io.Config(cfg_path)
 

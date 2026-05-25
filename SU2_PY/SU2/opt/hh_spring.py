@@ -149,3 +149,21 @@ def apply_hh_spring_after_selection(
     new_lower = spring_redistribute_centers(centers_lower, scores_lower, A=A)
 
     return new_upper, new_lower
+
+
+def apply_hh_spring_after_selection_symmetric(
+    prev_level,
+    chosen,
+    active_pair_scores,
+    opts,
+):
+    A = float(opts.get("spring_A", 20.0))
+
+    chosen_pair = [c for c in chosen if c["side"] == "PAIR"]
+    centers = list(prev_level.upper) + [float(c["x"]) for c in chosen_pair]
+    scores = list(active_pair_scores) + [
+        float(c["indicator"]) for c in chosen_pair
+    ]
+
+    new_pair = spring_redistribute_centers(centers, scores, A=A)
+    return new_pair, list(new_pair)

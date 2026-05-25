@@ -10,7 +10,9 @@ import SU2
 
 from SU2.opt.progressive_hh_core import (
     HHLevel,
+    assert_symmetric_centers,
     initial_centers,
+    is_symmetric_reduced,
     refine_uniform,
     refine_adaptive,
     apply_post_opt_coefficient_spring,
@@ -68,6 +70,52 @@ def build_initial_level(base_config, opts):
         base_config.get("PROGRESSIVE_HH_INITIAL_LOWER", None)
     )
 
+    if is_symmetric_reduced(opts):
+        if opts["surface_mode"] != "BOTH":
+            raise ValueError(
+                "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED requires "
+                "PROGRESSIVE_HH_SURFACE=BOTH"
+            )
+        if upper_manual is not None and lower_manual is not None:
+            assert_symmetric_centers(upper_manual, lower_manual)
+            pair_centers = upper_manual
+        elif upper_manual is not None:
+            print(
+                "[PROGRESSIVE_HH][SYMMETRY] WARNING: INITIAL_LOWER missing; "
+                "copying INITIAL_UPPER for reduced symmetry"
+            )
+            pair_centers = upper_manual
+        elif lower_manual is not None:
+            print(
+                "[PROGRESSIVE_HH][SYMMETRY] WARNING: INITIAL_UPPER missing; "
+                "copying INITIAL_LOWER for reduced symmetry"
+            )
+            pair_centers = lower_manual
+        else:
+            pair_centers = initial_centers(opts["n0"])
+
+        upper = list(pair_centers)
+        lower = list(pair_centers)
+
+        initial_mesh = None
+        if "MESH_FILENAME" in base_config and base_config["MESH_FILENAME"]:
+            initial_mesh = _resolve_from_cfg_dir(base_config, base_config["MESH_FILENAME"])
+
+        print(f"[PROGRESSIVE_HH] Initial upper centers = {upper}")
+        print(f"[PROGRESSIVE_HH] Initial lower centers = {lower}")
+        print(f"[PROGRESSIVE_HH][SYMMETRY] pair count = {len(upper)}")
+        print(f"[PROGRESSIVE_HH][SYMMETRY] full SU2 HH = {len(upper) + len(lower)}")
+
+        return HHLevel(
+            level_id=0,
+            upper=upper,
+            lower=lower,
+            workdir="LEVEL_0",
+            config_filename="config_level0.cfg",
+            project_filename="project_level0.pkl",
+            mesh_source=initial_mesh,
+        )
+
     if opts["surface_mode"] in ("UPPER", "BOTH"):
         if upper_manual is not None:
             upper = upper_manual
@@ -101,7 +149,26 @@ def build_initial_level(base_config, opts):
 def _cap_uniform_refinement(prev_level, upper, lower, opts):
     nfinal = opts.get("nfinal", None)
     if nfinal is None:
+        if is_symmetric_reduced(opts):
+            assert_symmetric_centers(upper, lower)
+            pair = sorted(upper)
+            return pair, list(pair)
         return upper, lower
+
+    if is_symmetric_reduced(opts):
+        assert_symmetric_centers(prev_level.upper, prev_level.lower)
+        assert_symmetric_centers(upper, lower)
+
+        n_remaining_pairs = (int(nfinal) - prev_level.ndv) // 2
+        if n_remaining_pairs <= 0:
+            pair = sorted(prev_level.upper)
+            return pair, list(pair)
+
+        old_pair = set(prev_level.upper)
+        add_pair = sorted(x for x in upper if x not in old_pair)
+        keep = add_pair[:n_remaining_pairs]
+        pair = sorted(set(list(prev_level.upper) + keep))
+        return pair, list(pair)
 
     n_remaining = int(nfinal) - prev_level.ndv
     if n_remaining <= 0:
@@ -145,9 +212,17 @@ def build_next_level(prev_level, result, opts):
         if selection_metadata is None:
             upper, lower = _cap_uniform_refinement(prev_level, upper, lower, opts)
     else:
-        upper = refine_uniform(prev_level.upper)
-        lower = refine_uniform(prev_level.lower)
+        if is_symmetric_reduced(opts):
+            assert_symmetric_centers(prev_level.upper, prev_level.lower)
+            upper = refine_uniform(prev_level.upper)
+            lower = list(upper)
+        else:
+            upper = refine_uniform(prev_level.upper)
+            lower = refine_uniform(prev_level.lower)
         upper, lower = _cap_uniform_refinement(prev_level, upper, lower, opts)
+
+    if is_symmetric_reduced(opts):
+        assert_symmetric_centers(upper, lower)
 
     return HHLevel(
         level_id=next_id,
@@ -197,6 +272,11 @@ def build_spring_reallocated_level(prev_level, result, opts, reoptimize=True):
         "history_file": result.get("history_file"),
         "final_mesh": result.get("final_mesh"),
     }
+
+    if is_symmetric_reduced(opts):
+        assert_symmetric_centers(upper, lower)
+        spring_metadata["symmetry_mode"] = "REDUCED"
+        spring_metadata["symmetry_sign"] = opts.get("symmetry_sign", -1.0)
 
     if not reoptimize:
         return HHLevel(
@@ -269,6 +349,8 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH_INITIAL_UPPER",
         "PROGRESSIVE_HH_INITIAL_LOWER",
         "PROGRESSIVE_HH_SURFACE",
+        "PROGRESSIVE_HH_SYMMETRY_MODE",
+        "PROGRESSIVE_HH_SYMMETRY_SIGN",
         "PROGRESSIVE_HH_TRIGGER",
         "PROGRESSIVE_HH_MAX_ITER_PER_LEVEL",
         "PROGRESSIVE_HH_WINDOW",

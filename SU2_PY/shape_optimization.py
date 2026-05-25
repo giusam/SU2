@@ -12,6 +12,7 @@ import SU2
 
 from SU2.opt.progressive_hh import (
     get_progressive_hh_options,
+    is_symmetric_reduced,
     build_initial_level,
     build_next_level,
     build_spring_reallocated_level,
@@ -138,6 +139,7 @@ def run_single_level(
     quiet=False,
     nzones=1,
     trigger_opts=None,
+    progressive_hh_opts=None,
 ):
     config = SU2.io.Config(filename)
 
@@ -194,7 +196,22 @@ def run_single_level(
     else:
         project.trigger_opts = None
 
+    if progressive_hh_opts is not None:
+        project.progressive_hh_symmetry = {
+            "mode": progressive_hh_opts.get("symmetry_mode", "NONE"),
+            "sign": progressive_hh_opts.get("symmetry_sign", -1.0),
+        }
+
     project.refinement_triggered = False
+
+    if (
+        progressive_hh_opts is not None
+        and is_symmetric_reduced(progressive_hh_opts)
+        and optimization != "SLSQP"
+    ):
+        raise ValueError(
+            "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED currently supports only SLSQP"
+        )
 
     if optimization == "SLSQP":
         SU2.opt.SLSQP(project, x0, xb, its, accu)
@@ -250,6 +267,23 @@ def progressive_hh_shape_optimization(
         sys.stdout.write(f"[PROGRESSIVE_HH] Upper centers: {level.upper}\n")
         sys.stdout.write(f"[PROGRESSIVE_HH] Lower centers: {level.lower}\n")
         sys.stdout.write(f"[PROGRESSIVE_HH] Mesh source: {level.mesh_source}\n")
+        sys.stdout.write(
+            "[PROGRESSIVE_HH][SYMMETRY] mode = "
+            f"{hh_opts.get('symmetry_mode', 'NONE')}\n"
+        )
+        sys.stdout.write(
+            "[PROGRESSIVE_HH][SYMMETRY] sign = "
+            f"{hh_opts.get('symmetry_sign', -1.0)}\n"
+        )
+        if is_symmetric_reduced(hh_opts):
+            sys.stdout.write(
+                "[PROGRESSIVE_HH][SYMMETRY] reduced NDV = "
+                f"{len(level.upper)}\n"
+            )
+            sys.stdout.write(
+                "[PROGRESSIVE_HH][SYMMETRY] full SU2 HH = "
+                f"{level.ndv}\n"
+            )
 
         trigger_opts = _build_online_trigger_opts(
             hh_opts,
@@ -269,6 +303,7 @@ def progressive_hh_shape_optimization(
                 quiet,
                 nzones,
                 trigger_opts=trigger_opts,
+                progressive_hh_opts=hh_opts,
             )
         finally:
             os.chdir(cwd)

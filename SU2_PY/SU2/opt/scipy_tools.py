@@ -159,6 +159,20 @@ def _compute_smoothed_history(history, window):
     return smooth
 
 
+def _trigger_can_fire(project, opts):
+    warmup_iter = int(opts.get("warmup_iter", 0))
+    return len(getattr(project, "trigger_history", [])) > warmup_iter
+
+
+def _log_trigger_warmup(name, project, opts):
+    warmup_iter = int(opts.get("warmup_iter", 0))
+    sys.stdout.write(
+        f"[PROGRESSIVE_HH] {name} | "
+        f"warmup guard active ({len(project.trigger_history)}/{warmup_iter}); "
+        "state updated, trigger suppressed\n"
+    )
+
+
 def _check_slope_trigger(project, obj_value, opts):
     """
     New robust slope trigger:
@@ -169,14 +183,7 @@ def _check_slope_trigger(project, obj_value, opts):
     """
     _init_trigger_state(project)
 
-    warmup_iter = int(opts.get("warmup_iter", 0))
-
-    if len(project.trigger_history) <= warmup_iter:
-        sys.stdout.write(
-            "[PROGRESSIVE_HH] SLOPE_EFFICIENCY ONLINE | "
-            f"warmup phase ({len(project.trigger_history)}/{warmup_iter})\n"
-        )
-        return
+    can_fire = _trigger_can_fire(project, opts)
 
     w = max(1, int(opts.get("window", 1)))
     r = float(opts.get("tol", 0.2))
@@ -230,6 +237,10 @@ def _check_slope_trigger(project, obj_value, opts):
 
     ratio = current_slope / max_slope
 
+    if not can_fire:
+        _log_trigger_warmup("SLOPE_EFFICIENCY ONLINE", project, opts)
+        return
+
     sys.stdout.write(
         "[PROGRESSIVE_HH] SLOPE_EFFICIENCY ONLINE | "
         f"ratio={ratio:.6e} threshold={r:.6e}\n"
@@ -250,7 +261,6 @@ def _check_slope_best_log_trigger(project, obj_value, opts):
     state.setdefault("max_slope_seen", 0.0)
     state.setdefault("bad_count", 0)
 
-    warmup_iter = int(opts.get("warmup_iter", 0))
     window = max(1, int(opts.get("window", 1)))
     tol = float(opts.get("tol", 0.2))
     eps = float(opts.get("eps", 1.0e-300))
@@ -272,14 +282,6 @@ def _check_slope_best_log_trigger(project, obj_value, opts):
         delta_k = 0.0
     state["improvements"].append(delta_k)
 
-    if len(project.trigger_history) <= warmup_iter:
-        state["last_log_best"] = y_k
-        sys.stdout.write(
-            "[PROGRESSIVE_HH] SLOPE_EFFICIENCY_BEST_LOG | "
-            f"warmup phase ({len(project.trigger_history)}/{warmup_iter})\n"
-        )
-        return
-
     if len(state["improvements"]) < window:
         state["last_log_best"] = y_k
         return
@@ -289,6 +291,13 @@ def _check_slope_best_log_trigger(project, obj_value, opts):
 
     if recent_slope > 0.0:
         state["max_slope_seen"] = max(state["max_slope_seen"], recent_slope)
+
+    can_fire = _trigger_can_fire(project, opts)
+
+    if not can_fire:
+        state["last_log_best"] = y_k
+        _log_trigger_warmup("SLOPE_EFFICIENCY_BEST_LOG", project, opts)
+        return
 
     ratio = recent_slope / max(state["max_slope_seen"], eps)
 
@@ -322,14 +331,8 @@ def _check_stagnation_trigger(project, obj_value, opts):
       - trigger when counter reaches stag_window
     """
     _init_trigger_state(project)
-    warmup_iter = int(opts.get("warmup_iter", 0))
+    can_fire = _trigger_can_fire(project, opts)
 
-    if len(project.trigger_history) <= warmup_iter:
-        sys.stdout.write(
-            "[PROGRESSIVE_HH] STAGNATION ONLINE | "
-            f"warmup phase ({len(project.trigger_history)}/{warmup_iter})\n"
-        )
-        return
     eps = 1.0e-14
     stag_tol = float(opts.get("stag_tol", 1.0e-3))
     stag_band = float(opts.get("stag_band", 0.02))
@@ -341,6 +344,8 @@ def _check_stagnation_trigger(project, obj_value, opts):
     if best_obj is None:
         project.trigger_state["best_obj"] = obj_value
         project.trigger_state["sat_counter"] = 0
+        if not can_fire:
+            _log_trigger_warmup("STAGNATION ONLINE", project, opts)
         return
 
     # New best
@@ -377,6 +382,10 @@ def _check_stagnation_trigger(project, obj_value, opts):
                 "[PROGRESSIVE_HH] STAGNATION ONLINE | "
                 f"outside band, reset counter (gap={gap:.6e}, band={stag_band:.6e})\n"
             )
+
+    if not can_fire:
+        _log_trigger_warmup("STAGNATION ONLINE", project, opts)
+        return
 
     if project.trigger_state["sat_counter"] >= stag_window:
         project.refinement_triggered = True

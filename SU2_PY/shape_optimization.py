@@ -43,7 +43,7 @@ def _build_online_trigger_opts(hh_opts, ilevel, current_ndv=None):
         return None
 
     trigger = hh_opts["trigger"]
-    warmup_iter = 0 if ilevel == 0 else hh_opts["warmup_iter"]
+    warmup_iter = int(hh_opts.get("warmup_iter", 0))
 
     if trigger == "MAX_ITER":
         return None

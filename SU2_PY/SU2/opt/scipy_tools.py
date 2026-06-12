@@ -9,7 +9,7 @@ import math
 import sys
 
 from .. import eval as su2eval
-from numpy import array, zeros
+from numpy import array, concatenate, vstack, zeros
 from SU2.opt.progressive_hh_core import (
     expand_symmetric_dv,
     full_to_reduced_symmetric,
@@ -843,11 +843,16 @@ def con_cieq(x, project):
     cons = project.con_cieq(x_eval)
 
     if cons:
-        cons = array(cons)
+        cons = -array(cons)
     else:
         cons = zeros([0])
 
-    return -cons
+    tc = getattr(project, "thickness_constraint", None)
+    if tc is not None:
+        g = array(tc.values(x_eval, project), dtype=float)
+        cons = concatenate([cons, g])
+
+    return cons
 
 
 def con_dcieq(x, project):
@@ -856,8 +861,14 @@ def con_dcieq(x, project):
 
     dim = project.n_dv
     if dcons:
-        dcons = _reduce_jac_if_needed(dcons, project)
+        dcons = -_reduce_jac_if_needed(dcons, project)
     else:
         dcons = zeros([0, dim])
 
-    return -dcons
+    tc = getattr(project, "thickness_constraint", None)
+    if tc is not None:
+        J_full = tc.jacobian_fd(x_eval, project)
+        J = _reduce_jac_if_needed(J_full, project)
+        dcons = vstack([dcons, J])
+
+    return dcons

@@ -8,6 +8,7 @@ import shutil
 
 import SU2
 
+from SU2.opt.thickness_constraint import clean_progressive_thickness_keys
 from SU2.opt.progressive_hh_core import (
     HHLevel,
     assert_symmetric_centers,
@@ -460,6 +461,7 @@ def make_hh_definition(level, scale, marker_name):
 def _remove_progressive_keys(cfg):
     progressive_keys = [
         "PROGRESSIVE_HH",
+        "PROGRESSIVE_PARAM_KIND",
         "PROGRESSIVE_HH_NLEVELS",
         "PROGRESSIVE_HH_N0",
         "PROGRESSIVE_HH_NFINAL",
@@ -496,11 +498,19 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH_SPRING_TIMING",
         "PROGRESSIVE_HH_SPRING_SCORE_MODE",
         "PROGRESSIVE_HH_SPRING_POST_ACTION",
+        "PROGRESSIVE_FFD_DV_KIND",
+        "PROGRESSIVE_FFD_BOX_TAG",
+        "PROGRESSIVE_FFD_MARKER",
+        "PROGRESSIVE_FFD_DOMAIN_MODE",
+        "PROGRESSIVE_FFD_CONTROL_ROW",
+        "PROGRESSIVE_FFD_DIRECTION",
+        "PROGRESSIVE_FFD_INITIAL_COLUMNS",
     ]
 
     for key in progressive_keys:
         if key in cfg:
             del cfg[key]
+    clean_progressive_thickness_keys(cfg)
 
 
 def _prepare_local_mesh(cfg, level):

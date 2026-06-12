@@ -10,6 +10,7 @@ from optparse import OptionParser
 sys.path.append(os.environ["SU2_RUN"])
 import SU2
 
+from SU2.opt.thickness_constraint import build_thickness_constraint_from_config
 from SU2.opt.progressive_hh import (
     get_progressive_hh_options,
     is_symmetric_reduced,
@@ -20,6 +21,13 @@ from SU2.opt.progressive_hh import (
     collect_level_result,
     should_refine,
     append_selection_history_csv,
+)
+from SU2.opt.progressive_ffd import (
+    get_progressive_ffd_options,
+    build_initial_ffd_level,
+    build_next_ffd_level,
+    build_ffd_spring_reallocated_level,
+    write_ffd_level_config,
 )
 
 
@@ -112,6 +120,7 @@ def main():
     sys.stdout.write("-------------------------------------------------------------------------\n")
 
     hh_opts = get_progressive_hh_options(base_config)
+    thickness_constraint = build_thickness_constraint_from_config(base_config)
 
     if not hh_opts["enabled"]:
         run_single_level(
@@ -122,6 +131,7 @@ def main():
             options.optimization,
             options.quiet,
             options.nzones,
+            thickness_constraint=thickness_constraint,
         )
         return
 
@@ -133,6 +143,7 @@ def main():
         options.optimization,
         options.quiet,
         options.nzones,
+        thickness_constraint=thickness_constraint,
     )
 
 
@@ -146,8 +157,11 @@ def run_single_level(
     nzones=1,
     trigger_opts=None,
     progressive_hh_opts=None,
+    thickness_constraint=None,
 ):
     config = SU2.io.Config(filename)
+    if thickness_constraint is None:
+        thickness_constraint = build_thickness_constraint_from_config(config)
 
     if "DV_MARKER" in config:
         dv_marker = config["DV_MARKER"]
@@ -219,6 +233,13 @@ def run_single_level(
             "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED currently supports only SLSQP"
         )
 
+    if thickness_constraint is not None and optimization != "SLSQP":
+        raise NotImplementedError(
+            "PROGRESSIVE_THICKNESS_CONSTRAINT currently supports only SLSQP"
+        )
+
+    project.thickness_constraint = thickness_constraint
+
     if optimization == "SLSQP":
         SU2.opt.SLSQP(project, x0, xb, its, accu)
     if optimization == "CG":
@@ -242,9 +263,24 @@ def progressive_hh_shape_optimization(
     optimization="SLSQP",
     quiet=False,
     nzones=1,
+    thickness_constraint=None,
 ):
     base_config = SU2.io.Config(filename)
     hh_opts = get_progressive_hh_options(base_config)
+    if thickness_constraint is None:
+        thickness_constraint = build_thickness_constraint_from_config(base_config)
+
+    if str(hh_opts.get("param_kind", "HICKS_HENNE")).upper() == "FFD":
+        return progressive_ffd_shape_optimization(
+            filename,
+            projectname,
+            partitions,
+            gradient,
+            optimization,
+            quiet,
+            nzones,
+            thickness_constraint=thickness_constraint,
+        )
 
     old_levels = [
         d for d in os.listdir(".")
@@ -310,6 +346,7 @@ def progressive_hh_shape_optimization(
                 nzones,
                 trigger_opts=trigger_opts,
                 progressive_hh_opts=hh_opts,
+                thickness_constraint=thickness_constraint,
             )
         finally:
             os.chdir(cwd)
@@ -388,6 +425,158 @@ def progressive_hh_shape_optimization(
             sys.stdout.write(
                 "[PROGRESSIVE_HH] Stop: refinement did not increase NDV "
                 f"before reaching NFINAL={hh_opts['nfinal']}\n"
+            )
+            break
+        ilevel += 1
+
+    if projectname and final_project and os.path.exists(final_project):
+        shutil.copy(final_project, projectname)
+
+
+def progressive_ffd_shape_optimization(
+    filename,
+    projectname="",
+    partitions=0,
+    gradient="CONTINUOUS_ADJOINT",
+    optimization="SLSQP",
+    quiet=False,
+    nzones=1,
+    thickness_constraint=None,
+):
+    base_config = SU2.io.Config(filename)
+    hh_opts = get_progressive_hh_options(base_config)
+    ffd_opts = get_progressive_ffd_options(base_config, hh_opts)
+    if thickness_constraint is None:
+        thickness_constraint = build_thickness_constraint_from_config(base_config)
+
+    old_levels = [
+        d for d in os.listdir(".")
+        if os.path.isdir(d) and d.startswith("LEVEL_")
+    ]
+
+    if old_levels:
+        sys.stdout.write("\n[PROGRESSIVE_FFD] Cleaning previous LEVEL_* folders\n")
+        for d in old_levels:
+            sys.stdout.write(f"[PROGRESSIVE_FFD] Removing {d}\n")
+            shutil.rmtree(d)
+
+    selection_history_csv = "progressive_ffd_selection_history.csv"
+    if os.path.exists(selection_history_csv):
+        os.remove(selection_history_csv)
+
+    level = build_initial_ffd_level(base_config, ffd_opts)
+    final_project = None
+
+    ilevel = 0
+    while True:
+        cfg_path = write_ffd_level_config(base_config, level, ffd_opts)
+        level_project = os.path.join(level.workdir, level.project_filename)
+
+        sys.stdout.write(f"\n[PROGRESSIVE_FFD] Level {ilevel} | NDV = {level.ndv}\n")
+        sys.stdout.write(f"[PROGRESSIVE_FFD] FFD DV kind: {level.ffd_dv_kind}\n")
+        sys.stdout.write(f"[PROGRESSIVE_FFD] Box tag: {level.ffd_box_tag}\n")
+        sys.stdout.write(f"[PROGRESSIVE_FFD] Domain mode: {level.domain_mode}\n")
+        sys.stdout.write(f"[PROGRESSIVE_FFD] Active columns: {level.columns}\n")
+        sys.stdout.write(f"[PROGRESSIVE_FFD] Mesh source: {level.mesh_source}\n")
+
+        trigger_opts = _build_online_trigger_opts(
+            ffd_opts,
+            ilevel,
+            current_ndv=level.ndv,
+        )
+
+        cwd = os.getcwd()
+        try:
+            os.chdir(level.workdir)
+            project = run_single_level(
+                os.path.basename(cfg_path),
+                os.path.basename(level_project),
+                partitions,
+                gradient,
+                optimization,
+                quiet,
+                nzones,
+                trigger_opts=trigger_opts,
+                progressive_hh_opts=None,
+                thickness_constraint=thickness_constraint,
+            )
+        finally:
+            os.chdir(cwd)
+
+        final_project = level_project
+        result = collect_level_result(level)
+        result["dv_values"] = getattr(
+            project,
+            "opt_dv_values",
+            getattr(project, "last_dv_values", None),
+        )
+
+        force_refine_after_spring = False
+
+        if getattr(level, "post_opt_spring_pending", False):
+            spring_post_action = str(
+                ffd_opts.get("spring_post_action", "REOPTIMIZE")
+            ).upper()
+            spring_level = build_ffd_spring_reallocated_level(
+                level,
+                result,
+                ffd_opts,
+                reoptimize=(spring_post_action == "REOPTIMIZE"),
+            )
+            if spring_level is not None:
+                sys.stdout.write(
+                    "[PROGRESSIVE_FFD] POST_OPT spring applied | "
+                    f"post_action={spring_post_action}\n"
+                )
+                level = spring_level
+                if spring_post_action == "REOPTIMIZE":
+                    ilevel += 1
+                    continue
+                sys.stdout.write(
+                    "[PROGRESSIVE_FFD] Skipping post-spring same-NDV optimization; "
+                    "proceeding directly to refinement.\n"
+                )
+                force_refine_after_spring = True
+            else:
+                sys.stdout.write(
+                    "[PROGRESSIVE_FFD][SPRING] WARNING: post-opt spring skipped; "
+                    "continuing normal progressive logic\n"
+                )
+
+        if _is_final_progressive_hh_level(
+            ffd_opts,
+            ilevel,
+            current_ndv=level.ndv,
+        ):
+            sys.stdout.write(f"[PROGRESSIVE_FFD] Stop after final level {ilevel}\n")
+            break
+
+        if force_refine_after_spring:
+            refine_now = True
+        elif ffd_opts["trigger"] == "MAX_ITER":
+            refine_now = should_refine(result["history"], ffd_opts, ilevel)
+        else:
+            refine_now = bool(getattr(project, "refinement_triggered", False))
+
+        if not refine_now:
+            sys.stdout.write(f"[PROGRESSIVE_FFD] Stop after level {ilevel}\n")
+            break
+
+        if ffd_opts.get("nfinal", None) is None and ilevel == ffd_opts["nlevels"] - 1:
+            sys.stdout.write(f"[PROGRESSIVE_FFD] Reached maximum level {ilevel}\n")
+            break
+
+        ndv_before_refine = level.ndv
+        level = build_next_ffd_level(level, result, ffd_opts)
+        append_selection_history_csv(
+            selection_history_csv,
+            getattr(level, "selection_metadata", None),
+            result,
+        )
+        if ffd_opts.get("nfinal", None) is not None and level.ndv <= ndv_before_refine:
+            sys.stdout.write(
+                "[PROGRESSIVE_FFD] Stop: refinement did not increase NDV "
+                f"before reaching NFINAL={ffd_opts['nfinal']}\n"
             )
             break
         ilevel += 1

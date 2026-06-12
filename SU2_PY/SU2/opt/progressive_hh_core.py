@@ -183,6 +183,15 @@ def project_full_to_symmetric(x_full, n_pairs, sign):
 
 def get_progressive_hh_options(config):
     enabled = _as_bool(config.get("PROGRESSIVE_HH", "NO"))
+    param_kind = str(config.get("PROGRESSIVE_PARAM_KIND", "HICKS_HENNE")).strip().upper()
+    if not param_kind:
+        param_kind = "HICKS_HENNE"
+    allowed_param_kinds = ("HICKS_HENNE", "FFD")
+    if param_kind not in allowed_param_kinds:
+        raise ValueError(
+            "Invalid PROGRESSIVE_PARAM_KIND "
+            f"{param_kind!r}; allowed values are {allowed_param_kinds}"
+        )
 
     scale = 1.0
     if "DEFINITION_DV" in config:
@@ -321,7 +330,15 @@ def get_progressive_hh_options(config):
     upper_count = _count_initial_points(upper_initial_value)
     lower_count = _count_initial_points(lower_initial_value)
 
-    if symmetry_mode == "REDUCED":
+    if param_kind == "FFD":
+        ffd_initial_value = config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None)
+        ffd_initial_count = _count_initial_points(ffd_initial_value)
+        if ffd_initial_count is None:
+            ffd_initial_count = upper_count
+        if ffd_initial_count is None:
+            ffd_initial_count = n0
+        initial_ndv = ffd_initial_count
+    elif symmetry_mode == "REDUCED":
         if surface_mode != "BOTH":
             raise ValueError(
                 "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED requires "
@@ -374,12 +391,13 @@ def get_progressive_hh_options(config):
         print(f"[PROGRESSIVE_HH][SYMMETRY] mode = {symmetry_mode}")
         print(f"[PROGRESSIVE_HH][SYMMETRY] sign = {symmetry_sign}")
         print(f"[PROGRESSIVE_HH] refine state mode = {refine_state_mode}")
-        if symmetry_mode == "REDUCED":
+        if param_kind == "HICKS_HENNE" and symmetry_mode == "REDUCED":
             print(f"[PROGRESSIVE_HH][SYMMETRY] pair count = {pair_count}")
             print(f"[PROGRESSIVE_HH][SYMMETRY] full SU2 HH = {initial_ndv}")
 
     return {
         "enabled": enabled,
+        "param_kind": param_kind,
         "nlevels": int(config.get("PROGRESSIVE_HH_NLEVELS", 1)),
         "n0": n0,
         "nfinal": nfinal,

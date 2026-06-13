@@ -867,7 +867,7 @@ def con_dcieq(x, project):
 
     tc = getattr(project, "thickness_constraint", None)
     if tc is not None:
-        J_full = tc.jacobian_fd(x_eval, project)
+        J_full = tc.jacobian(x_eval, project)
         J = _reduce_jac_if_needed(J_full, project)
         dcons = vstack([dcons, J])
 

@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import hashlib
+import math
 import os
 import shutil
 import sys
@@ -21,6 +22,7 @@ THICKNESS_PROGRESSIVE_KEYS = [
     "PROGRESSIVE_THICKNESS_X_STATIONS",
     "PROGRESSIVE_THICKNESS_MARGIN",
     "PROGRESSIVE_THICKNESS_FD_EPS",
+    "PROGRESSIVE_THICKNESS_GRADIENT",
     "PROGRESSIVE_THICKNESS_CACHE_FILE",
     "PROGRESSIVE_THICKNESS_DOMAIN_MODE",
     "PROGRESSIVE_THICKNESS_SYMMETRY_Y",
@@ -31,6 +33,28 @@ def _as_bool(value, default=False):
     if value is None:
         return default
     return str(value).strip().upper() in ("YES", "TRUE", "1", "ON")
+
+
+def _normalize_gradient_mode(value):
+    mode = str(value or "AUTO").strip().upper()
+    aliases = {
+        "FD": "FINITE_DIFFERENCE",
+        "FINDIFF": "FINITE_DIFFERENCE",
+        "FINITE_DIFF": "FINITE_DIFFERENCE",
+        "FINITE_DIFFERENCES": "FINITE_DIFFERENCE",
+        "FINITE_DIFFERENCE": "FINITE_DIFFERENCE",
+        "ANALYTIC": "ANALYTIC",
+        "ANALYTICAL": "ANALYTIC",
+        "ACCELERATED": "ANALYTIC",
+        "FAST": "ANALYTIC",
+        "AUTO": "AUTO",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            "PROGRESSIVE_THICKNESS_GRADIENT must be AUTO, ANALYTIC, "
+            f"or FINITE_DIFFERENCE; got {mode!r}"
+        )
+    return aliases[mode]
 
 
 def _resolve_from_cfg_dir(base_config, filename):
@@ -153,6 +177,14 @@ def _parse_x_stations(value):
 
 
 def _read_su2_points_and_marker_segments(mesh_filename, marker_name):
+    points, segments = _read_su2_points_and_marker_segments_with_ids(
+        mesh_filename,
+        marker_name,
+    )
+    return points, [(points[a], points[b]) for a, b in segments]
+
+
+def _read_su2_points_and_marker_segments_with_ids(mesh_filename, marker_name):
     marker_name = str(marker_name).strip()
     with open(mesh_filename, "r") as fp:
         lines = fp.readlines()
@@ -205,7 +237,7 @@ def _read_su2_points_and_marker_segments(mesh_filename, marker_name):
                     node_ids = elem_values[1:]
                     for a, b in zip(node_ids[:-1], node_ids[1:]):
                         if a in points and b in points:
-                            segments.append((points[a], points[b]))
+                            segments.append((a, b))
                 if not segments:
                     raise ValueError(
                         f"Marker {marker_name!r} has no usable boundary segments"
@@ -215,6 +247,158 @@ def _read_su2_points_and_marker_segments(mesh_filename, marker_name):
         i += 1
 
     raise ValueError(f"Marker {marker_name!r} was not found in {mesh_filename}")
+
+
+def _hicks_henne_bump(x, center):
+    x = float(x)
+    center = float(center)
+    if not 0.0 < center < 1.0:
+        return 0.0
+    if not 0.0 < x < 1.0:
+        return 0.0
+
+    exponent = math.log(0.5) / math.log(center)
+    value = math.sin(math.pi * (x ** exponent))
+    return value ** 6
+
+
+def _bernstein(n, i, t):
+    n = int(n)
+    i = int(i)
+    if i < 0 or i > n:
+        return 0.0
+    t = max(0.0, min(1.0, float(t)))
+    return math.comb(n, i) * (t ** i) * ((1.0 - t) ** (n - i))
+
+
+def _definition_dv_size(def_dv):
+    return int(sum(int(v) for v in def_dv.get("SIZE", [])))
+
+
+def _as_scalar_param_list(value):
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        return [float(v) for v in value]
+    return [float(value)]
+
+
+def _ffd_control_point_2d_params(params):
+    params = _as_scalar_param_list(params)
+    if len(params) >= 5:
+        return int(round(params[1])), int(round(params[2])), float(params[3]), float(params[4])
+    if len(params) >= 4:
+        return int(round(params[0])), int(round(params[1])), float(params[2]), float(params[3])
+    raise ValueError(f"Invalid FFD_CONTROL_POINT_2D params: {params}")
+
+
+def _mesh_filename_from_project(project):
+    cfg = project.config
+    mesh_in = str(cfg["MESH_FILENAME"])
+    if not os.path.isabs(mesh_in):
+        mesh_in = os.path.abspath(mesh_in)
+    return mesh_in
+
+
+def _read_ffd_surface_param_map(mesh_filename, box_tag, marker_name):
+    from SU2.opt.progressive_ffd_mesh import (
+        _find_tagged_ffd_block,
+        _infer_axes_from_control_points,
+        _infer_surface_param_location,
+        _parse_control_points,
+        _parse_count_block,
+        _parse_degree,
+        _parse_mesh_points,
+        _split_tokens,
+    )
+
+    points, marker_segments = _read_su2_points_and_marker_segments_with_ids(
+        mesh_filename,
+        marker_name,
+    )
+    marker_point_ids = set()
+    for a, b in marker_segments:
+        marker_point_ids.add(a)
+        marker_point_ids.add(b)
+
+    with open(mesh_filename, "r") as fp:
+        lines = fp.readlines()
+
+    ndime, _ = _parse_mesh_points(lines)
+    block_start, block_end = _find_tagged_ffd_block(lines, box_tag)
+    degree = _parse_degree(lines, block_start, block_end)
+    control_block = _parse_count_block(
+        lines,
+        block_start,
+        block_end,
+        "FFD_CONTROL_POINTS",
+    )
+    surface_block = _parse_count_block(
+        lines,
+        block_start,
+        block_end,
+        "FFD_SURFACE_POINTS",
+    )
+    if control_block is None or surface_block is None:
+        raise ValueError("FFD_CONTROL_POINTS and FFD_SURFACE_POINTS are required")
+
+    control_points, _, _ = _parse_control_points(control_block)
+    x_columns, y_rows, z_planes = _infer_axes_from_control_points(
+        control_points,
+        degree,
+    )
+    if not z_planes:
+        z_planes = [0.0]
+
+    axes = {
+        "columns": list(x_columns),
+        "y_rows": list(y_rows),
+        "z_planes": list(z_planes),
+    }
+
+    param_by_point = {}
+    for line in surface_block["data"]:
+        tokens = _split_tokens(line)
+        if not tokens:
+            continue
+        best = None
+        for token in tokens[:4]:
+            try:
+                point_id = int(round(float(token)))
+            except Exception:
+                continue
+            if point_id not in marker_point_ids or point_id not in points:
+                continue
+            local_best = _infer_surface_param_location(
+                tokens,
+                points[point_id],
+                axes,
+                ndime,
+            )
+            if local_best is None or local_best["point_id"] != point_id:
+                continue
+            if best is None or local_best["score"] < best["score"]:
+                best = local_best
+
+        if best is None:
+            continue
+
+        point_id = best["point_id"]
+        start = best["param_start"]
+        count = best["param_count"]
+        uvw = [float(tokens[start]), float(tokens[start + 1]), 0.0]
+        if count >= 3:
+            uvw[2] = float(tokens[start + 2])
+        param_by_point[point_id] = uvw
+
+    missing = sorted(pid for pid in marker_point_ids if pid not in param_by_point)
+    if missing:
+        raise ValueError(
+            "Could not recover FFD parametric coordinates for "
+            f"{len(missing)} marker points"
+        )
+
+    return points, marker_segments, param_by_point, axes
 
 
 def _section_measure_from_segments(
@@ -376,6 +560,7 @@ class ThicknessConstraint:
         reference_measure,
         margin=0.0,
         fd_eps=1.0e-6,
+        gradient_mode="AUTO",
         domain_mode="FULL",
         symmetry_y=0.0,
     ):
@@ -386,10 +571,12 @@ class ThicknessConstraint:
         self.reference_thickness = self.reference_measure
         self.margin = float(margin)
         self.fd_eps = float(fd_eps)
+        self.gradient_mode = _normalize_gradient_mode(gradient_mode)
         self.domain_mode = str(domain_mode).upper()
         self.symmetry_y = float(symmetry_y)
         self.eval_dir = "THICKNESS_CONSTRAINT_EVAL"
         self._cache = {}
+        self._fallback_warned = False
 
     def _cache_key(self, x_eval, cfg):
         payload = repr(
@@ -483,6 +670,181 @@ class ThicknessConstraint:
 
         return jac
 
+    def jacobian_analytic(self, x_eval, project):
+        def_dv = project.config["DEFINITION_DV"]
+        kinds = [str(k).upper() for k in def_dv.get("KIND", [])]
+        if not kinds:
+            raise ValueError("DEFINITION_DV is empty")
+
+        if all(kind == "HICKS_HENNE" for kind in kinds):
+            return self._jacobian_hicks_henne(def_dv)
+
+        if all(kind == "FFD_CONTROL_POINT_2D" for kind in kinds):
+            return self._jacobian_ffd_control_point_2d(def_dv, project)
+
+        raise ValueError(
+            "Analytic thickness gradient supports only pure HICKS_HENNE or "
+            "pure FFD_CONTROL_POINT_2D definitions"
+        )
+
+    def jacobian(self, x_eval, project):
+        if self.gradient_mode == "FINITE_DIFFERENCE":
+            return self.jacobian_fd(x_eval, project)
+
+        def_dv = project.config["DEFINITION_DV"]
+        kinds = [str(k).upper() for k in def_dv.get("KIND", [])]
+        if self.gradient_mode == "AUTO" and all(kind == "HICKS_HENNE" for kind in kinds):
+            if not self._fallback_warned:
+                print(
+                    "[THICKNESS_CONSTRAINT] AUTO gradient keeps finite differences "
+                    "for HICKS_HENNE because SU2 applies HH through surface-normal "
+                    "classification; set PROGRESSIVE_THICKNESS_GRADIENT=ANALYTIC "
+                    "to use the fast approximation."
+                )
+                self._fallback_warned = True
+            return self.jacobian_fd(x_eval, project)
+
+        try:
+            return self.jacobian_analytic(x_eval, project)
+        except Exception as exc:
+            if self.gradient_mode == "ANALYTIC":
+                raise RuntimeError(
+                    "Analytic thickness constraint gradient failed"
+                ) from exc
+
+            if not self._fallback_warned:
+                print(
+                    "[THICKNESS_CONSTRAINT] WARNING: analytic gradient unavailable; "
+                    f"falling back to finite differences ({exc})"
+                )
+                self._fallback_warned = True
+            return self.jacobian_fd(x_eval, project)
+
+    def _jacobian_hicks_henne(self, def_dv):
+        n_dv = _definition_dv_size(def_dv)
+        jac = np.zeros((len(self.x_stations), n_dv), dtype=float)
+
+        k = 0
+        for i_dv, kind in enumerate(def_dv["KIND"]):
+            if str(kind).upper() != "HICKS_HENNE":
+                raise ValueError("Mixed DV kinds are not supported")
+            if int(def_dv["SIZE"][i_dv]) != 1:
+                raise ValueError("HICKS_HENNE analytic thickness gradient requires SIZE=1")
+
+            params = _as_scalar_param_list(def_dv["PARAM"][i_dv])
+            if len(params) < 2:
+                raise ValueError(f"Invalid HICKS_HENNE params: {params}")
+            side = "UPPER" if float(params[0]) >= 0.5 else "LOWER"
+            center = float(params[1])
+            scale = float(def_dv["SCALE"][i_dv])
+
+            for i_x, x in enumerate(self.x_stations):
+                bump = scale * _hicks_henne_bump(x, center)
+                if self.domain_mode == "FULL":
+                    jac[i_x, k] = bump
+                elif self.domain_mode == "HALF_UPPER":
+                    jac[i_x, k] = bump if side == "UPPER" else 0.0
+                else:
+                    raise ValueError(
+                        "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL or HALF_UPPER"
+                    )
+            k += 1
+
+        return jac
+
+    def _jacobian_ffd_control_point_2d(self, def_dv, project):
+        n_dv = _definition_dv_size(def_dv)
+        if any(int(size) != 1 for size in def_dv.get("SIZE", [])):
+            raise ValueError("FFD_CONTROL_POINT_2D analytic gradient requires SIZE=1")
+
+        mesh_filename = _mesh_filename_from_project(project)
+        box_tags = [str(tag) for tag in def_dv.get("FFDTAG", []) if str(tag)]
+        if not box_tags:
+            raise ValueError("FFD_CONTROL_POINT_2D definitions require FFDTAG")
+        if len(set(box_tags)) != 1:
+            raise ValueError("Analytic FFD thickness gradient supports one FFD box")
+
+        points, segments, param_by_point, axes = _read_ffd_surface_param_map(
+            mesh_filename,
+            box_tags[0],
+            self.marker,
+        )
+        degree_i = len(axes["columns"]) - 1
+        degree_j = len(axes["y_rows"]) - 1
+
+        point_dy = {}
+        for point_id, uvw in param_by_point.items():
+            u, v = float(uvw[0]), float(uvw[1])
+            values = np.zeros(n_dv, dtype=float)
+            k = 0
+            for i_dv, params in enumerate(def_dv["PARAM"]):
+                i_idx, j_idx, dx, dy = _ffd_control_point_2d_params(params)
+                if abs(dx) > 1.0e-14:
+                    raise ValueError(
+                        "Analytic FFD thickness gradient supports only Y-direction "
+                        "FFD_CONTROL_POINT_2D variables"
+                    )
+                scale = float(def_dv["SCALE"][i_dv])
+                values[k] = (
+                    scale
+                    * dy
+                    * _bernstein(degree_i, i_idx, u)
+                    * _bernstein(degree_j, j_idx, v)
+                )
+                k += 1
+            point_dy[point_id] = values
+
+        jac = np.zeros((len(self.x_stations), n_dv), dtype=float)
+        tol = 1.0e-12
+
+        for i_x, x_station in enumerate(self.x_stations):
+            hits = []
+            x_station = float(x_station)
+            for a, b in segments:
+                p0 = points[a]
+                p1 = points[b]
+                x0, y0 = float(p0[0]), float(p0[1])
+                x1, y1 = float(p1[0]), float(p1[1])
+                xmin = min(x0, x1)
+                xmax = max(x0, x1)
+                if x_station < xmin - tol or x_station > xmax + tol:
+                    continue
+
+                if abs(x1 - x0) <= tol:
+                    if abs(x_station - x0) <= tol:
+                        hits.append((y0, point_dy[a]))
+                        hits.append((y1, point_dy[b]))
+                    continue
+
+                t = (x_station - x0) / (x1 - x0)
+                if -tol <= t <= 1.0 + tol:
+                    t = max(0.0, min(1.0, t))
+                    y_hit = y0 + t * (y1 - y0)
+                    dy_hit = (1.0 - t) * point_dy[a] + t * point_dy[b]
+                    hits.append((y_hit, dy_hit))
+
+            if self.domain_mode == "FULL":
+                if len(hits) < 2:
+                    raise ValueError(
+                        f"Could not compute FFD thickness gradient at x={x_station:.12g}"
+                    )
+                upper = max(hits, key=lambda item: item[0])
+                lower = min(hits, key=lambda item: item[0])
+                jac[i_x, :] = upper[1] - lower[1]
+            elif self.domain_mode == "HALF_UPPER":
+                if not hits:
+                    raise ValueError(
+                        f"Could not compute FFD half-thickness gradient at x={x_station:.12g}"
+                    )
+                upper = max(hits, key=lambda item: item[0])
+                jac[i_x, :] = upper[1]
+            else:
+                raise ValueError(
+                    "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL or HALF_UPPER"
+                )
+
+        return jac
+
 
 def build_thickness_constraint_from_config(base_config):
     enabled = _as_bool(
@@ -504,6 +866,9 @@ def build_thickness_constraint_from_config(base_config):
     x_stations_value = base_config.get("PROGRESSIVE_THICKNESS_X_STATIONS", None)
     margin = float(base_config.get("PROGRESSIVE_THICKNESS_MARGIN", 0.0))
     fd_eps = float(base_config.get("PROGRESSIVE_THICKNESS_FD_EPS", 1.0e-6))
+    gradient_mode = _normalize_gradient_mode(
+        base_config.get("PROGRESSIVE_THICKNESS_GRADIENT", "AUTO")
+    )
     domain_mode = str(
         base_config.get("PROGRESSIVE_THICKNESS_DOMAIN_MODE", "FULL")
     ).upper()
@@ -548,6 +913,7 @@ def build_thickness_constraint_from_config(base_config):
     print(f"[THICKNESS_CONSTRAINT] reference mesh = {ref_mesh}")
     print(f"[THICKNESS_CONSTRAINT] marker = {marker}")
     print(f"[THICKNESS_CONSTRAINT] domain mode = {domain_mode}")
+    print(f"[THICKNESS_CONSTRAINT] gradient mode = {gradient_mode}")
     if domain_mode == "HALF_UPPER":
         print(f"[THICKNESS_CONSTRAINT] symmetry y = {symmetry_y}")
     if explicit_x_stations:
@@ -572,6 +938,7 @@ def build_thickness_constraint_from_config(base_config):
         reference_measure=reference,
         margin=margin,
         fd_eps=fd_eps,
+        gradient_mode=gradient_mode,
         domain_mode=domain_mode,
         symmetry_y=symmetry_y,
     )

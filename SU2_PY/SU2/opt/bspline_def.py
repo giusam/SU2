@@ -8,6 +8,8 @@ import math
 from collections import defaultdict
 
 from SU2.opt.bspline_modes import (
+    ALLOWED_DEFORMATION_DIRECTION_MODES,
+    ALLOWED_SURFACE_MODES,
     BSplineModeError,
     LE_SAFE_DEFAULT_POWER,
     LE_SAFE_DEFAULT_X0,
@@ -15,8 +17,11 @@ from SU2.opt.bspline_modes import (
     deformation_direction,
     evaluate_normal_displacement,
     load_mode_spec,
+    normalize_deformation_direction_mode,
+    normalize_surface_mode,
     validate_le_safe_direction_options,
     validate_mode_spec,
+    validate_surface_mode_against_modes,
 )
 
 
@@ -419,13 +424,24 @@ def compute_deformed_surface(
     le_safe_x0=LE_SAFE_DEFAULT_X0,
     le_safe_x1=LE_SAFE_DEFAULT_X1,
     le_safe_power=LE_SAFE_DEFAULT_POWER,
+    deformation_direction_mode=None,
+    surface_mode="BOTH",
 ):
     spec = validate_mode_spec(mode_spec)
+    try:
+        surface_mode = normalize_surface_mode(surface_mode)
+        validate_surface_mode_against_modes(spec, surface_mode)
+    except BSplineModeError as exc:
+        raise BSplineDefError(str(exc))
+    direction_mode = normalize_deformation_direction_mode(
+        deformation_direction_mode,
+        le_safe_direction=le_safe_direction,
+    )
     direction_options = validate_le_safe_direction_options(
-        le_safe_direction,
-        le_safe_x0,
-        le_safe_x1,
-        le_safe_power,
+        direction_mode == "LE_SAFE",
+        le_safe_x0 if direction_mode == "LE_SAFE" else LE_SAFE_DEFAULT_X0,
+        le_safe_x1 if direction_mode == "LE_SAFE" else LE_SAFE_DEFAULT_X1,
+        le_safe_power if direction_mode == "LE_SAFE" else LE_SAFE_DEFAULT_POWER,
     )
     if not spec.get("normal_displacement", True):
         raise BSplineDefError("BSPLINE_DEF v1 only supports normal_displacement=true")
@@ -444,12 +460,15 @@ def compute_deformed_surface(
         for node_id in node_ids
     ]
     y_values = [points[node_id][1] for node_id in node_ids]
-    sides = classify_sides(
-        node_ids,
-        x_over_c,
-        y_values,
-        side_overrides=side_overrides,
-    )
+    if surface_mode == "BOTH":
+        sides = classify_sides(
+            node_ids,
+            x_over_c,
+            y_values,
+            side_overrides=side_overrides,
+        )
+    else:
+        sides = [surface_mode.lower()] * len(node_ids)
     normals = compute_surface_normals(points, node_ids, sides, closed)
     weights = compute_arc_length_weights(points, node_ids, closed)
     normal_displacement, mode_values = evaluate_normal_displacement(
@@ -479,6 +498,7 @@ def compute_deformed_surface(
             le_safe_x0=direction_options["le_safe_x0"],
             le_safe_x1=direction_options["le_safe_x1"],
             le_safe_power=direction_options["le_safe_power"],
+            direction_mode=direction_mode,
         )
         deformed_x = x + displacement * dir_x
         deformed_y = y + displacement * dir_y
@@ -493,6 +513,8 @@ def compute_deformed_surface(
                 "normal_y": ny,
                 "deform_dir_x": dir_x,
                 "deform_dir_y": dir_y,
+                "deformation_direction_mode": direction_mode,
+                "surface_mode": surface_mode,
                 "weight": weight,
                 "normal_displacement": displacement,
                 "deformed_x": deformed_x,
@@ -534,6 +556,8 @@ def write_metadata(records, filename):
         "normal_y",
         "deform_dir_x",
         "deform_dir_y",
+        "deformation_direction_mode",
+        "surface_mode",
         "weight",
         "deformed_x",
         "deformed_y",
@@ -556,6 +580,8 @@ def write_bspline_surface_files(
     le_safe_x0=LE_SAFE_DEFAULT_X0,
     le_safe_x1=LE_SAFE_DEFAULT_X1,
     le_safe_power=LE_SAFE_DEFAULT_POWER,
+    deformation_direction_mode=None,
+    surface_mode="BOTH",
 ):
     spec = load_mode_spec(modes_filename)
     result = compute_deformed_surface(
@@ -567,6 +593,8 @@ def write_bspline_surface_files(
         le_safe_x0=le_safe_x0,
         le_safe_x1=le_safe_x1,
         le_safe_power=le_safe_power,
+        deformation_direction_mode=deformation_direction_mode,
+        surface_mode=surface_mode,
     )
     write_surface_positions(result["records"], output_filename)
     write_metadata(result["records"], metadata_filename)
@@ -595,6 +623,18 @@ def _build_arg_parser():
         help="Output metadata CSV file",
     )
     parser.add_argument(
+        "--surface-mode",
+        default="BOTH",
+        choices=ALLOWED_SURFACE_MODES,
+        help="Treat the marker as a full airfoil or one half-domain surface",
+    )
+    parser.add_argument(
+        "--deformation-direction",
+        default=None,
+        choices=ALLOWED_DEFORMATION_DIRECTION_MODES,
+        help="Direction used to apply the scalar B-spline deformation",
+    )
+    parser.add_argument(
         "--le-safe-direction",
         action="store_true",
         default=False,
@@ -621,6 +661,8 @@ def main(argv=None):
             le_safe_x0=args.le_safe_x0,
             le_safe_x1=args.le_safe_x1,
             le_safe_power=args.le_safe_power,
+            deformation_direction_mode=args.deformation_direction,
+            surface_mode=args.surface_mode,
         )
     except (BSplineDefError, BSplineModeError, OSError) as exc:
         parser.error(str(exc))

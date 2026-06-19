@@ -30,6 +30,7 @@ from SU2.opt.bspline_su2_driver import (
     read_bspline_gradients,
     read_gradient_vector,
     read_objective_from_history,
+    resolve_thickness_domain_mode,
     run_command,
     run_bspline_su2_optimization,
     thickness_options_from_config,
@@ -705,6 +706,107 @@ def test_bspline_thickness_analytic_jacobian_matches_finite_difference():
     assert analytic == pytest.approx(finite_difference, rel=1.0e-6, abs=1.0e-8)
 
 
+@pytest.mark.parametrize(
+    "domain_mode,y_base,deform_y,expected_value,expected_gradient",
+    [
+        ("HALF_UPPER", 0.1, 1.0, 0.1, 1.0),
+        ("HALF_LOWER", -0.1, 1.0, 0.1, -1.0),
+    ],
+)
+def test_bspline_half_thickness_value_and_gradient_sign(
+    domain_mode,
+    y_base,
+    deform_y,
+    expected_value,
+    expected_gradient,
+):
+    metadata = [
+        {"node_id": 0, "x": 0.0, "y": y_base, "normal_x": 0.0, "normal_y": deform_y},
+        {"node_id": 1, "x": 1.0, "y": y_base, "normal_x": 0.0, "normal_y": deform_y},
+    ]
+    constraint = BSplineThicknessConstraint(
+        metadata,
+        np.ones((2, 1), dtype=float),
+        ["mode"],
+        reference_measure=[expected_value],
+        x_stations=[0.5],
+        domain_mode=domain_mode,
+        symmetry_y=0.0,
+        closed=False,
+    )
+
+    assert constraint.section_measure([0.0]) == pytest.approx([expected_value])
+    assert constraint.jacobian_analytic([0.0])[0, 0] == pytest.approx(expected_gradient)
+
+
+@pytest.mark.parametrize(
+    "surface_mode,configured,expected",
+    [
+        ("BOTH", "AUTO", "FULL"),
+        ("UPPER", "AUTO", "HALF_UPPER"),
+        ("LOWER", "AUTO", "HALF_LOWER"),
+        ("HALF_LOWER", "HALF_LOWER", "HALF_LOWER"),
+    ],
+)
+def test_thickness_domain_auto_follows_surface_mode(surface_mode, configured, expected):
+    assert resolve_thickness_domain_mode(surface_mode, configured) == expected
+
+
+@pytest.mark.parametrize(
+    "surface_mode,configured,message",
+    [
+        ("UPPER", "FULL", "FULL thickness requires a complete upper/lower surface"),
+        ("LOWER", "HALF_UPPER", "HALF_UPPER thickness is incompatible"),
+    ],
+)
+def test_thickness_domain_rejects_incompatible_surface_mode(
+    surface_mode,
+    configured,
+    message,
+):
+    with pytest.raises(BSplineSU2DriverError, match=message):
+        resolve_thickness_domain_mode(surface_mode, configured)
+
+
+@pytest.mark.parametrize("surface_mode,side", [("UPPER", "upper"), ("LOWER", "lower")])
+def test_driver_uses_only_single_surface_modes(tmp_path, surface_mode, side):
+    spec = _single_mode_spec()
+    spec["modes"][0]["side"] = side
+    spec["modes"][0]["id"] = f"{side}_b"
+    spec["surface_mode"] = surface_mode
+    driver = _make_driver(
+        tmp_path,
+        spec=spec,
+        surface_mode=surface_mode,
+        symmetry_coupling="NONE",
+    )
+
+    assert driver.mode_ids == [f"{side}_b"]
+    assert len(driver.reduced_variable_ids) == 1
+    driver.write_optimized_modes([0.004])
+    optimized = json.loads(driver.optimized_modes_filename.read_text())
+    assert optimized["surface_mode"] == surface_mode
+    assert {mode["side"] for mode in optimized["modes"]} == {side}
+
+
+@pytest.mark.parametrize("surface_mode", ["UPPER", "LOWER"])
+def test_half_domain_rejects_symmetry_coupling(tmp_path, surface_mode):
+    spec = _single_mode_spec()
+    side = surface_mode.lower()
+    spec["modes"][0]["side"] = side
+    spec["surface_mode"] = surface_mode
+    with pytest.raises(
+        BSplineSU2DriverError,
+        match="BSPLINE_SYMMETRY_COUPLING is only valid with BSPLINE_SURFACE_MODE=BOTH",
+    ):
+        _make_driver(
+            tmp_path,
+            spec=spec,
+            surface_mode=surface_mode,
+            symmetry_coupling="NORMAL_EQUAL",
+        )
+
+
 def test_bspline_thickness_slsqp_jacobian_scales_by_relax_and_beta(tmp_path):
     driver = _make_driver(
         tmp_path,
@@ -822,6 +924,8 @@ def test_command_builder_produces_expected_commands(tmp_path):
         "--mesh",
     ]
     assert "/abs/base_mesh.su2" in commands["bspline_def"]
+    direction_index = commands["bspline_def"].index("--deformation-direction")
+    assert commands["bspline_def"][direction_index + 1] == "NORMAL"
     assert commands["bspline_def"][-2:] == ["--marker", "airfoil"]
     assert commands["def"] == ["mpirun", "-n", "6", "SU2_DEF", "def.cfg"]
     assert commands["primal"] == ["mpirun", "-n", "6", "SU2_CFD", "primal.cfg"]
@@ -838,6 +942,82 @@ def test_command_builder_produces_expected_commands(tmp_path):
     assert "--prefer-vector" in commands["bspline_dot"]
     assert "--sensitivity-weighting" in commands["bspline_dot"]
     assert commands["bspline_dot"][commands["bspline_dot"].index("--sensitivity-weighting") + 1] == "NODAL"
+
+
+def test_command_builder_uses_vertical_direction_without_le_safe_options(tmp_path):
+    paths = build_eval_paths(tmp_path / "eval_0000")
+
+    commands = build_eval_commands(
+        paths,
+        base_mesh="/abs/base_mesh.su2",
+        marker="airfoil",
+        python_executable="python3",
+        deformation_direction_mode="VERTICAL",
+        le_safe_direction=True,
+        le_safe_x0=0.0,
+        le_safe_x1=0.05,
+        le_safe_power=2.0,
+    )
+    command = commands["bspline_def"]
+
+    mode_index = command.index("--deformation-direction")
+    assert command[mode_index + 1] == "VERTICAL"
+    assert "--le-safe-direction" not in command
+    assert "--le-safe-x0" not in command
+    assert "--le-safe-x1" not in command
+    assert "--le-safe-power" not in command
+
+
+def test_command_builder_passes_half_domain_surface_mode(tmp_path):
+    paths = build_eval_paths(tmp_path / "eval_0000")
+    command = build_eval_commands(
+        paths,
+        base_mesh="/abs/mesh_half_lower.su2",
+        marker="airfoil",
+        surface_mode="LOWER",
+    )["bspline_def"]
+
+    index = command.index("--surface-mode")
+    assert command[index + 1] == "LOWER"
+
+
+def test_driver_config_maps_vertical_deformation_direction():
+    options = fixed_driver_options_from_config(
+        {
+            "BSPLINE_DEFORMATION_DIRECTION": "VERTICAL",
+            "BSPLINE_LE_SAFE_DIRECTION": True,
+        }
+    )
+    assert options["deformation_direction_mode"] == "VERTICAL"
+    assert options["le_safe_direction"] is True
+
+
+def test_driver_config_maps_surface_mode_alias():
+    options = fixed_driver_options_from_config(
+        {"BSPLINE_SURFACE_MODE": "HALF_UPPER"}
+    )
+    assert options["surface_mode"] == "HALF_UPPER"
+
+
+def test_command_builder_keeps_legacy_le_safe_activation(tmp_path):
+    paths = build_eval_paths(tmp_path / "eval_0000")
+    command = build_eval_commands(
+        paths,
+        base_mesh="/abs/base_mesh.su2",
+        marker="airfoil",
+        python_executable="python3",
+        le_safe_direction=True,
+        le_safe_x0=0.0,
+        le_safe_x1=0.05,
+        le_safe_power=2.0,
+    )["bspline_def"]
+
+    mode_index = command.index("--deformation-direction")
+    assert command[mode_index + 1] == "LE_SAFE"
+    assert "--le-safe-direction" in command
+    assert "--le-safe-x0" in command
+    assert "--le-safe-x1" in command
+    assert "--le-safe-power" in command
 
 
 def test_flat_eval_layout_is_removed(tmp_path):
@@ -1245,6 +1425,7 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
         "OPT_LINE_SEARCH_BOUND= 0.004\n"
         "BSPLINE_EVAL_LAYOUT= DSN\n"
         "BSPLINE_SYMMETRY_COUPLING= NORMAL_EQUAL\n"
+        "BSPLINE_DEFORMATION_DIRECTION= VERTICAL\n"
         "BSPLINE_LOCAL_STEP_LIMIT= YES\n"
         "BSPLINE_LOCAL_STEP_LIMIT_RATIO= 150.0\n"
         "OPT_CONSTRAINT= THICKNESS\n"
@@ -1263,6 +1444,7 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert values["OPT_LINE_SEARCH_BOUND"] == pytest.approx(0.004)
     assert values["BSPLINE_EVAL_LAYOUT"] == "DSN"
     assert values["BSPLINE_SYMMETRY_COUPLING"] == "NORMAL_EQUAL"
+    assert values["BSPLINE_DEFORMATION_DIRECTION"] == "VERTICAL"
     assert values["BSPLINE_LOCAL_STEP_LIMIT"] is True
     assert values["BSPLINE_LOCAL_STEP_LIMIT_RATIO"] == pytest.approx(150.0)
     assert values["BSPLINE_MAX_NORMAL_DISPLACEMENT"] == pytest.approx(0.03)
@@ -1280,6 +1462,7 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert options["opt_line_search_bound"] == pytest.approx(0.004)
     assert options["eval_layout"] == "DSN"
     assert options["symmetry_coupling"] == "NORMAL_EQUAL"
+    assert options["deformation_direction_mode"] == "VERTICAL"
     assert options["objective_adjoint"] == "drag"
     assert options["local_step_limit"] is True
     assert options["local_step_limit_ratio"] == pytest.approx(150.0)
@@ -1329,6 +1512,7 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert args.sensitivity_weighting == "NODAL"
     assert args.eval_layout == "DSN"
     assert args.symmetry_coupling == "NORMAL_EQUAL"
+    assert args.deformation_direction_mode == "VERTICAL"
     assert args.local_step_limit is True
     assert args.local_step_limit_ratio == pytest.approx(125.0)
     assert args.auto_scale_bounds_to_geometry is True

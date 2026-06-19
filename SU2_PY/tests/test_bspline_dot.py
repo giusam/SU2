@@ -333,6 +333,122 @@ def test_projection_uses_deform_dir_columns_when_present():
     assert gradient["gradient"] == pytest.approx(0.125)
 
 
+def test_vertical_vector_projection_uses_only_signed_sensitivity_y():
+    spec = _base_spec()
+    metadata = [
+        {
+            "node_id": 1,
+            "x": 0.5,
+            "y": 0.05,
+            "x_over_c": 0.5,
+            "side": "upper",
+            "normal_x": 0.8,
+            "normal_y": 0.6,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": 1.0,
+            "weight": 1.0,
+            "deformed_x": 0.5,
+            "deformed_y": 0.05,
+        },
+        {
+            "node_id": 2,
+            "x": 0.5,
+            "y": -0.05,
+            "x_over_c": 0.5,
+            "side": "lower",
+            "normal_x": -0.8,
+            "normal_y": -0.6,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": -1.0,
+            "weight": 1.0,
+            "deformed_x": 0.5,
+            "deformed_y": -0.05,
+        },
+    ]
+    sensitivities = [
+        {"node_id": 1, "sensitivity_x": 1000.0, "sensitivity_y": 2.0},
+        {"node_id": 2, "sensitivity_x": -2000.0, "sensitivity_y": 3.0},
+    ]
+
+    gradients = _by_mode(project_bspline_gradients(spec, metadata, sensitivities))
+
+    assert gradients["upper_B1"]["gradient"] == pytest.approx(0.75)
+    assert gradients["lower_B1"]["gradient"] == pytest.approx(-1.125)
+
+
+@pytest.mark.parametrize(
+    "side,direction_y,sensitivity_y,expected",
+    [
+        ("upper", 1.0, 2.0, 0.75),
+        ("lower", -1.0, 2.0, -0.75),
+    ],
+)
+def test_vertical_projection_supports_single_surface_metadata(
+    side,
+    direction_y,
+    sensitivity_y,
+    expected,
+):
+    spec = _base_spec()
+    spec["modes"] = [mode for mode in spec["modes"] if mode["side"] == side]
+    spec["surface_mode"] = side.upper()
+    metadata = [
+        {
+            "node_id": 1,
+            "x": 0.5,
+            "y": 0.05 if side == "upper" else -0.05,
+            "x_over_c": 0.5,
+            "side": side,
+            "normal_x": 0.0,
+            "normal_y": direction_y,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": direction_y,
+            "weight": 1.0,
+            "deformed_x": 0.5,
+            "deformed_y": 0.05 if side == "upper" else -0.05,
+        }
+    ]
+    sensitivities = [
+        {"node_id": 1, "sensitivity_x": 1000.0, "sensitivity_y": sensitivity_y}
+    ]
+
+    gradient = project_bspline_gradients(spec, metadata, sensitivities)[0]
+
+    assert gradient["side"] == side
+    assert gradient["gradient"] == pytest.approx(expected)
+
+
+def test_scalar_normal_sensitivity_is_converted_to_effective_direction():
+    spec = _base_spec()
+    metadata = [
+        {
+            "node_id": 1,
+            "x": 0.5,
+            "y": 0.05,
+            "x_over_c": 0.5,
+            "side": "upper",
+            "normal_x": 0.6,
+            "normal_y": 0.8,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": 1.0,
+            "weight": 1.0,
+            "deformed_x": 0.5,
+            "deformed_y": 0.05,
+        }
+    ]
+    sensitivities = [{"node_id": 1, "surface_sensitivity": 2.0}]
+
+    gradient = project_bspline_gradients(
+        spec,
+        metadata,
+        sensitivities,
+        prefer_vector=False,
+    )[0]
+
+    assert gradient["projection_mode"] == "scalar"
+    assert gradient["gradient"] == pytest.approx(0.6)
+
+
 def test_read_metadata_defaults_deform_dir_to_normal_when_absent(tmp_path):
     # Backward compatibility: metadata without deform_dir_* falls back to normals.
     records = _metadata_records()

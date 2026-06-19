@@ -17,6 +17,8 @@ DEFAULT_NORMALIZATION_SAMPLES = 5001
 LE_SAFE_DEFAULT_X0 = 0.005
 LE_SAFE_DEFAULT_X1 = 0.025
 LE_SAFE_DEFAULT_POWER = 1.5
+ALLOWED_DEFORMATION_DIRECTION_MODES = ("NORMAL", "LE_SAFE", "VERTICAL")
+ALLOWED_SURFACE_MODES = ("BOTH", "UPPER", "LOWER")
 
 
 def _as_float(value, name):
@@ -44,6 +46,55 @@ def _as_float_list(values, name):
     if not isinstance(values, (list, tuple)):
         raise BSplineModeError(f"{name} must be a list")
     return [_as_float(value, name) for value in values]
+
+
+def normalize_surface_mode(value=None):
+    """Return the canonical B-spline surface mode."""
+
+    normalized = str("BOTH" if value is None else value).strip().upper().replace("-", "_")
+    aliases = {
+        "BOTH": "BOTH",
+        "FULL": "BOTH",
+        "UPPER": "UPPER",
+        "HALF_UPPER": "UPPER",
+        "LOWER": "LOWER",
+        "HALF_LOWER": "LOWER",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError:
+        raise BSplineModeError(
+            "BSPLINE_SURFACE_MODE must be BOTH, UPPER, or LOWER; "
+            f"got {value!r}"
+        )
+
+
+def active_sides_from_surface_mode(surface_mode):
+    mode = normalize_surface_mode(surface_mode)
+    if mode == "UPPER":
+        return ["upper"]
+    if mode == "LOWER":
+        return ["lower"]
+    return ["upper", "lower"]
+
+
+def validate_surface_mode_against_modes(spec, surface_mode):
+    """Reject active modes belonging to a side absent from a half-domain."""
+
+    mode = normalize_surface_mode(surface_mode)
+    required_side = None if mode == "BOTH" else mode.lower()
+    if required_side is None:
+        return mode
+
+    for item in spec.get("modes", []):
+        if item.get("active", True) is False:
+            continue
+        if str(item.get("side", "")).strip().lower() != required_side:
+            raise BSplineModeError(
+                f"BSPLINE_SURFACE_MODE={mode} requires all active modes "
+                f"to have side='{required_side}'"
+            )
+    return mode
 
 
 def _validate_degree(value, name):
@@ -198,6 +249,10 @@ def validate_mode_spec(spec):
     for mode in modes:
         _validate_mode(mode, seen_ids)
 
+    if "surface_mode" in spec:
+        surface_mode = normalize_surface_mode(spec["surface_mode"])
+        validate_surface_mode_against_modes(spec, surface_mode)
+
     return spec
 
 
@@ -265,6 +320,41 @@ def class_shape_factor(x, class_shape="sqrt_x_one_minus_x"):
     # LE tangent while recovering a sqrt-like profile away from x=0.
     eps = 1.0e-2
     return x * (1.0 - x) / math.sqrt(x + eps)
+
+
+def normalize_deformation_direction_mode(value=None, le_safe_direction=False):
+    if value is None or str(value).strip() == "":
+        legacy_le_safe = _as_bool(
+            le_safe_direction,
+            "BSPLINE_LE_SAFE_DIRECTION",
+        )
+        return "LE_SAFE" if legacy_le_safe else "NORMAL"
+
+    normalized = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "normal": "NORMAL",
+        "normals": "NORMAL",
+        "le_safe": "LE_SAFE",
+        "lesafe": "LE_SAFE",
+        "vertical": "VERTICAL",
+        "y": "VERTICAL",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError:
+        raise BSplineModeError(
+            "BSPLINE_DEFORMATION_DIRECTION must be one of "
+            f"{ALLOWED_DEFORMATION_DIRECTION_MODES}; got {value!r}"
+        )
+
+
+def vertical_direction(side):
+    side = str(side).strip().lower()
+    if side == "upper":
+        return 0.0, 1.0
+    if side == "lower":
+        return 0.0, -1.0
+    raise BSplineModeError(f"invalid side for vertical direction: {side!r}")
 
 
 def le_safe_direction(
@@ -335,8 +425,15 @@ def deformation_direction(
     le_safe_x0=LE_SAFE_DEFAULT_X0,
     le_safe_x1=LE_SAFE_DEFAULT_X1,
     le_safe_power=LE_SAFE_DEFAULT_POWER,
+    direction_mode=None,
 ):
-    if not bool(use_le_safe_direction):
+    mode = normalize_deformation_direction_mode(
+        direction_mode,
+        le_safe_direction=use_le_safe_direction,
+    )
+    if mode == "VERTICAL":
+        return vertical_direction(side)
+    if mode == "NORMAL":
         return float(normal_x), float(normal_y)
     return le_safe_direction(
         x_over_c,

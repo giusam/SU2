@@ -25,14 +25,20 @@ from SU2.opt.bspline_dot import (
     read_metadata,
 )
 from SU2.opt.bspline_modes import (
+    ALLOWED_DEFORMATION_DIRECTION_MODES,
+    ALLOWED_SURFACE_MODES,
     BSplineModeError,
     LE_SAFE_DEFAULT_POWER,
     LE_SAFE_DEFAULT_X0,
     LE_SAFE_DEFAULT_X1,
+    active_sides_from_surface_mode,
     evaluate_all_modes,
     load_mode_spec,
+    normalize_deformation_direction_mode,
+    normalize_surface_mode,
     validate_le_safe_direction_options,
     validate_mode_spec,
+    validate_surface_mode_against_modes,
 )
 from SU2.opt.progressive_trigger import (
     RefinementTriggered,
@@ -74,6 +80,8 @@ SUPPORTED_OPT_CONFIG_KEYS = {
     "BSPLINE_LOCAL_STEP_LIMIT_RATIO",
     "BSPLINE_EVAL_LAYOUT",
     "BSPLINE_SYMMETRY_COUPLING",
+    "BSPLINE_SURFACE_MODE",
+    "BSPLINE_DEFORMATION_DIRECTION",
     *THICKNESS_PROGRESSIVE_KEYS,
     "BSPLINE_NLEVELS",
     "BSPLINE_NFINAL",
@@ -239,6 +247,8 @@ def fixed_driver_options_from_config(config_values):
         "BSPLINE_PRINT_OPTIMIZER_TABLE": "print_optimizer_table",
         "BSPLINE_EVAL_LAYOUT": "eval_layout",
         "BSPLINE_SYMMETRY_COUPLING": "symmetry_coupling",
+        "BSPLINE_SURFACE_MODE": "surface_mode",
+        "BSPLINE_DEFORMATION_DIRECTION": "deformation_direction_mode",
         "BSPLINE_LE_SAFE_DIRECTION": "le_safe_direction",
         "BSPLINE_LE_SAFE_X0": "le_safe_x0",
         "BSPLINE_LE_SAFE_X1": "le_safe_x1",
@@ -273,6 +283,41 @@ def thickness_options_from_config(config_values):
             if key in options and options[key]:
                 options[key] = _resolve_from_cfg_dir(cfg, options[key])
     return options
+
+
+def resolve_thickness_domain_mode(surface_mode, value="AUTO"):
+    """Resolve AUTO and enforce a physically compatible thickness domain."""
+
+    try:
+        surface_mode = normalize_surface_mode(surface_mode)
+    except BSplineModeError as exc:
+        raise BSplineSU2DriverError(str(exc))
+    domain_mode = str(value or "AUTO").strip().upper()
+    allowed = ("AUTO", "FULL", "HALF_UPPER", "HALF_LOWER")
+    if domain_mode not in allowed:
+        raise BSplineSU2DriverError(
+            "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be AUTO, FULL, "
+            f"HALF_UPPER, or HALF_LOWER; got {domain_mode!r}"
+        )
+
+    natural = {
+        "BOTH": "FULL",
+        "UPPER": "HALF_UPPER",
+        "LOWER": "HALF_LOWER",
+    }[surface_mode]
+    if domain_mode == "AUTO":
+        return natural
+    if domain_mode == natural:
+        return domain_mode
+    if domain_mode == "FULL":
+        raise BSplineSU2DriverError(
+            "FULL thickness requires a complete upper/lower surface; "
+            f"use {natural} with BSPLINE_SURFACE_MODE={surface_mode}."
+        )
+    raise BSplineSU2DriverError(
+        f"{domain_mode} thickness is incompatible with "
+        f"BSPLINE_SURFACE_MODE={surface_mode}; use {natural}."
+    )
 
 
 def _explicit_cli_dests(parser, argv):
@@ -898,6 +943,8 @@ def build_eval_commands(
     mpi_prefix=None,
     python_executable=None,
     sensitivity_weighting="NODAL",
+    surface_mode="BOTH",
+    deformation_direction_mode=None,
     le_safe_direction=False,
     le_safe_x0=None,
     le_safe_x1=None,
@@ -909,6 +956,14 @@ def build_eval_commands(
     try:
         sensitivity_weighting = normalize_sensitivity_weighting(sensitivity_weighting)
     except BSplineDotError as exc:
+        raise BSplineSU2DriverError(str(exc))
+    try:
+        surface_mode = normalize_surface_mode(surface_mode)
+        direction_mode = normalize_deformation_direction_mode(
+            deformation_direction_mode,
+            le_safe_direction=le_safe_direction,
+        )
+    except BSplineModeError as exc:
         raise BSplineSU2DriverError(str(exc))
     base_mesh = str(base_mesh)
 
@@ -924,10 +979,14 @@ def build_eval_commands(
         paths.surface_positions.name,
         "--metadata",
         paths.metadata.name,
+        "--surface-mode",
+        surface_mode,
+        "--deformation-direction",
+        direction_mode,
     ]
     if marker:
         bspline_def.extend(["--marker", str(marker)])
-    if le_safe_direction:
+    if direction_mode == "LE_SAFE":
         bspline_def.append("--le-safe-direction")
         if le_safe_x0 is not None:
             bspline_def.extend(["--le-safe-x0", str(float(le_safe_x0))])
@@ -1377,9 +1436,9 @@ class BSplineThicknessConstraint:
         self._fallback_warned = False
         self._switch_warned = False
 
-        if self.domain_mode not in ("FULL", "HALF_UPPER"):
+        if self.domain_mode not in ("FULL", "HALF_UPPER", "HALF_LOWER"):
             raise BSplineSU2DriverError(
-                "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL or HALF_UPPER"
+                "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL, HALF_UPPER, or HALF_LOWER"
             )
         if self.basis_matrix.ndim != 2:
             raise BSplineSU2DriverError("thickness basis matrix must be two-dimensional")
@@ -1398,12 +1457,8 @@ class BSplineThicknessConstraint:
 
         self.x_base = np.asarray([float(row["x"]) for row in self.metadata], dtype=float)
         self.y_base = np.asarray([float(row["y"]) for row in self.metadata], dtype=float)
-        # The constraint reconstructs the *actually produced* deformed geometry,
-        # so it must displace along the same direction bspline_def used:
-        # deform_dir_x/deform_dir_y. These equal the raw normal when LE-safe
-        # direction is disabled (the default), so behaviour is unchanged there;
-        # with LE-safe enabled they carry the blended direction and keep the
-        # thickness value and its gradient consistent with the real mesh.
+        # Reconstruct the geometry with the effective NORMAL, LE_SAFE, or
+        # VERTICAL direction recorded by bspline_def.
         self.deform_dir_x = np.asarray(
             [float(row.get("deform_dir_x", row["normal_x"])) for row in self.metadata],
             dtype=float,
@@ -1480,12 +1535,18 @@ class BSplineThicknessConstraint:
                     )
                 y_values = [hit[0] for hit in hits]
                 values.append(max(y_values) - min(y_values))
+            elif self.domain_mode == "HALF_UPPER":
+                if not hits:
+                    raise BSplineSU2DriverError(
+                        f"Could not compute B-spline upper half-thickness at x={float(x_station):.12g}"
+                    )
+                values.append(max(hit[0] for hit in hits) - self.symmetry_y)
             else:
                 if not hits:
                     raise BSplineSU2DriverError(
-                        f"Could not compute B-spline half-thickness at x={float(x_station):.12g}"
+                        f"Could not compute B-spline lower half-thickness at x={float(x_station):.12g}"
                     )
-                values.append(max(hit[0] for hit in hits) - self.symmetry_y)
+                values.append(self.symmetry_y - min(hit[0] for hit in hits))
         return np.asarray(values, dtype=float)
 
     def values(self, coefficients):
@@ -1524,13 +1585,20 @@ class BSplineThicknessConstraint:
                     )
                     self._switch_warned = True
                 jac[i_x, :] = upper[1] - lower[1]
-            else:
+            elif self.domain_mode == "HALF_UPPER":
                 if not hits:
                     raise BSplineSU2DriverError(
-                        f"Could not compute B-spline half-thickness gradient at x={float(x_station):.12g}"
+                        f"Could not compute B-spline upper half-thickness gradient at x={float(x_station):.12g}"
                     )
                 upper = max(hits, key=lambda item: item[0])
                 jac[i_x, :] = upper[1]
+            else:
+                if not hits:
+                    raise BSplineSU2DriverError(
+                        f"Could not compute B-spline lower half-thickness gradient at x={float(x_station):.12g}"
+                    )
+                lower = min(hits, key=lambda item: item[0])
+                jac[i_x, :] = -lower[1]
         return jac
 
     def jacobian_fd_physical(self, coefficients):
@@ -1592,11 +1660,13 @@ class BSplineSU2Driver:
         eval_layout="DSN",
         objective_adjoint="drag",
         symmetry_coupling="NONE",
+        surface_mode="BOTH",
         sensitivity_weighting="NODAL",
         local_step_limit=False,
         local_step_limit_ratio=200.0,
         trigger_opts=None,
         progressive_label="PROGRESSIVE_BSPLINE",
+        deformation_direction_mode=None,
         le_safe_direction=False,
         le_safe_x0=None,
         le_safe_x1=None,
@@ -1612,22 +1682,37 @@ class BSplineSU2Driver:
         self.objective_column = objective_column
         self.eval_layout = _normalize_eval_layout(eval_layout)
         self.objective_adjoint = _normalize_objective_adjoint(objective_adjoint)
+        try:
+            self.surface_mode = normalize_surface_mode(surface_mode)
+        except BSplineModeError as exc:
+            raise BSplineSU2DriverError(str(exc))
         self.symmetry_coupling = str(symmetry_coupling or "NONE").strip().upper()
         if self.symmetry_coupling not in ALLOWED_SYMMETRY_COUPLINGS:
             raise BSplineSU2DriverError(
                 f"BSPLINE_SYMMETRY_COUPLING must be one of {ALLOWED_SYMMETRY_COUPLINGS}; got {self.symmetry_coupling!r}"
             )
+        if self.surface_mode != "BOTH" and self.symmetry_coupling != "NONE":
+            raise BSplineSU2DriverError(
+                "BSPLINE_SYMMETRY_COUPLING is only valid with BSPLINE_SURFACE_MODE=BOTH"
+            )
         try:
-            self.le_safe_direction_options = validate_le_safe_direction_options(
+            self.deformation_direction_mode = normalize_deformation_direction_mode(
+                deformation_direction_mode,
                 le_safe_direction=le_safe_direction,
+            )
+            self.le_safe_direction_options = validate_le_safe_direction_options(
+                le_safe_direction=self.deformation_direction_mode == "LE_SAFE",
                 le_safe_x0=le_safe_x0
-                if le_safe_x0 is not None
+                if self.deformation_direction_mode == "LE_SAFE"
+                and le_safe_x0 is not None
                 else LE_SAFE_DEFAULT_X0,
                 le_safe_x1=le_safe_x1
-                if le_safe_x1 is not None
+                if self.deformation_direction_mode == "LE_SAFE"
+                and le_safe_x1 is not None
                 else LE_SAFE_DEFAULT_X1,
                 le_safe_power=le_safe_power
-                if le_safe_power is not None
+                if self.deformation_direction_mode == "LE_SAFE"
+                and le_safe_power is not None
                 else LE_SAFE_DEFAULT_POWER,
             )
         except BSplineModeError as exc:
@@ -1701,6 +1786,12 @@ class BSplineSU2Driver:
                 raise BSplineSU2DriverError(f"required file was not found: {filename}")
 
         self.mode_spec = load_mode_spec(str(self.modes_filename))
+        try:
+            validate_surface_mode_against_modes(self.mode_spec, self.surface_mode)
+        except BSplineModeError as exc:
+            raise BSplineSU2DriverError(str(exc))
+        if self.surface_mode != "BOTH" and "surface_mode" not in self.mode_spec:
+            self.mode_spec["surface_mode"] = self.surface_mode
         self.mode_ids = active_mode_ids(self.mode_spec)
         if not self.mode_ids:
             raise BSplineSU2DriverError("bspline_modes.json has no active modes")
@@ -1786,6 +1877,8 @@ class BSplineSU2Driver:
             mpi_prefix=self.mpi_prefix,
             python_executable=self.python_executable,
             sensitivity_weighting=self.sensitivity_weighting,
+            surface_mode=self.surface_mode,
+            deformation_direction_mode=self.deformation_direction_mode,
             le_safe_direction=self.le_safe_direction_options["le_safe_direction"],
             le_safe_x0=self.le_safe_direction_options["le_safe_x0"],
             le_safe_x1=self.le_safe_direction_options["le_safe_x1"],
@@ -2006,13 +2099,10 @@ class BSplineSU2Driver:
                 f"({marker!r} != {self.marker!r})"
             )
 
-        domain_mode = str(
-            options.get("PROGRESSIVE_THICKNESS_DOMAIN_MODE", "FULL")
-        ).upper()
-        if domain_mode not in ("FULL", "HALF_UPPER"):
-            raise BSplineSU2DriverError(
-                "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL or HALF_UPPER"
-            )
+        domain_mode = resolve_thickness_domain_mode(
+            self.surface_mode,
+            options.get("PROGRESSIVE_THICKNESS_DOMAIN_MODE", "AUTO"),
+        )
         symmetry_y = float(options.get("PROGRESSIVE_THICKNESS_SYMMETRY_Y", 0.0))
         margin = float(options.get("PROGRESSIVE_THICKNESS_MARGIN", 0.0))
         fd_eps = float(options.get("PROGRESSIVE_THICKNESS_FD_EPS", 1.0e-6))
@@ -2068,6 +2158,8 @@ class BSplineSU2Driver:
         print("[BSPLINE_SU2_DRIVER] Thickness constraint active")
         print(f"[BSPLINE_SU2_DRIVER] thickness marker = {marker}")
         print(f"[BSPLINE_SU2_DRIVER] thickness domain mode = {domain_mode}")
+        print(f"[PROGRESSIVE_BSPLINE][THICKNESS] domain = {domain_mode}")
+        print(f"[PROGRESSIVE_BSPLINE][THICKNESS] symmetry_y = {symmetry_y}")
         print(f"[BSPLINE_SU2_DRIVER] thickness gradient mode = {gradient_mode}")
         print(f"[BSPLINE_SU2_DRIVER] thickness stations = {len(x_stations)}")
         print(
@@ -2362,6 +2454,7 @@ class BSplineSU2Driver:
                 "adjoint_dir": str(paths.adjoint_dir),
                 "objective_adjoint": paths.objective_adjoint,
                 "symmetry_coupling": self.symmetry_coupling,
+                "surface_mode": self.surface_mode,
                 "sensitivity_weighting": self.sensitivity_weighting,
                 "n_active_modes": len(self.mode_ids),
                 "n_design_variables": len(self.reduced_variable_ids),
@@ -2531,6 +2624,8 @@ class BSplineSU2Driver:
                 mpi_prefix=self.mpi_prefix,
                 python_executable=self.python_executable,
                 sensitivity_weighting=self.sensitivity_weighting,
+                surface_mode=self.surface_mode,
+                deformation_direction_mode=self.deformation_direction_mode,
                 le_safe_direction=self.le_safe_direction_options["le_safe_direction"],
                 le_safe_x0=self.le_safe_direction_options["le_safe_x0"],
                 le_safe_x1=self.le_safe_direction_options["le_safe_x1"],
@@ -2651,6 +2746,16 @@ class BSplineSU2Driver:
         print(f"Number of active modes: {len(self.mode_ids)}")
         print(f"Number of design variables: {len(self.reduced_variable_ids)}")
         print(f"Symmetry coupling: {self.symmetry_coupling}")
+        print(f"[PROGRESSIVE_BSPLINE][SURFACE] mode = {self.surface_mode}")
+        print(
+            "[PROGRESSIVE_BSPLINE][SURFACE] active sides = "
+            f"{active_sides_from_surface_mode(self.surface_mode)}"
+        )
+        print(f"[PROGRESSIVE_BSPLINE][SURFACE] ndv = {len(self.reduced_variable_ids)}")
+        print(
+            "[PROGRESSIVE_BSPLINE][SURFACE] deformation direction = "
+            f"{self.deformation_direction_mode}"
+        )
         print(f"Eval layout: {self.eval_layout}")
         print(f"Sensitivity weighting: {self.sensitivity_weighting}")
         print(
@@ -2987,11 +3092,13 @@ def run_bspline_su2_optimization(
     eval_layout="DSN",
     objective_adjoint="drag",
     symmetry_coupling="NONE",
+    surface_mode="BOTH",
     sensitivity_weighting="NODAL",
     local_step_limit=False,
     local_step_limit_ratio=200.0,
     trigger_opts=None,
     progressive_label="PROGRESSIVE_BSPLINE",
+    deformation_direction_mode=None,
     le_safe_direction=False,
     le_safe_x0=None,
     le_safe_x1=None,
@@ -3028,11 +3135,13 @@ def run_bspline_su2_optimization(
         eval_layout=eval_layout,
         objective_adjoint=objective_adjoint,
         symmetry_coupling=symmetry_coupling,
+        surface_mode=surface_mode,
         sensitivity_weighting=sensitivity_weighting,
         local_step_limit=local_step_limit,
         local_step_limit_ratio=local_step_limit_ratio,
         trigger_opts=trigger_opts,
         progressive_label=progressive_label,
+        deformation_direction_mode=deformation_direction_mode,
         le_safe_direction=le_safe_direction,
         le_safe_x0=le_safe_x0,
         le_safe_x1=le_safe_x1,
@@ -3188,11 +3297,33 @@ def _build_arg_parser():
         help="Optional upper/lower B-spline coefficient coupling",
     )
     parser.add_argument(
+        "--surface-mode",
+        default="BOTH",
+        choices=ALLOWED_SURFACE_MODES,
+        help="Optimize both airfoil surfaces or one half-domain surface",
+    )
+    parser.add_argument(
         "--sensitivity-weighting",
         default="NODAL",
         choices=("NODAL", "DENSITY"),
         help="Treat SU2 surface sensitivities as nodal values or densities requiring arc-length weights",
     )
+    parser.add_argument(
+        "--deformation-direction",
+        dest="deformation_direction_mode",
+        default=None,
+        choices=ALLOWED_DEFORMATION_DIRECTION_MODES,
+        help="Direction used to apply the scalar B-spline deformation",
+    )
+    parser.add_argument(
+        "--le-safe-direction",
+        action="store_true",
+        default=False,
+        help="Legacy alias selecting LE_SAFE when --deformation-direction is omitted",
+    )
+    parser.add_argument("--le-safe-x0", type=float, default=LE_SAFE_DEFAULT_X0)
+    parser.add_argument("--le-safe-x1", type=float, default=LE_SAFE_DEFAULT_X1)
+    parser.add_argument("--le-safe-power", type=float, default=LE_SAFE_DEFAULT_POWER)
     parser.add_argument(
         "--local-step-limit",
         action="store_true",
@@ -3251,7 +3382,13 @@ def main(argv=None):
             eval_layout=args.eval_layout,
             objective_adjoint=getattr(args, "objective_adjoint", "drag"),
             symmetry_coupling=args.symmetry_coupling,
+            surface_mode=args.surface_mode,
             sensitivity_weighting=args.sensitivity_weighting,
+            deformation_direction_mode=args.deformation_direction_mode,
+            le_safe_direction=args.le_safe_direction,
+            le_safe_x0=args.le_safe_x0,
+            le_safe_x1=args.le_safe_x1,
+            le_safe_power=args.le_safe_power,
             local_step_limit=args.local_step_limit,
             local_step_limit_ratio=args.local_step_limit_ratio,
         )

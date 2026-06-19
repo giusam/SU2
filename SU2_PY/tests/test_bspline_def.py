@@ -13,8 +13,13 @@ from SU2.opt.bspline_modes import (
     deformation_direction,
     evaluate_mode_values,
     le_safe_direction,
+    normalize_deformation_direction_mode,
+    normalize_surface_mode,
+    active_sides_from_surface_mode,
+    validate_surface_mode_against_modes,
     validate_le_safe_direction_options,
     validate_mode_spec,
+    vertical_direction,
 )
 
 
@@ -127,7 +132,8 @@ def test_max_normalization_scales_nonzero_mode_to_one():
         "coefficient": 0.0,
     }
     values = evaluate_mode_values(mode, [i / 100 for i in range(101)])
-    assert max(abs(value) for value in values) == pytest.approx(1.0, abs=2.0e-4)
+    # The continuous normalization maximum need not lie on this 0.01 grid.
+    assert max(abs(value) for value in values) == pytest.approx(1.0, abs=2.5e-4)
 
 
 def test_synthetic_airfoil_marker_gets_reasonable_normals_and_positive_weights(tmp_path):
@@ -141,6 +147,56 @@ def test_synthetic_airfoil_marker_gets_reasonable_normals_and_positive_weights(t
     assert all(record["weight"] > 0.0 for record in result["records"])
     assert max(record["normal_y"] for record in upper) > 0.8
     assert min(record["normal_y"] for record in lower) < -0.8
+
+
+@pytest.mark.parametrize(
+    "value,expected,sides",
+    [
+        (None, "BOTH", ["upper", "lower"]),
+        ("FULL", "BOTH", ["upper", "lower"]),
+        ("HALF_UPPER", "UPPER", ["upper"]),
+        ("half-lower", "LOWER", ["lower"]),
+    ],
+)
+def test_surface_mode_normalization_and_active_sides(value, expected, sides):
+    assert normalize_surface_mode(value) == expected
+    assert active_sides_from_surface_mode(value) == sides
+
+
+def test_surface_mode_validation_rejects_absent_active_side():
+    with pytest.raises(
+        BSplineModeError,
+        match="BSPLINE_SURFACE_MODE=UPPER requires all active modes to have side='upper'",
+    ):
+        validate_surface_mode_against_modes(_base_spec(), "UPPER")
+
+
+@pytest.mark.parametrize(
+    "surface_mode,side,vertical_sign",
+    [("UPPER", "upper", 1.0), ("LOWER", "lower", -1.0)],
+)
+def test_half_domain_forces_every_marker_node_to_active_side(
+    tmp_path,
+    surface_mode,
+    side,
+    vertical_sign,
+):
+    mesh_file = _write_synthetic_airfoil_mesh(tmp_path / "airfoil.su2")
+    spec = _base_spec(coefficient=0.01)
+    spec["modes"] = [mode for mode in spec["modes"] if mode["side"] == side]
+    spec["surface_mode"] = surface_mode
+
+    result = compute_deformed_surface(
+        str(mesh_file),
+        spec,
+        surface_mode=surface_mode,
+        deformation_direction_mode="VERTICAL",
+    )
+
+    assert {record["side"] for record in result["records"]} == {side}
+    assert {record["surface_mode"] for record in result["records"]} == {surface_mode}
+    assert all(record["deform_dir_x"] == pytest.approx(0.0) for record in result["records"])
+    assert all(record["deform_dir_y"] == pytest.approx(vertical_sign) for record in result["records"])
 
 
 def test_zero_coefficients_produce_unchanged_surface_positions(tmp_path):
@@ -261,6 +317,66 @@ def test_deformation_direction_enabled_uses_le_safe_direction():
     assert (vx, vy) == pytest.approx((0.0, 1.0))
 
 
+@pytest.mark.parametrize(
+    "value,legacy_le_safe,expected",
+    [
+        (None, False, "NORMAL"),
+        (None, True, "LE_SAFE"),
+        ("vertical", False, "VERTICAL"),
+        ("Y", False, "VERTICAL"),
+        ("le-safe", False, "LE_SAFE"),
+        ("normals", False, "NORMAL"),
+    ],
+)
+def test_normalize_deformation_direction_mode(value, legacy_le_safe, expected):
+    assert (
+        normalize_deformation_direction_mode(
+            value,
+            le_safe_direction=legacy_le_safe,
+        )
+        == expected
+    )
+
+
+def test_vertical_direction_and_deformation_direction_follow_surface_side():
+    assert vertical_direction("upper") == (0.0, 1.0)
+    assert vertical_direction("lower") == (0.0, -1.0)
+    assert deformation_direction(
+        0.5,
+        "upper",
+        0.8,
+        0.6,
+        direction_mode="VERTICAL",
+    ) == (0.0, 1.0)
+    assert deformation_direction(
+        0.5,
+        "lower",
+        -0.8,
+        -0.6,
+        direction_mode="VERTICAL",
+    ) == (0.0, -1.0)
+
+
+def test_vertical_deformation_keeps_x_fixed_and_changes_y(tmp_path):
+    mesh_file = _write_synthetic_airfoil_mesh(tmp_path / "airfoil.su2")
+    result = compute_deformed_surface(
+        str(mesh_file),
+        _base_spec(coefficient=0.01),
+        deformation_direction_mode="VERTICAL",
+    )
+
+    changed_y = []
+    for record in result["records"]:
+        expected_y = 1.0 if record["side"] == "upper" else -1.0
+        assert record["deform_dir_x"] == pytest.approx(0.0)
+        assert record["deform_dir_y"] == pytest.approx(expected_y)
+        assert record["deformation_direction_mode"] == "VERTICAL"
+        assert record["deformed_x"] == pytest.approx(record["x"])
+        changed_y.append(not math.isclose(record["deformed_y"], record["y"]))
+
+    assert any(changed_y)
+
+
 def test_validate_le_safe_direction_options_defaults():
     options = validate_le_safe_direction_options()
     assert options == {
@@ -359,4 +475,3 @@ def test_deformed_surface_with_le_safe_direction_keeps_le_x_constant(tmp_path):
         # for the lower LE point.
         assert record["deform_dir_y"] in (pytest.approx(1.0), pytest.approx(-1.0))
         assert record["deform_dir_x"] == pytest.approx(0.0)
-

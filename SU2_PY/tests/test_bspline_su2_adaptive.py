@@ -270,6 +270,51 @@ def test_boehm_transfer_is_normalization_and_class_shape_aware(tmp_path):
     ) <= 1.0e-12
 
 
+@pytest.mark.parametrize("surface_mode,side", [("UPPER", "upper"), ("LOWER", "lower")])
+def test_boehm_transfer_preserves_single_surface_without_creating_other_side(
+    tmp_path,
+    surface_mode,
+    side,
+):
+    modes_path = tmp_path / "modes.json"
+    spec = generate_initial_bspline_modes(
+        modes_path,
+        "AIRFOIL",
+        nper_side=4,
+        surface_mode=surface_mode,
+        class_shape="none",
+    )
+    for mode in spec["modes"]:
+        mode["coefficient"] = 0.001 * (int(mode["basis_index"]) + 1)
+    metadata = [
+        {"x_over_c": float(x_value), "side": side}
+        for x_value in np.linspace(0.0, 1.0, 41)
+    ]
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            symmetry_coupling="NONE",
+            surface_mode=surface_mode,
+            nfinal=5,
+        )
+    )
+    space = extract_clamped_knot_space(spec, settings)
+    coefficients_by_side, _diagnostics = transfer_shape_to_inserted_space(
+        space,
+        metadata,
+        [0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+        settings=settings,
+    )
+    transferred = regenerate_clamped_modes(
+        space,
+        [0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+        coefficients_by_side,
+    )
+
+    assert set(coefficients_by_side) == {side}
+    assert len(transferred["modes"]) == 5
+    assert {mode["side"] for mode in transferred["modes"]} == {side}
+
+
 def test_boehm_transfer_bounds_failure_does_not_clip(tmp_path):
     modes_path = tmp_path / "modes.json"
     spec = generate_initial_bspline_modes(
@@ -373,6 +418,36 @@ def test_le_safe_options_default_to_disabled():
     assert settings["le_safe_direction"] is False
     assert settings["le_safe_x0"] > 0.0
     assert settings["le_safe_x1"] > settings["le_safe_x0"]
+
+
+def test_vertical_direction_overrides_legacy_le_safe_flag():
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            deformation_direction_mode="VERTICAL",
+            le_safe_direction=True,
+        )
+    )
+    assert settings["deformation_direction_mode"] == "VERTICAL"
+    assert settings["le_safe_direction"] is False
+
+
+def test_normal_direction_overrides_legacy_le_safe_flag():
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            deformation_direction_mode="NORMAL",
+            le_safe_direction=True,
+        )
+    )
+    assert settings["deformation_direction_mode"] == "NORMAL"
+    assert settings["le_safe_direction"] is False
+
+
+def test_legacy_le_safe_flag_selects_le_safe_mode():
+    settings = validate_adaptive_options(
+        _minimal_settings(le_safe_direction=True)
+    )
+    assert settings["deformation_direction_mode"] == "LE_SAFE"
+    assert settings["le_safe_direction"] is True
 
 
 def test_le_safe_invalid_band_rejected():
@@ -677,6 +752,84 @@ def test_knot_insertion_growth_ratio_and_fixed_remain_supported(tmp_path):
     assert selected["reduced_ndv_after"] == selected["reduced_ndv_before"] + 1
 
 
+@pytest.mark.parametrize("surface_mode,side", [("UPPER", "upper"), ("LOWER", "lower")])
+def test_knot_insertion_refines_only_active_half_domain(
+    tmp_path,
+    surface_mode,
+    side,
+):
+    modes = tmp_path / "modes.json"
+    spec = generate_initial_bspline_modes(
+        modes,
+        "AIRFOIL",
+        nper_side=4,
+        surface_mode=surface_mode,
+        class_shape="none",
+    )
+    metadata = [
+        {"x_over_c": float(x_value), "side": side}
+        for x_value in np.linspace(0.05, 0.95, 19)
+    ]
+    signal = [math.sin(5.0 * math.pi * row["x_over_c"]) for row in metadata]
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            symmetry_coupling="NONE",
+            surface_mode=surface_mode,
+            nfinal=5,
+            nadd_mode="FIXED",
+            fixed_nadd=1,
+            knot_insertions_per_refine=1,
+            knot_score_mode="RESIDUAL_ENERGY",
+        )
+    )
+
+    next_modes, rows, selected = build_next_knot_inserted_modes(
+        spec,
+        metadata,
+        signal,
+        settings,
+    )
+
+    assert next_modes is not None
+    assert len(next_modes["modes"]) == 5
+    assert {mode["side"] for mode in next_modes["modes"]} == {side}
+    assert {row["side"] for row in rows} == {surface_mode}
+    assert selected["side"] == surface_mode
+    assert selected["ndv_before"] == 4
+    assert selected["ndv_after"] == 5
+
+
+@pytest.mark.parametrize("surface_mode,side", [("UPPER", "upper"), ("LOWER", "lower")])
+def test_generate_initial_modes_contains_only_requested_surface(
+    tmp_path,
+    surface_mode,
+    side,
+):
+    path = tmp_path / f"{side}.json"
+    spec = generate_initial_bspline_modes(
+        path,
+        "AIRFOIL",
+        nper_side=7,
+        surface_mode=surface_mode,
+    )
+
+    assert spec["surface_mode"] == surface_mode
+    assert len(spec["modes"]) == 7
+    assert {mode["side"] for mode in spec["modes"]} == {side}
+
+
+def test_default_initial_mode_generation_remains_both_surfaces(tmp_path):
+    spec = generate_initial_bspline_modes(
+        tmp_path / "both.json",
+        "AIRFOIL",
+        nper_side=7,
+    )
+
+    assert spec["surface_mode"] == "BOTH"
+    assert len(spec["modes"]) == 14
+    assert {mode["side"] for mode in spec["modes"]} == {"upper", "lower"}
+
+
 def _single_cfg_text(tmp_path, extra_lines=()):
     lines = [
         "MESH_FILENAME= mesh.su2",
@@ -712,6 +865,73 @@ def test_transfer_cfg_options_are_parsed(tmp_path):
     assert settings["transfer_bound_policy"] == "ERROR"
     assert settings["transfer_geometry_abs_tol"] == pytest.approx(2.0e-11)
     assert settings["transfer_geometry_rel_tol"] == pytest.approx(3.0e-9)
+
+
+def test_vertical_deformation_direction_is_read_from_cfg(tmp_path):
+    cfg = tmp_path / "case.cfg"
+    cfg.write_text(
+        _single_cfg_text(
+            tmp_path,
+            [
+                "BSPLINE_DEFORMATION_DIRECTION= VERTICAL",
+                "BSPLINE_LE_SAFE_DIRECTION= YES",
+            ],
+        )
+    )
+
+    settings = parse_adaptive_options(["-f", str(cfg)])
+
+    assert settings["deformation_direction_mode"] == "VERTICAL"
+    assert settings["le_safe_direction"] is False
+
+
+@pytest.mark.parametrize(
+    "surface_mode,expected_side,expected_domain",
+    [
+        ("UPPER", "upper", "HALF_UPPER"),
+        ("LOWER", "lower", "HALF_LOWER"),
+    ],
+)
+def test_surface_mode_cfg_generates_half_domain_and_resolves_thickness_auto(
+    tmp_path,
+    surface_mode,
+    expected_side,
+    expected_domain,
+):
+    cfg = tmp_path / "case.cfg"
+    cfg.write_text(
+        _single_cfg_text(
+            tmp_path,
+            [
+                f"BSPLINE_SURFACE_MODE= {surface_mode}",
+                "BSPLINE_SYMMETRY_COUPLING= NONE",
+                "PROGRESSIVE_THICKNESS_CONSTRAINT= YES",
+                "PROGRESSIVE_THICKNESS_REF_MESH= mesh.su2",
+            ],
+        )
+    )
+
+    settings = parse_adaptive_options(["-f", str(cfg)])
+    spec = json.loads(Path(settings["modes"]).read_text())
+
+    assert settings["surface_mode"] == surface_mode
+    assert settings["thickness_options"]["PROGRESSIVE_THICKNESS_DOMAIN_MODE"] == expected_domain
+    assert len(spec["modes"]) == 7
+    assert {mode["side"] for mode in spec["modes"]} == {expected_side}
+
+
+@pytest.mark.parametrize("surface_mode", ["UPPER", "LOWER"])
+def test_adaptive_half_domain_rejects_symmetry_coupling(surface_mode):
+    with pytest.raises(
+        BSplineAdaptiveError,
+        match="BSPLINE_SYMMETRY_COUPLING is only valid with BSPLINE_SURFACE_MODE=BOTH",
+    ):
+        validate_adaptive_options(
+            _minimal_settings(
+                surface_mode=surface_mode,
+                symmetry_coupling="NORMAL_EQUAL",
+            )
+        )
 
 
 def test_candidate_bank_is_not_required():

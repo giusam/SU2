@@ -581,6 +581,8 @@ def _choose_projection_mode(sensitivities, prefer_vector):
 def _metadata_values(metadata):
     x_over_c = []
     sides = []
+    normals_x = []
+    normals_y = []
     directions_x = []
     directions_y = []
     weights = []
@@ -596,6 +598,12 @@ def _metadata_values(metadata):
 
         x_over_c.append(_as_float(record.get("x_over_c"), f"metadata row {index} x_over_c"))
         sides.append(side)
+        normals_x.append(
+            _as_float(record.get("normal_x"), f"metadata row {index} normal_x")
+        )
+        normals_y.append(
+            _as_float(record.get("normal_y"), f"metadata row {index} normal_y")
+        )
         directions_x.append(
             _as_float(
                 record.get("deform_dir_x", record.get("normal_x")),
@@ -610,7 +618,15 @@ def _metadata_values(metadata):
         )
         weights.append(weight)
 
-    return x_over_c, sides, directions_x, directions_y, weights
+    return (
+        x_over_c,
+        sides,
+        normals_x,
+        normals_y,
+        directions_x,
+        directions_y,
+        weights,
+    )
 
 
 def project_bspline_gradients(
@@ -626,7 +642,15 @@ def project_bspline_gradients(
     sensitivity_weighting = normalize_sensitivity_weighting(sensitivity_weighting)
     aligned_sensitivities = match_sensitivities_to_metadata(metadata, sensitivities)
     projection_mode = _choose_projection_mode(aligned_sensitivities, prefer_vector)
-    x_over_c, sides, directions_x, directions_y, weights = _metadata_values(metadata)
+    (
+        x_over_c,
+        sides,
+        normals_x,
+        normals_y,
+        directions_x,
+        directions_y,
+        weights,
+    ) = _metadata_values(metadata)
     mode_values = evaluate_all_modes(spec, x_over_c, sides=sides)
 
     gradients = []
@@ -641,9 +665,11 @@ def project_bspline_gradients(
         raw_norm_square = 0.0
         weighted_phi_norm_square = 0.0
 
-        for phi, weight, dir_x, dir_y, sensitivity in zip(
+        for phi, weight, normal_x, normal_y, dir_x, dir_y, sensitivity in zip(
             phi_values,
             weights,
+            normals_x,
+            normals_y,
             directions_x,
             directions_y,
             aligned_sensitivities,
@@ -654,9 +680,12 @@ def project_bspline_gradients(
                     + _as_float(sensitivity.get("sensitivity_y"), "sensitivity_y") * dir_y
                 )
             else:
-                projected_sensitivity = _as_float(
+                normal_sensitivity = _as_float(
                     sensitivity.get("surface_sensitivity"),
                     "surface_sensitivity",
+                )
+                projected_sensitivity = normal_sensitivity * (
+                    normal_x * dir_x + normal_y * dir_y
                 )
             factor = weight if sensitivity_weighting == "DENSITY" else 1.0
             gradient += projected_sensitivity * phi * factor

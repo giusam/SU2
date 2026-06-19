@@ -21,16 +21,22 @@ from SU2.opt.bspline_dot import (
     read_sensitivity_file,
 )
 from SU2.opt.bspline_modes import (
+    ALLOWED_DEFORMATION_DIRECTION_MODES,
+    ALLOWED_SURFACE_MODES,
     BSplineModeError,
     LE_SAFE_DEFAULT_POWER,
     LE_SAFE_DEFAULT_X0,
     LE_SAFE_DEFAULT_X1,
+    active_sides_from_surface_mode,
     clamped_basis_count,
     evaluate_all_modes,
     load_mode_spec,
     mode_normalization_factor,
+    normalize_deformation_direction_mode,
+    normalize_surface_mode,
     validate_le_safe_direction_options,
     validate_mode_spec,
+    validate_surface_mode_against_modes,
 )
 from SU2.opt.bspline_su2_driver import (
     ALLOWED_EVAL_LAYOUTS,
@@ -42,6 +48,7 @@ from SU2.opt.bspline_su2_driver import (
     cache_key,
     fixed_driver_options_from_config,
     read_objective_from_history,
+    resolve_thickness_domain_mode,
     run_bspline_su2_optimization,
     write_mode_spec,
 )
@@ -92,6 +99,7 @@ GLOBAL_MODE_KEYS = (
     "class_shape",
     "normalize_basis",
     "normalization_mode",
+    "surface_mode",
 )
 KNOT_SCORE_FIELDNAMES = [
     "batch_step",
@@ -100,6 +108,7 @@ KNOT_SCORE_FIELDNAMES = [
     "span_right",
     "span_width",
     "inserted_knot",
+    "side",
     "score_mode",
     "score",
     "score_raw",
@@ -357,6 +366,8 @@ def extract_clamped_knot_space(mode_spec, settings=None):
     coupling = str(settings.get("symmetry_coupling", "NONE")).upper()
     try:
         spec = validate_mode_spec(mode_spec)
+        surface_mode = normalize_surface_mode(settings.get("surface_mode", "BOTH"))
+        validate_surface_mode_against_modes(spec, surface_mode)
     except BSplineModeError as exc:
         raise BSplineAdaptiveError(str(exc))
 
@@ -387,6 +398,12 @@ def extract_clamped_knot_space(mode_spec, settings=None):
     if coupling in ("NORMAL_EQUAL", "NORMAL_OPPOSITE") and set(by_side) != {"upper", "lower"}:
         raise BSplineAdaptiveError(
             f"{coupling} KNOT_INSERTION requires paired upper and lower clamped bases"
+        )
+    expected_sides = set(active_sides_from_surface_mode(surface_mode))
+    if surface_mode != "BOTH" and set(by_side) != expected_sides:
+        raise BSplineAdaptiveError(
+            f"BSPLINE_SURFACE_MODE={surface_mode} requires active side "
+            f"{surface_mode.lower()!r}"
         )
 
     groups = {}
@@ -720,6 +737,7 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
     old_modes, old_matrix = reduced_basis_matrix_for_space(space, space.spec, metadata)
     signal = np.asarray(signal, dtype=float)
     residual = signal - project_onto_basis(old_matrix, signal, regularization=regularization)
+    candidate_side = space.sides[0].upper() if len(space.sides) == 1 else "BOTH"
     rows = []
     for left, right, inserted in spans:
         new_knots = insert_knot_midpoint(space.knot_vector, (left, right, inserted))
@@ -762,6 +780,7 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
                 "span_right": float(right),
                 "span_width": float(right) - float(left),
                 "inserted_knot": float(inserted),
+                "side": candidate_side,
                 "score_mode": knot_score_mode,
                 "score": float(score),
                 "score_raw": float(score_raw),
@@ -1187,6 +1206,7 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
                 "span_left": float(selected["span_left"]),
                 "span_right": float(selected["span_right"]),
                 "inserted_knot": float(selected["inserted_knot"]),
+                "side": str(selected.get("side", "BOTH")).upper(),
                 "score": float(selected["score"]),
                 "score_raw": float(selected["score_raw"]),
                 "residual_energy": float(selected["residual_energy"]),
@@ -1200,8 +1220,9 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
         score_rows.extend(step_rows)
         print(
             "[PROGRESSIVE_BSPLINE] KNOT_INSERTION selected | "
-            "step={} span=[{:.6f},{:.6f}] knot={:.6f} score={:.6e}".format(
+            "step={} side={} span=[{:.6f},{:.6f}] knot={:.6f} score={:.6e}".format(
                 step,
+                str(selected.get("side", "BOTH")).upper(),
                 float(selected["span_left"]),
                 float(selected["span_right"]),
                 float(selected["inserted_knot"]),
@@ -1246,6 +1267,7 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
         "span_left": float(first["span_left"]),
         "span_right": float(first["span_right"]),
         "inserted_knot": float(first["inserted_knot"]),
+        "side": str(first.get("side", "BOTH")).upper(),
         "score": float(first["score"]),
         "score_raw": float(first["score_raw"]),
         "residual_energy": float(first["residual_energy"]),
@@ -2026,6 +2048,16 @@ def validate_adaptive_options(opts):
         raise BSplineAdaptiveError(
             f"unsupported symmetry coupling {opts['symmetry_coupling']!r}; allowed values are {ALLOWED_SYMMETRY_COUPLINGS}"
         )
+    try:
+        opts["surface_mode"] = normalize_surface_mode(
+            opts.get("surface_mode", "BOTH")
+        )
+    except BSplineModeError as exc:
+        raise BSplineAdaptiveError(str(exc))
+    if opts["surface_mode"] != "BOTH" and opts["symmetry_coupling"] != "NONE":
+        raise BSplineAdaptiveError(
+            "BSPLINE_SYMMETRY_COUPLING is only valid with BSPLINE_SURFACE_MODE=BOTH"
+        )
     opts["objective_adjoint"] = str(opts.get("objective_adjoint", "drag")).strip() or "drag"
 
     opts["auto_scale_bounds_to_geometry"] = bool(opts.get("auto_scale_bounds_to_geometry", False))
@@ -2115,20 +2147,48 @@ def validate_adaptive_options(opts):
     if opts["local_step_limit_ratio"] <= 0.0:
         raise BSplineAdaptiveError("--local-step-limit-ratio must be positive")
     opts["thickness_options"] = dict(opts.get("thickness_options") or {})
+    if _as_bool(
+        opts["thickness_options"].get("PROGRESSIVE_THICKNESS_CONSTRAINT", False),
+        default=False,
+    ):
+        try:
+            domain_mode = resolve_thickness_domain_mode(
+                opts["surface_mode"],
+                opts["thickness_options"].get(
+                    "PROGRESSIVE_THICKNESS_DOMAIN_MODE",
+                    "AUTO",
+                ),
+            )
+        except BSplineSU2DriverError as exc:
+            raise BSplineAdaptiveError(str(exc))
+        opts["thickness_options"]["PROGRESSIVE_THICKNESS_DOMAIN_MODE"] = domain_mode
 
-    # LE-safe deformation direction (fixed leading-edge safety).
-    # Disabled by default; when enabled, the deformation and adjoint projection
-    # use the same geometry-safe direction near the leading edge so local knot
-    # insertions do not push the surface upstream of x_LE.
     try:
-        le_safe_opts = validate_le_safe_direction_options(
+        direction_mode = normalize_deformation_direction_mode(
+            opts.get("deformation_direction_mode"),
             le_safe_direction=opts.get("le_safe_direction", False),
-            le_safe_x0=opts.get("le_safe_x0", LE_SAFE_DEFAULT_X0),
-            le_safe_x1=opts.get("le_safe_x1", LE_SAFE_DEFAULT_X1),
-            le_safe_power=opts.get("le_safe_power", LE_SAFE_DEFAULT_POWER),
+        )
+        le_safe_opts = validate_le_safe_direction_options(
+            le_safe_direction=direction_mode == "LE_SAFE",
+            le_safe_x0=(
+                opts.get("le_safe_x0", LE_SAFE_DEFAULT_X0)
+                if direction_mode == "LE_SAFE"
+                else LE_SAFE_DEFAULT_X0
+            ),
+            le_safe_x1=(
+                opts.get("le_safe_x1", LE_SAFE_DEFAULT_X1)
+                if direction_mode == "LE_SAFE"
+                else LE_SAFE_DEFAULT_X1
+            ),
+            le_safe_power=(
+                opts.get("le_safe_power", LE_SAFE_DEFAULT_POWER)
+                if direction_mode == "LE_SAFE"
+                else LE_SAFE_DEFAULT_POWER
+            ),
         )
     except BSplineModeError as exc:
         raise BSplineAdaptiveError(str(exc))
+    opts["deformation_direction_mode"] = direction_mode
     opts["le_safe_direction"] = le_safe_opts["le_safe_direction"]
     opts["le_safe_x0"] = le_safe_opts["le_safe_x0"]
     opts["le_safe_x1"] = le_safe_opts["le_safe_x1"]
@@ -2319,6 +2379,7 @@ def generate_initial_bspline_modes(
     class_shape="sqrt_x_one_minus_x",
     normalize_basis=True,
     normalization_mode="max",
+    surface_mode="BOTH",
 ):
     nper_side = int(nper_side)
     degree = int(degree)
@@ -2333,6 +2394,10 @@ def generate_initial_bspline_modes(
     marker = str(marker or "").strip()
     if not marker:
         raise BSplineAdaptiveError("BSPLINE_MARKER is required to generate initial B-spline modes")
+    try:
+        surface_mode = normalize_surface_mode(surface_mode)
+    except BSplineModeError as exc:
+        raise BSplineAdaptiveError(str(exc))
 
     n_internal = nper_side - degree - 1
     internal = [
@@ -2341,7 +2406,7 @@ def generate_initial_bspline_modes(
     ]
     knot_vector = [0.0] * (degree + 1) + internal + [1.0] * (degree + 1)
     modes = []
-    for side in ("upper", "lower"):
+    for side in active_sides_from_surface_mode(surface_mode):
         for basis_index in range(nper_side):
             modes.append(
                 {
@@ -2365,6 +2430,7 @@ def generate_initial_bspline_modes(
         "class_shape": str(class_shape),
         "normalize_basis": _as_bool(normalize_basis, default=True),
         "normalization_mode": str(normalization_mode),
+        "surface_mode": surface_mode,
         "modes": modes,
     }
     write_mode_spec(validate_mode_spec(spec), filename)
@@ -2528,6 +2594,12 @@ def prepare_bspline_launch_settings(settings):
             "Candidate/generated refinement has been removed."
         )
     settings["candidate_bank"] = None
+    try:
+        settings["surface_mode"] = normalize_surface_mode(
+            settings.get("surface_mode", "BOTH")
+        )
+    except BSplineModeError as exc:
+        raise BSplineAdaptiveError(str(exc))
 
     if settings.get("nproc") is not None and not settings.get("_mpi_cli_provided", False):
         settings["mpi"] = f"mpirun -n {int(settings['nproc'])}"
@@ -2559,6 +2631,7 @@ def prepare_bspline_launch_settings(settings):
                 ),
                 normalize_basis=settings.get("initial_normalize_basis", True),
                 normalization_mode=settings.get("initial_normalization_mode", "max"),
+                surface_mode=settings["surface_mode"],
             )
             settings["modes"] = str(modes_path.resolve())
             generated_initial = True
@@ -2603,6 +2676,36 @@ def print_startup_summary(settings):
     print("[PROGRESSIVE_BSPLINE] sensitivity weighting: NODAL")
     print("[PROGRESSIVE_BSPLINE] refinement: KNOT_INSERTION")
     print("[PROGRESSIVE_BSPLINE] refinement state: INITIAL_MESH_KEEP_DV")
+    print(
+        "[PROGRESSIVE_BSPLINE] deformation direction: "
+        f"{settings.get('deformation_direction_mode', 'NORMAL')}"
+    )
+    surface_mode = settings.get("surface_mode", "BOTH")
+    active_sides = active_sides_from_surface_mode(surface_mode)
+    try:
+        ndv = len(active_mode_ids(load_mode_spec(settings["modes"])))
+    except Exception:
+        ndv = ""
+    print(f"[PROGRESSIVE_BSPLINE][SURFACE] mode = {surface_mode}")
+    print(f"[PROGRESSIVE_BSPLINE][SURFACE] active sides = {active_sides}")
+    print(f"[PROGRESSIVE_BSPLINE][SURFACE] ndv = {ndv}")
+    print(
+        "[PROGRESSIVE_BSPLINE][SURFACE] deformation direction = "
+        f"{settings.get('deformation_direction_mode', 'NORMAL')}"
+    )
+    thickness_options = settings.get("thickness_options") or {}
+    if _as_bool(
+        thickness_options.get("PROGRESSIVE_THICKNESS_CONSTRAINT", False),
+        default=False,
+    ):
+        print(
+            "[PROGRESSIVE_BSPLINE][THICKNESS] domain = "
+            f"{thickness_options.get('PROGRESSIVE_THICKNESS_DOMAIN_MODE')}"
+        )
+        print(
+            "[PROGRESSIVE_BSPLINE][THICKNESS] symmetry_y = "
+            f"{float(thickness_options.get('PROGRESSIVE_THICKNESS_SYMMETRY_Y', 0.0))}"
+        )
     print(f"[PROGRESSIVE_BSPLINE] online trigger: {settings.get('trigger', 'MAX_ITER')}")
 
 
@@ -2643,6 +2746,12 @@ def _settings_from_args(args):
         "eval_layout": args.eval_layout,
         "objective_adjoint": args.objective_adjoint,
         "symmetry_coupling": args.symmetry_coupling,
+        "surface_mode": getattr(args, "surface_mode", "BOTH"),
+        "deformation_direction_mode": getattr(
+            args,
+            "deformation_direction_mode",
+            None,
+        ),
         "trigger": args.trigger,
         "window": args.window,
         "tol": args.tol,
@@ -2700,6 +2809,12 @@ def progressive_bspline_su2_shape_optimization(settings):
         fp.write("\n")
 
     initial_modes = load_mode_spec(settings["modes"])
+    try:
+        validate_surface_mode_against_modes(initial_modes, settings["surface_mode"])
+    except BSplineModeError as exc:
+        raise BSplineAdaptiveError(str(exc))
+    if settings["surface_mode"] != "BOTH" and "surface_mode" not in initial_modes:
+        initial_modes["surface_mode"] = settings["surface_mode"]
     current_modes = initial_modes
     adaptive_rows = []
 
@@ -2778,8 +2893,10 @@ def progressive_bspline_su2_shape_optimization(settings):
             eval_layout=settings.get("eval_layout", "DSN"),
             objective_adjoint=settings.get("objective_adjoint", "drag"),
             symmetry_coupling=settings.get("symmetry_coupling", "NONE"),
+            surface_mode=settings.get("surface_mode", "BOTH"),
             trigger_opts=trigger_opts,
             progressive_label="PROGRESSIVE_BSPLINE",
+            deformation_direction_mode=settings.get("deformation_direction_mode"),
             le_safe_direction=bool(settings.get("le_safe_direction", False)),
             le_safe_x0=settings.get("le_safe_x0", LE_SAFE_DEFAULT_X0),
             le_safe_x1=settings.get("le_safe_x1", LE_SAFE_DEFAULT_X1),
@@ -2880,6 +2997,15 @@ def progressive_bspline_su2_shape_optimization(settings):
                         float(knot_selected_data["span_right"]),
                         float(knot_selected_data["inserted_knot"]),
                         int(knot_selected_data["ndv_after"]) - int(knot_selected_data["ndv_before"]),
+                    )
+                )
+                print(
+                    "[PROGRESSIVE_BSPLINE] refinement | ndv_before={} ndv_after={} "
+                    "selected side={} x={:.6f}".format(
+                        int(knot_selected_data["ndv_before"]),
+                        int(knot_selected_data["ndv_after"]),
+                        str(knot_selected_data.get("side", "BOTH")).upper(),
+                        float(knot_selected_data["inserted_knot"]),
                     )
                 )
                 print(
@@ -2991,6 +3117,13 @@ def _build_arg_parser():
     parser.add_argument("--eval-layout", default="DSN", choices=ALLOWED_EVAL_LAYOUTS)
     parser.add_argument("--objective-adjoint", default="drag")
     parser.add_argument("--symmetry-coupling", default="NONE", choices=ALLOWED_SYMMETRY_COUPLINGS)
+    parser.add_argument("--surface-mode", default="BOTH", choices=ALLOWED_SURFACE_MODES)
+    parser.add_argument(
+        "--deformation-direction",
+        dest="deformation_direction_mode",
+        default=None,
+        choices=ALLOWED_DEFORMATION_DIRECTION_MODES,
+    )
     parser.add_argument("--trigger", default="MAX_ITER")
     parser.add_argument("--trigger-window", dest="window", type=int, default=1)
     parser.add_argument("--trigger-ratio", dest="tol", type=float, default=0.2)

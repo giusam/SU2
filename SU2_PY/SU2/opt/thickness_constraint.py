@@ -57,6 +57,53 @@ def _normalize_gradient_mode(value):
     return aliases[mode]
 
 
+def _resolve_domain_mode(value, surface_mode=None):
+    domain_mode = str(value or "AUTO").strip().upper()
+    allowed = ("AUTO", "FULL", "HALF_UPPER", "HALF_LOWER")
+    if domain_mode not in allowed:
+        raise ValueError(
+            "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be AUTO, FULL, "
+            f"HALF_UPPER, or HALF_LOWER; got {domain_mode!r}"
+        )
+
+    if surface_mode is None:
+        return "FULL" if domain_mode == "AUTO" else domain_mode
+
+    surface_aliases = {
+        "BOTH": "BOTH",
+        "FULL": "BOTH",
+        "UPPER": "UPPER",
+        "HALF_UPPER": "UPPER",
+        "LOWER": "LOWER",
+        "HALF_LOWER": "LOWER",
+    }
+    surface_key = str(surface_mode).strip().upper().replace("-", "_")
+    if surface_key not in surface_aliases:
+        raise ValueError(
+            "BSPLINE_SURFACE_MODE must be BOTH, UPPER, or LOWER; "
+            f"got {surface_mode!r}"
+        )
+    surface_mode = surface_aliases[surface_key]
+    natural = {
+        "BOTH": "FULL",
+        "UPPER": "HALF_UPPER",
+        "LOWER": "HALF_LOWER",
+    }[surface_mode]
+    if domain_mode == "AUTO":
+        return natural
+    if domain_mode == natural:
+        return domain_mode
+    if domain_mode == "FULL":
+        raise ValueError(
+            "FULL thickness requires a complete upper/lower surface; "
+            f"use {natural} with BSPLINE_SURFACE_MODE={surface_mode}."
+        )
+    raise ValueError(
+        f"{domain_mode} thickness is incompatible with "
+        f"BSPLINE_SURFACE_MODE={surface_mode}; use {natural}."
+    )
+
+
 def _resolve_from_cfg_dir(base_config, filename):
     if not filename:
         return filename
@@ -446,9 +493,16 @@ def _section_measure_from_segments(
                     f"from marker {marker_name!r} in {mesh_filename}"
                 )
             section_measure.append(max(y_hits) - symmetry_y)
+        elif domain_mode == "HALF_LOWER":
+            if len(y_hits) < 1:
+                raise ValueError(
+                    f"Could not compute lower half-thickness at x={x:.12g} "
+                    f"from marker {marker_name!r} in {mesh_filename}"
+                )
+            section_measure.append(symmetry_y - min(y_hits))
         else:
             raise ValueError(
-                "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL or HALF_UPPER, "
+                "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL, HALF_UPPER, or HALF_LOWER, "
                 f"got {domain_mode!r}"
             )
 
@@ -744,9 +798,11 @@ class ThicknessConstraint:
                     jac[i_x, k] = bump
                 elif self.domain_mode == "HALF_UPPER":
                     jac[i_x, k] = bump if side == "UPPER" else 0.0
+                elif self.domain_mode == "HALF_LOWER":
+                    jac[i_x, k] = bump if side == "LOWER" else 0.0
                 else:
                     raise ValueError(
-                        "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL or HALF_UPPER"
+                        "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL, HALF_UPPER, or HALF_LOWER"
                     )
             k += 1
 
@@ -838,9 +894,16 @@ class ThicknessConstraint:
                     )
                 upper = max(hits, key=lambda item: item[0])
                 jac[i_x, :] = upper[1]
+            elif self.domain_mode == "HALF_LOWER":
+                if not hits:
+                    raise ValueError(
+                        f"Could not compute FFD lower half-thickness gradient at x={x_station:.12g}"
+                    )
+                lower = min(hits, key=lambda item: item[0])
+                jac[i_x, :] = -lower[1]
             else:
                 raise ValueError(
-                    "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL or HALF_UPPER"
+                    "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL, HALF_UPPER, or HALF_LOWER"
                 )
 
         return jac
@@ -869,9 +932,13 @@ def build_thickness_constraint_from_config(base_config):
     gradient_mode = _normalize_gradient_mode(
         base_config.get("PROGRESSIVE_THICKNESS_GRADIENT", "AUTO")
     )
-    domain_mode = str(
-        base_config.get("PROGRESSIVE_THICKNESS_DOMAIN_MODE", "FULL")
-    ).upper()
+    default_domain = "AUTO" if "BSPLINE_SURFACE_MODE" in base_config else "FULL"
+    domain_mode = _resolve_domain_mode(
+        base_config.get("PROGRESSIVE_THICKNESS_DOMAIN_MODE", default_domain),
+        base_config.get("BSPLINE_SURFACE_MODE")
+        if "BSPLINE_SURFACE_MODE" in base_config
+        else None,
+    )
     symmetry_y = float(base_config.get("PROGRESSIVE_THICKNESS_SYMMETRY_Y", 0.0))
     cache_value = str(
         base_config.get(
@@ -880,12 +947,6 @@ def build_thickness_constraint_from_config(base_config):
         )
     )
     cache_file = _resolve_from_cfg_dir(base_config, cache_value)
-
-    if domain_mode not in ("FULL", "HALF_UPPER"):
-        raise ValueError(
-            "PROGRESSIVE_THICKNESS_DOMAIN_MODE must be FULL or HALF_UPPER, "
-            f"got {domain_mode!r}"
-        )
 
     explicit_x_stations = not _x_stations_value_is_empty(x_stations_value)
     if explicit_x_stations:
@@ -914,7 +975,7 @@ def build_thickness_constraint_from_config(base_config):
     print(f"[THICKNESS_CONSTRAINT] marker = {marker}")
     print(f"[THICKNESS_CONSTRAINT] domain mode = {domain_mode}")
     print(f"[THICKNESS_CONSTRAINT] gradient mode = {gradient_mode}")
-    if domain_mode == "HALF_UPPER":
+    if domain_mode in ("HALF_UPPER", "HALF_LOWER"):
         print(f"[THICKNESS_CONSTRAINT] symmetry y = {symmetry_y}")
     if explicit_x_stations:
         print("[THICKNESS_CONSTRAINT] x stations = explicit")

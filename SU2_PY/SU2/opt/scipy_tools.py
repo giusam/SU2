@@ -10,6 +10,7 @@ import sys
 
 from .. import eval as su2eval
 from numpy import array, concatenate, vstack, zeros
+from SU2.opt import progressive_trigger as _progressive_trigger
 from SU2.opt.progressive_hh_core import (
     expand_symmetric_dv,
     full_to_reduced_symmetric,
@@ -398,6 +399,17 @@ def _check_stagnation_trigger(project, obj_value, opts):
         raise RefinementTriggered()
 
 
+RefinementTriggered = _progressive_trigger.RefinementTriggered
+_init_trigger_state = _progressive_trigger._init_trigger_state
+_update_filtered_history = _progressive_trigger._update_filtered_history
+_compute_smoothed_history = _progressive_trigger._compute_smoothed_history
+_trigger_can_fire = _progressive_trigger._trigger_can_fire
+_log_trigger_warmup = _progressive_trigger._log_trigger_warmup
+_check_slope_trigger = _progressive_trigger._check_slope_trigger
+_check_slope_best_log_trigger = _progressive_trigger._check_slope_best_log_trigger
+_check_stagnation_trigger = _progressive_trigger._check_stagnation_trigger
+
+
 # -------------------------------------------------------------------
 #  Scipy SLSQP
 # -------------------------------------------------------------------
@@ -542,7 +554,8 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
         )
     except RefinementTriggered:
         sys.stdout.write(
-            "[PROGRESSIVE_HH] Optimization stopped early due to refinement trigger\n"
+            f"[{_progressive_trigger.trigger_prefix(project)}] "
+            "Optimization stopped early due to refinement trigger\n"
         )
         outputs = None
 
@@ -768,24 +781,7 @@ def obj_f(x, project):
     for this_obj in obj_list:
         obj = obj + this_obj
 
-    if not hasattr(project, "trigger_history"):
-        project.trigger_history = []
-
-    project.trigger_history.append(obj)
-
-    opts = getattr(project, "trigger_opts", None)
-
-    if opts:
-        trigger = str(opts.get("trigger", "")).upper()
-
-        if trigger in ("SLOPE_EFFICIENCY_TRIGGER", "SLOPE_EFFICIENCY_FILTERED"):
-            _check_slope_trigger(project, obj, opts)
-
-        elif trigger == "SLOPE_EFFICIENCY_BEST_LOG":
-            _check_slope_best_log_trigger(project, obj, opts)
-
-        elif trigger == "STAGNATION_TRIGGER":
-            _check_stagnation_trigger(project, obj, opts)
+    _progressive_trigger.record_objective_and_check(project, obj)
 
     return obj
 

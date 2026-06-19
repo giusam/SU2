@@ -11,6 +11,7 @@ sys.path.append(os.environ["SU2_RUN"])
 import SU2
 
 from SU2.opt.thickness_constraint import build_thickness_constraint_from_config
+from SU2.opt.progressive_trigger import build_online_trigger_opts
 from SU2.opt.progressive_hh import (
     get_progressive_hh_options,
     is_symmetric_reduced,
@@ -47,44 +48,22 @@ def _build_online_trigger_opts(hh_opts, ilevel, current_ndv=None):
     Build the trigger options passed to scipy_tools.py for online triggering.
     The last level is never refined online.
     """
-    if _is_final_progressive_hh_level(hh_opts, ilevel, current_ndv=current_ndv):
-        return None
-
-    trigger = hh_opts["trigger"]
-    warmup_iter = int(hh_opts.get("warmup_iter", 0))
-
-    if trigger == "MAX_ITER":
-        return None
-
-    if trigger in ("SLOPE_EFFICIENCY_TRIGGER", "SLOPE_EFFICIENCY_FILTERED"):
-        return {
-            "trigger": trigger,
-            "window": hh_opts["window"],
-            "tol": hh_opts["tol"],
-            "filter_tol": hh_opts["slope_filter_tol"],
-            "warmup_iter": warmup_iter,
-        }
-
-    if trigger == "SLOPE_EFFICIENCY_BEST_LOG":
-        return {
-            "trigger": "SLOPE_EFFICIENCY_BEST_LOG",
-            "window": hh_opts["window"],
-            "tol": hh_opts["tol"],
-            "warmup_iter": warmup_iter,
-            "eps": hh_opts.get("trigger_eps", 1.0e-300),
-            "patience": hh_opts.get("slope_patience", 1),
-        }
-
-    if trigger == "STAGNATION_TRIGGER":
-        return {
-            "trigger": trigger,
-            "stag_tol": hh_opts["stag_tol"],
-            "stag_band": hh_opts["stag_band"],
-            "stag_window": hh_opts["stag_window"],
-            "warmup_iter": warmup_iter,
-        }
-
-    return None
+    return build_online_trigger_opts(
+        hh_opts["trigger"],
+        current_level=ilevel,
+        current_ndv=current_ndv,
+        final_ndv=hh_opts.get("nfinal", None),
+        nlevels=hh_opts.get("nlevels", None),
+        window=hh_opts["window"],
+        tolerance=hh_opts["tol"],
+        filter_tolerance=hh_opts["slope_filter_tol"],
+        warmup=hh_opts.get("warmup_iter", 0),
+        eps=hh_opts.get("trigger_eps", 1.0e-300),
+        patience=hh_opts.get("slope_patience", 1),
+        stagnation_tolerance=hh_opts["stag_tol"],
+        stagnation_band=hh_opts["stag_band"],
+        stagnation_window=hh_opts["stag_window"],
+    )
 
 
 def main():
@@ -158,6 +137,7 @@ def run_single_level(
     trigger_opts=None,
     progressive_hh_opts=None,
     thickness_constraint=None,
+    progressive_label=None,
 ):
     config = SU2.io.Config(filename)
     if thickness_constraint is None:
@@ -221,6 +201,8 @@ def run_single_level(
             "mode": progressive_hh_opts.get("symmetry_mode", "NONE"),
             "sign": progressive_hh_opts.get("symmetry_sign", -1.0),
         }
+    if progressive_label is not None:
+        project.progressive_label = str(progressive_label)
 
     project.refinement_triggered = False
 
@@ -347,6 +329,7 @@ def progressive_hh_shape_optimization(
                 trigger_opts=trigger_opts,
                 progressive_hh_opts=hh_opts,
                 thickness_constraint=thickness_constraint,
+                progressive_label="PROGRESSIVE_HH",
             )
         finally:
             os.chdir(cwd)
@@ -499,6 +482,7 @@ def progressive_ffd_shape_optimization(
                 trigger_opts=trigger_opts,
                 progressive_hh_opts=None,
                 thickness_constraint=thickness_constraint,
+                progressive_label="PROGRESSIVE_FFD",
             )
         finally:
             os.chdir(cwd)

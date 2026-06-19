@@ -34,6 +34,12 @@ install_data(['SU2/io/config.py',
 	      install_dir: join_paths(get_option('bindir'), 'SU2/io'))
 
 install_data(['SU2/opt/project.py',
+              'SU2/opt/bspline_def.py',
+              'SU2/opt/bspline_dot.py',
+              'SU2/opt/bspline_fd_check.py',
+              'SU2/opt/bspline_su2_adaptive.py',
+              'SU2/opt/bspline_su2_driver.py',
+              'SU2/opt/bspline_modes.py',
               'SU2/opt/scipy_tools.py',
               'SU2/opt/__init__.py'],
 	      install_dir: join_paths(get_option('bindir'), 'SU2/opt'))

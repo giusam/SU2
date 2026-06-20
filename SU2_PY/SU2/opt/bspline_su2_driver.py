@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
 from pathlib import Path
@@ -60,6 +61,65 @@ class BSplineSU2DriverError(RuntimeError):
     pass
 
 
+class GradientGuardStop(RuntimeError):
+    def __init__(self, last_safe_entry, bad_entry, guard_info=None):
+        self.last_safe_entry = last_safe_entry
+        self.bad_entry = bad_entry
+        self.guard_info = guard_info or {}
+        super().__init__("Raw-gradient guard stop: rollback to last safe evaluation")
+
+
+def gradient_guard_triggered(
+    entry,
+    recent_safe_raw_gnorms,
+    *,
+    factor=100.0,
+    window=5,
+    min_history=3,
+    floor=1.0e-14,
+):
+    """Detect a pathological pre-beta, pre-optimizer-scaled gradient."""
+
+    gnorm_raw = float(entry["gnorm_raw"])
+    if not np.isfinite(gnorm_raw):
+        return True, {
+            "reason": "nonfinite_raw_gradient",
+            "gnorm_raw": gnorm_raw,
+            "reference": None,
+            "ratio": np.inf,
+        }
+
+    good = [
+        float(value)
+        for value in recent_safe_raw_gnorms
+        if np.isfinite(value) and float(value) > 0.0
+    ]
+    if len(good) < int(min_history):
+        return False, {
+            "reason": "insufficient_history",
+            "gnorm_raw": gnorm_raw,
+            "reference": None,
+            "ratio": None,
+        }
+
+    window = max(1, int(window))
+    reference = max(float(np.median(good[-window:])), float(floor))
+    ratio = gnorm_raw / reference
+    if ratio > float(factor):
+        return True, {
+            "reason": "raw_gradient_explosion",
+            "gnorm_raw": gnorm_raw,
+            "reference": reference,
+            "ratio": ratio,
+        }
+    return False, {
+        "reason": "ok",
+        "gnorm_raw": gnorm_raw,
+        "reference": reference,
+        "ratio": ratio,
+    }
+
+
 DEFAULT_BOUNDS = (-0.01, 0.01)
 ALLOWED_EVAL_LAYOUTS = ("DSN",)
 ALLOWED_SYMMETRY_COUPLINGS = ("NONE", "NORMAL_EQUAL", "NORMAL_OPPOSITE")
@@ -82,6 +142,12 @@ SUPPORTED_OPT_CONFIG_KEYS = {
     "BSPLINE_SYMMETRY_COUPLING",
     "BSPLINE_SURFACE_MODE",
     "BSPLINE_DEFORMATION_DIRECTION",
+    "BSPLINE_GRADIENT_GUARD",
+    "BSPLINE_GRADIENT_GUARD_FACTOR",
+    "BSPLINE_GRADIENT_GUARD_WINDOW",
+    "BSPLINE_GRADIENT_GUARD_MIN_HISTORY",
+    "BSPLINE_GRADIENT_GUARD_FLOOR",
+    "BSPLINE_GRADIENT_GUARD_RESTART_LIMIT",
     *THICKNESS_PROGRESSIVE_KEYS,
     "BSPLINE_NLEVELS",
     "BSPLINE_NFINAL",
@@ -249,6 +315,12 @@ def fixed_driver_options_from_config(config_values):
         "BSPLINE_SYMMETRY_COUPLING": "symmetry_coupling",
         "BSPLINE_SURFACE_MODE": "surface_mode",
         "BSPLINE_DEFORMATION_DIRECTION": "deformation_direction_mode",
+        "BSPLINE_GRADIENT_GUARD": "gradient_guard",
+        "BSPLINE_GRADIENT_GUARD_FACTOR": "gradient_guard_factor",
+        "BSPLINE_GRADIENT_GUARD_WINDOW": "gradient_guard_window",
+        "BSPLINE_GRADIENT_GUARD_MIN_HISTORY": "gradient_guard_min_history",
+        "BSPLINE_GRADIENT_GUARD_FLOOR": "gradient_guard_floor",
+        "BSPLINE_GRADIENT_GUARD_RESTART_LIMIT": "gradient_guard_restart_limit",
         "BSPLINE_LE_SAFE_DIRECTION": "le_safe_direction",
         "BSPLINE_LE_SAFE_X0": "le_safe_x0",
         "BSPLINE_LE_SAFE_X1": "le_safe_x1",
@@ -1209,7 +1281,7 @@ def read_objective_from_history(history_filename, objective_column):
     return _as_float(value, f"{history_filename} {objective_column}")
 
 
-def read_bspline_gradients(gradients_filename):
+def read_bspline_gradients(gradients_filename, allow_nonfinite=False):
     with open(gradients_filename, "r", newline="") as fp:
         reader = csv.DictReader(fp)
         if not reader.fieldnames:
@@ -1228,10 +1300,19 @@ def read_bspline_gradients(gradients_filename):
                 raise BSplineSU2DriverError(
                     f"{gradients_filename} has duplicate mode_id {mode_id!r}"
                 )
-            gradients[mode_id] = _as_float(
-                row.get(gradient_field, ""),
-                f"{gradients_filename}:{row_number} gradient",
-            )
+            value = row.get(gradient_field, "")
+            if allow_nonfinite:
+                try:
+                    gradients[mode_id] = float(value)
+                except Exception:
+                    raise BSplineSU2DriverError(
+                        f"{gradients_filename}:{row_number} gradient must be numeric"
+                    )
+            else:
+                gradients[mode_id] = _as_float(
+                    value,
+                    f"{gradients_filename}:{row_number} gradient",
+                )
     return gradients
 
 
@@ -1248,8 +1329,11 @@ def _find_field(fieldnames, requested_field):
     )
 
 
-def read_gradient_vector(gradients_filename, mode_ids):
-    gradients = read_bspline_gradients(gradients_filename)
+def read_gradient_vector(gradients_filename, mode_ids, allow_nonfinite=False):
+    gradients = read_bspline_gradients(
+        gradients_filename,
+        allow_nonfinite=allow_nonfinite,
+    )
     missing = [mode_id for mode_id in mode_ids if mode_id not in gradients]
     if missing:
         raise BSplineSU2DriverError(
@@ -1655,6 +1739,12 @@ class BSplineSU2Driver:
         opt_bound_lower=None,
         opt_relax_factor=1.0,
         opt_gradient_factor=1.0,
+        gradient_guard=True,
+        gradient_guard_factor=100.0,
+        gradient_guard_window=5,
+        gradient_guard_min_history=3,
+        gradient_guard_floor=1.0e-14,
+        gradient_guard_next_action="restart_same_level",
         opt_line_search_bound=None,
         thickness_options=None,
         eval_layout="DSN",
@@ -1751,6 +1841,40 @@ class BSplineSU2Driver:
         )
         if self.opt_gradient_factor <= 0.0:
             raise BSplineSU2DriverError("OPT_GRADIENT_FACTOR must be positive")
+        self.gradient_guard_enabled = _thickness_as_bool(
+            gradient_guard,
+            default=True,
+        )
+        self.gradient_guard_factor = _as_float(
+            gradient_guard_factor,
+            "BSPLINE_GRADIENT_GUARD_FACTOR",
+        )
+        self.gradient_guard_window = int(gradient_guard_window)
+        self.gradient_guard_min_history = int(gradient_guard_min_history)
+        self.gradient_guard_floor = _as_float(
+            gradient_guard_floor,
+            "BSPLINE_GRADIENT_GUARD_FLOOR",
+        )
+        self.gradient_guard_next_action = str(
+            gradient_guard_next_action or "restart_same_level"
+        ).strip().lower()
+        if self.gradient_guard_factor <= 0.0:
+            raise BSplineSU2DriverError("BSPLINE_GRADIENT_GUARD_FACTOR must be positive")
+        if self.gradient_guard_window < 1:
+            raise BSplineSU2DriverError("BSPLINE_GRADIENT_GUARD_WINDOW must be >= 1")
+        if self.gradient_guard_min_history < 1:
+            raise BSplineSU2DriverError("BSPLINE_GRADIENT_GUARD_MIN_HISTORY must be >= 1")
+        if self.gradient_guard_floor <= 0.0:
+            raise BSplineSU2DriverError("BSPLINE_GRADIENT_GUARD_FLOOR must be positive")
+        if self.gradient_guard_next_action not in (
+            "refine",
+            "restart_same_level",
+            "terminate_last_safe",
+        ):
+            raise BSplineSU2DriverError(
+                "gradient guard next action must be refine, restart_same_level, "
+                "or terminate_last_safe"
+            )
         self.opt_line_search_bound = (
             None
             if opt_line_search_bound is None
@@ -1841,6 +1965,10 @@ class BSplineSU2Driver:
         self._local_step_anchor_reduced = list(self.initial_reduced_coefficients)
         self._cache = {}
         self._history_records = []
+        self.last_safe_entry = None
+        self.best_physical_entry = None
+        self.recent_safe_raw_gnorms = deque(maxlen=self.gradient_guard_window)
+        self.last_gradient_guard_stop = None
         self._slsqp_major_iter = 0
         self._run_eval_count = 0
         self._printed_commands_log_path = False
@@ -2332,15 +2460,133 @@ class BSplineSU2Driver:
         self._line_search_anchor_physical = list(physical_eval)
         self._local_step_anchor_reduced = self.compress_full_physical(physical_eval)
 
+    def _optimizer_gradient_for_logging(self, raw_gradient, line_search_info=None):
+        info = line_search_info or {}
+        beta = float(info.get("line_search_beta", 1.0))
+        values = [float(value) for value in raw_gradient]
+        reduced = []
+        for variable in self.reduced_variables:
+            reduced.append(
+                sum(
+                    float(sign) * values[int(index)]
+                    for index, sign in zip(variable.mode_indices, variable.signs)
+                )
+            )
+        return np.asarray(reduced, dtype=float) * (
+            self.opt_relax_factor * self.opt_gradient_factor * beta
+        )
+
+    def _gradient_entry(self, result, paths, line_search_info=None):
+        info = {
+            **self._line_search_default_info(),
+            **(line_search_info or {}),
+        }
+        raw_gradient = np.asarray(result.get("gradient") or [], dtype=float)
+        optimizer_gradient = self._optimizer_gradient_for_logging(
+            raw_gradient,
+            info,
+        )
+        evaluated = [float(value) for value in result.get("coefficients", [])]
+        requested = [
+            float(value)
+            for value in info.get("requested_x", evaluated)
+        ]
+        beta_eff = float(info.get("line_search_beta", 1.0))
+        return {
+            "eval_id": int(result.get("eval_id", -1)),
+            "objective": float(result["objective"]),
+            "requested_x": requested,
+            "evaluated_x": evaluated,
+            "beta_eff": beta_eff,
+            "was_clipped": bool(
+                int(info.get("line_search_limited", 0)) or beta_eff < 1.0
+            ),
+            "gnorm_raw": float(np.linalg.norm(raw_gradient)),
+            "gnorm_opt": float(np.linalg.norm(optimizer_gradient)),
+            "eval_dir": Path(paths.eval_dir),
+            "modes_file": Path(paths.modes_current),
+        }
+
+    def restore_modes_from_entry(self, entry):
+        self.optimized_modes_filename.parent.mkdir(parents=True, exist_ok=True)
+        source = None if entry is None else entry.get("modes_file")
+        if source is not None and Path(source).exists():
+            source = Path(source)
+            if source.resolve() != self.optimized_modes_filename.resolve():
+                shutil.copy2(source, self.optimized_modes_filename)
+        else:
+            self.write_optimized_modes(self.initial_coefficients)
+        return self.optimized_modes_filename
+
+    def _log_gradient_guard_stop(self, bad_entry, guard_info):
+        safe_eval = (
+            None
+            if self.last_safe_entry is None
+            else self.last_safe_entry.get("eval_id")
+        )
+        print("GRADIENT_GUARD_STOP")
+        print(f"  reason          = {guard_info.get('reason')}")
+        print(f"  bad_eval        = {bad_entry.get('eval_id')}")
+        print(f"  restore_eval    = {safe_eval}")
+        print(f"  gnorm_raw_bad   = {bad_entry.get('gnorm_raw')}")
+        print(f"  gnorm_raw_ref   = {guard_info.get('reference')}")
+        print(f"  raw_ratio       = {guard_info.get('ratio')}")
+        print(f"  gnorm_opt_bad   = {bad_entry.get('gnorm_opt')}")
+        print(f"  beta_eff_bad    = {bad_entry.get('beta_eff')}")
+        print("  action          = rollback_to_last_safe")
+        print(f"  next_action     = {self.gradient_guard_next_action}")
+
+    def register_gradient_entry(self, entry):
+        triggered = False
+        guard_info = {
+            "reason": "disabled",
+            "gnorm_raw": float(entry["gnorm_raw"]),
+            "reference": None,
+            "ratio": None,
+        }
+        if self.gradient_guard_enabled:
+            triggered, guard_info = gradient_guard_triggered(
+                entry,
+                self.recent_safe_raw_gnorms,
+                factor=self.gradient_guard_factor,
+                window=self.gradient_guard_window,
+                min_history=self.gradient_guard_min_history,
+                floor=self.gradient_guard_floor,
+            )
+        if triggered:
+            self.restore_modes_from_entry(self.last_safe_entry)
+            self._log_gradient_guard_stop(entry, guard_info)
+            stop = GradientGuardStop(
+                self.last_safe_entry,
+                bad_entry=entry,
+                guard_info=guard_info,
+            )
+            self.last_gradient_guard_stop = stop
+            raise stop
+
+        self.last_safe_entry = entry
+        self.recent_safe_raw_gnorms.append(float(entry["gnorm_raw"]))
+        objective = float(entry["objective"])
+        if np.isfinite(objective) and (
+            self.best_physical_entry is None
+            or objective < float(self.best_physical_entry["objective"])
+        ):
+            self.best_physical_entry = entry
+        return guard_info
+
     def _evaluate_optimizer_variables(self, variables):
         reduced_trial = self.optimizer_to_physical(variables)
         physical_trial = self.expand_reduced_physical(reduced_trial)
         physical_eval, info = self._apply_line_search_bound(physical_trial)
+        info["requested_x"] = list(physical_trial)
+        info["evaluated_x"] = list(physical_eval)
         return self.evaluate(physical_eval, line_search_info=info), info
 
     def _evaluate_reduced_physical(self, reduced_coefficients):
         physical_trial = self.expand_reduced_physical(reduced_coefficients)
         physical_eval, info = self._apply_line_search_bound(physical_trial)
+        info["requested_x"] = list(physical_trial)
+        info["evaluated_x"] = list(physical_eval)
         result = self.evaluate(physical_eval, line_search_info=info)
         reduced_eval = self.compress_full_physical(physical_eval)
         return result, info, reduced_eval
@@ -2469,6 +2715,28 @@ class BSplineSU2Driver:
             json.dump(data, fp, indent=2, sort_keys=True)
             fp.write("\n")
 
+    def _write_gradient_guard_summary(self, paths, entry, guard_info, status):
+        data = {}
+        if paths.summary.exists():
+            try:
+                with open(paths.summary, "r") as fp:
+                    data = json.load(fp)
+            except Exception:
+                data = {}
+        data["gradient_guard"] = {
+            "status": str(status),
+            "reason": guard_info.get("reason"),
+            "gnorm_raw": entry.get("gnorm_raw"),
+            "gnorm_opt": entry.get("gnorm_opt"),
+            "reference": guard_info.get("reference"),
+            "ratio": guard_info.get("ratio"),
+            "beta_eff": entry.get("beta_eff"),
+            "was_clipped": bool(entry.get("was_clipped", False)),
+        }
+        with open(paths.summary, "w") as fp:
+            json.dump(data, fp, indent=2, sort_keys=True)
+            fp.write("\n")
+
     def _append_history_record(
         self,
         eval_id,
@@ -2479,6 +2747,8 @@ class BSplineSU2Driver:
         line_search_info=None,
         eval_dir=None,
         eval_index=None,
+        gradient_guard_info=None,
+        gradient_entry=None,
     ):
         line_search_info = {
             **self._line_search_default_info(),
@@ -2489,11 +2759,17 @@ class BSplineSU2Driver:
             if self.symmetry_coupling != "NONE"
             else []
         )
+        gradient_values = list(gradient or [])
+        gradient_is_finite = all(np.isfinite(float(value)) for value in gradient_values)
         reduced_gradient = (
-            self.collapse_gradient_to_reduced(gradient)
-            if self.symmetry_coupling != "NONE" and gradient
+            self.collapse_gradient_to_reduced(gradient_values)
+            if self.symmetry_coupling != "NONE"
+            and gradient_values
+            and gradient_is_finite
             else []
         )
+        gradient_guard_info = dict(gradient_guard_info or {})
+        gradient_entry = dict(gradient_entry or {})
         record = {
             "eval_index": eval_index,
             "slsqp_iter": self._slsqp_major_iter,
@@ -2502,7 +2778,12 @@ class BSplineSU2Driver:
             "objective": objective,
             "coefficients": list(coefficients),
             "reduced_coefficients": list(reduced_coefficients),
-            "gradients": list(gradient or []),
+            "gradients": gradient_values,
+            "gnorm_raw": gradient_entry.get("gnorm_raw", ""),
+            "gnorm_opt": gradient_entry.get("gnorm_opt", ""),
+            "gradient_guard_reason": gradient_guard_info.get("reason", ""),
+            "gradient_guard_reference": gradient_guard_info.get("reference", ""),
+            "gradient_guard_ratio": gradient_guard_info.get("ratio", ""),
             "status": status,
             "line_search_beta": line_search_info["line_search_beta"],
             "line_search_maxdiff": line_search_info["line_search_maxdiff"],
@@ -2524,7 +2805,7 @@ class BSplineSU2Driver:
         if self.symmetry_coupling != "NONE":
             for reduced_id, coefficient in zip(self.reduced_variable_ids, reduced_coefficients):
                 record[f"reduced_coeff__{reduced_id}"] = coefficient
-        for mode_id, value in zip(self.mode_ids, gradient or []):
+        for mode_id, value in zip(self.mode_ids, gradient_values):
             record[f"grad__{mode_id}"] = value
         if self.symmetry_coupling != "NONE":
             for reduced_id, value in zip(self.reduced_variable_ids, reduced_gradient):
@@ -2543,6 +2824,11 @@ class BSplineSU2Driver:
                 "coefficients",
                 "reduced_coefficients",
                 "gradients",
+                "gnorm_raw",
+                "gnorm_opt",
+                "gradient_guard_reason",
+                "gradient_guard_reference",
+                "gradient_guard_ratio",
             ]
             + [f"coeff__{mode_id}" for mode_id in self.mode_ids]
             + (
@@ -2689,7 +2975,11 @@ class BSplineSU2Driver:
             )
             create_eval_aliases(paths)
             self._write_eval_summary_metadata(paths, line_search_info=line_search_info)
-            gradient = read_gradient_vector(paths.gradients, self.mode_ids)
+            gradient = read_gradient_vector(
+                paths.gradients,
+                self.mode_ids,
+                allow_nonfinite=self.gradient_guard_enabled,
+            )
 
             result = {
                 "eval_index": eval_index,
@@ -2700,6 +2990,55 @@ class BSplineSU2Driver:
                 "coefficients": coefficients,
                 "status": "ok",
             }
+            gradient_entry = self._gradient_entry(
+                result,
+                paths,
+                line_search_info=line_search_info,
+            )
+            try:
+                guard_info = self.register_gradient_entry(gradient_entry)
+            except GradientGuardStop as stop:
+                result.update(
+                    {
+                        "status": "rejected_gradient_guard",
+                        "gnorm_raw": gradient_entry["gnorm_raw"],
+                        "gnorm_opt": gradient_entry["gnorm_opt"],
+                        "gradient_guard_info": stop.guard_info,
+                    }
+                )
+                self._write_gradient_guard_summary(
+                    paths,
+                    gradient_entry,
+                    stop.guard_info,
+                    "rejected",
+                )
+                self._append_history_record(
+                    eval_id,
+                    objective,
+                    coefficients,
+                    gradient,
+                    "rejected_gradient_guard",
+                    line_search_info=line_search_info,
+                    eval_dir=paths.eval_dir,
+                    eval_index=eval_index,
+                    gradient_guard_info=stop.guard_info,
+                    gradient_entry=gradient_entry,
+                )
+                raise
+
+            result.update(
+                {
+                    "gnorm_raw": gradient_entry["gnorm_raw"],
+                    "gnorm_opt": gradient_entry["gnorm_opt"],
+                    "gradient_guard_info": guard_info,
+                }
+            )
+            self._write_gradient_guard_summary(
+                paths,
+                gradient_entry,
+                guard_info,
+                "safe",
+            )
             self._cache[key] = result
             self._print_iteration_row(result, line_search_info=line_search_info)
             self._append_history_record(
@@ -2711,8 +3050,12 @@ class BSplineSU2Driver:
                 line_search_info=line_search_info,
                 eval_dir=paths.eval_dir,
                 eval_index=eval_index,
+                gradient_guard_info=guard_info,
+                gradient_entry=gradient_entry,
             )
             return result
+        except GradientGuardStop:
+            raise
         except Exception as exc:
             self._append_history_record(
                 eval_id,
@@ -2758,6 +3101,15 @@ class BSplineSU2Driver:
         )
         print(f"Eval layout: {self.eval_layout}")
         print(f"Sensitivity weighting: {self.sensitivity_weighting}")
+        print(
+            "Raw-gradient guard: {} factor={} window={} min_history={} floor={}".format(
+                "ON" if self.gradient_guard_enabled else "OFF",
+                self.gradient_guard_factor,
+                self.gradient_guard_window,
+                self.gradient_guard_min_history,
+                self.gradient_guard_floor,
+            )
+        )
         print(
             "Objective function scaling factor: [{:.15g}]".format(
                 float(self.opt_gradient_factor)
@@ -2817,12 +3169,12 @@ class BSplineSU2Driver:
         if not self._printed_iteration_header:
             print(
                 "SLSQP_IT   FC   EVAL_ID      OBJFUN_PHYS     OBJFUN_SLSQP      "
-                "GNORM_PHYS       GNORM_SLSQP        LS_BETA LS_BETA_LOCAL"
+                "GNORM_RAW        GNORM_OPT          LS_BETA LS_BETA_LOCAL"
             )
             self._printed_iteration_header = True
 
         gradient = result.get("gradient") or []
-        gnorm_phys = math.sqrt(
+        gnorm_raw = math.sqrt(
             sum(float(value) * float(value) for value in gradient)
         )
         reduced_gradient = self.collapse_gradient_to_reduced(gradient) if gradient else []
@@ -2848,7 +3200,7 @@ class BSplineSU2Driver:
         obj_phys = float(result["objective"])
         obj_slsqp = obj_phys * float(self.opt_gradient_factor)
 
-        gnorm_slsqp = (
+        gnorm_opt = (
             math.sqrt(sum(float(value) * float(value) for value in reduced_gradient))
             * float(self.opt_relax_factor)
             * float(self.opt_gradient_factor)
@@ -2866,12 +3218,46 @@ class BSplineSU2Driver:
                 eval_id,
                 obj_phys,
                 obj_slsqp,
-                gnorm_phys,
-                gnorm_slsqp,
+                gnorm_raw,
+                gnorm_opt,
                 beta,
                 local_beta,
             )
         )
+
+    def _controlled_gradient_guard_result(self, stop, optimizer="SLSQP"):
+        safe = stop.last_safe_entry
+        self.restore_modes_from_entry(safe)
+        if safe is None:
+            coefficients = list(self.initial_coefficients)
+            objective = math.inf
+            safe_eval_id = None
+        else:
+            coefficients = [float(value) for value in safe["evaluated_x"]]
+            objective = float(safe["objective"])
+            safe_eval_id = int(safe["eval_id"])
+        refine = self.gradient_guard_next_action == "refine"
+        if refine:
+            self.trigger_project.refinement_triggered = True
+        if self.print_optimizer_table:
+            print("Raw-gradient guard stop    (controlled rollback)")
+            print(f"            Restored evaluation: {safe_eval_id}")
+            print(f"            Current function value: {objective:.12g}")
+        return {
+            "optimizer": optimizer,
+            "success": True,
+            "message": "Raw-gradient guard stop: restored last safe evaluation",
+            "objective": objective,
+            "coefficients": coefficients,
+            "status": "gradient_guard_stop",
+            "gradient_guard_triggered": True,
+            "gradient_guard_info": dict(stop.guard_info),
+            "gradient_guard_bad_eval_id": stop.bad_entry.get("eval_id"),
+            "gradient_guard_restore_eval_id": safe_eval_id,
+            "gradient_guard_next_action": self.gradient_guard_next_action,
+            "early_refine_triggered": refine,
+            "refinement_triggered": refine,
+        }
 
     def optimize(self, maxiter=5, fallback_step=0.1, gradient_tol=1.0e-8):
         self.trigger_project.trigger_history = []
@@ -2887,11 +3273,17 @@ class BSplineSU2Driver:
                 raise BSplineSU2DriverError(
                     "SciPy is required when PROGRESSIVE_THICKNESS_CONSTRAINT=YES"
                 )
-            return self._optimize_projected_gradient_descent(
-                maxiter=maxiter,
-                step_size=fallback_step,
-                gradient_tol=gradient_tol,
-            )
+            try:
+                return self._optimize_projected_gradient_descent(
+                    maxiter=maxiter,
+                    step_size=fallback_step,
+                    gradient_tol=gradient_tol,
+                )
+            except GradientGuardStop as stop:
+                return self._controlled_gradient_guard_result(
+                    stop,
+                    optimizer="projected_gradient_descent",
+                )
 
         x0 = self.physical_to_optimizer(self.initial_reduced_coefficients)
         bounds_u = self.optimizer_bounds()
@@ -2936,6 +3328,8 @@ class BSplineSU2Driver:
                 callback=callback,
                 options=options,
             )
+        except GradientGuardStop as stop:
+            return self._controlled_gradient_guard_result(stop, optimizer="SLSQP")
         except RefinementTriggered:
             early_refine_triggered = True
             print(
@@ -3087,6 +3481,12 @@ def run_bspline_su2_optimization(
     opt_bound_lower=None,
     opt_relax_factor=1.0,
     opt_gradient_factor=1.0,
+    gradient_guard=True,
+    gradient_guard_factor=100.0,
+    gradient_guard_window=5,
+    gradient_guard_min_history=3,
+    gradient_guard_floor=1.0e-14,
+    gradient_guard_next_action="restart_same_level",
     opt_line_search_bound=None,
     thickness_options=None,
     eval_layout="DSN",
@@ -3130,6 +3530,12 @@ def run_bspline_su2_optimization(
         opt_bound_lower=opt_bound_lower,
         opt_relax_factor=opt_relax_factor,
         opt_gradient_factor=opt_gradient_factor,
+        gradient_guard=gradient_guard,
+        gradient_guard_factor=gradient_guard_factor,
+        gradient_guard_window=gradient_guard_window,
+        gradient_guard_min_history=gradient_guard_min_history,
+        gradient_guard_floor=gradient_guard_floor,
+        gradient_guard_next_action=gradient_guard_next_action,
         opt_line_search_bound=opt_line_search_bound,
         thickness_options=thickness_options,
         eval_layout=eval_layout,
@@ -3274,6 +3680,23 @@ def _build_arg_parser():
         help="SU2-style objective/gradient scaling factor for SLSQP",
     )
     parser.add_argument(
+        "--gradient-guard",
+        dest="gradient_guard",
+        action="store_true",
+        help="Enable the raw-gradient explosion guard (default)",
+    )
+    parser.add_argument(
+        "--no-gradient-guard",
+        dest="gradient_guard",
+        action="store_false",
+        help="Disable the raw-gradient explosion guard",
+    )
+    parser.set_defaults(gradient_guard=True)
+    parser.add_argument("--gradient-guard-factor", type=float, default=100.0)
+    parser.add_argument("--gradient-guard-window", type=int, default=5)
+    parser.add_argument("--gradient-guard-min-history", type=int, default=3)
+    parser.add_argument("--gradient-guard-floor", type=float, default=1.0e-14)
+    parser.add_argument(
         "--opt-line-search-bound",
         type=float,
         default=None,
@@ -3377,6 +3800,11 @@ def main(argv=None):
             opt_bound_lower=args.opt_bound_lower,
             opt_relax_factor=args.opt_relax_factor,
             opt_gradient_factor=args.opt_gradient_factor,
+            gradient_guard=args.gradient_guard,
+            gradient_guard_factor=args.gradient_guard_factor,
+            gradient_guard_window=args.gradient_guard_window,
+            gradient_guard_min_history=args.gradient_guard_min_history,
+            gradient_guard_floor=args.gradient_guard_floor,
             opt_line_search_bound=args.opt_line_search_bound,
             thickness_options=getattr(args, "thickness_options", None),
             eval_layout=args.eval_layout,

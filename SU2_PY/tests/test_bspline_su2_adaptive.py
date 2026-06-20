@@ -1,3 +1,4 @@
+import csv
 import json
 import math
 import sys
@@ -18,10 +19,13 @@ from SU2.opt.bspline_su2_adaptive import (
     build_next_knot_inserted_modes,
     build_scalar_deformation_sensitivity,
     extract_clamped_knot_space,
+    find_eval_dir_for_mode_coefficients,
     generate_initial_bspline_modes,
+    gradient_guard_next_action_for_level,
     parse_adaptive_options,
     progressive_bspline_su2_shape_optimization,
     regenerate_clamped_modes,
+    run_with_gradient_guard_restarts,
     transfer_shape_to_inserted_space,
     validate_adaptive_options,
 )
@@ -99,6 +103,77 @@ def test_shared_trigger_decisions_match_hh_ffd_bspline(trigger, history, extra, 
 
 def test_max_iter_builds_no_online_trigger():
     assert build_online_trigger_opts("MAX_ITER", current_level=0, current_ndv=4, final_ndv=9) is None
+
+
+def test_gradient_guard_refines_when_another_level_is_available():
+    assert gradient_guard_next_action_for_level(
+        level_id=0,
+        nlevels=2,
+        current_ndv=7,
+        nfinal=15,
+    ) == "refine"
+
+
+def test_gradient_guard_restarts_final_level_with_clean_optimizer_state():
+    assert gradient_guard_next_action_for_level(
+        level_id=1,
+        nlevels=2,
+        current_ndv=7,
+        nfinal=15,
+    ) == "restart_same_level"
+    assert gradient_guard_next_action_for_level(
+        level_id=0,
+        nlevels=2,
+        current_ndv=15,
+        nfinal=15,
+    ) == "restart_same_level"
+
+
+def test_gradient_guard_refine_action_does_not_restart_same_level(tmp_path):
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+        return {"gradient_guard_triggered": True, "success": True}
+
+    result = run_with_gradient_guard_restarts(
+        fake_run,
+        {"token": "level-0"},
+        active_modes_start_filename=tmp_path / "start.json",
+        optimized_modes_filename=tmp_path / "optimized.json",
+        next_action="refine",
+        restart_limit=2,
+    )
+
+    assert len(calls) == 1
+    assert result["gradient_guard_restart_count"] == 0
+
+
+def test_gradient_guard_final_level_reinvokes_optimizer_from_safe_modes(tmp_path):
+    start = tmp_path / "active_modes_start.json"
+    optimized = tmp_path / "optimized_modes.json"
+    start.write_text("bad-start")
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            optimized.write_text("restored-safe")
+            return {"gradient_guard_triggered": True, "success": True}
+        assert start.read_text() == "restored-safe"
+        return {"gradient_guard_triggered": False, "success": True}
+
+    result = run_with_gradient_guard_restarts(
+        fake_run,
+        {"token": "final-level"},
+        active_modes_start_filename=start,
+        optimized_modes_filename=optimized,
+        next_action="restart_same_level",
+        restart_limit=2,
+    )
+
+    assert len(calls) == 2
+    assert result["gradient_guard_restart_count"] == 1
 
 
 def _minimal_settings(**overrides):
@@ -830,6 +905,44 @@ def test_default_initial_mode_generation_remains_both_surfaces(tmp_path):
     assert {mode["side"] for mode in spec["modes"]} == {"upper", "lower"}
 
 
+def test_rejected_gradient_guard_eval_is_not_adaptive_scoring_source(tmp_path):
+    opt_run = tmp_path / "opt_run"
+    opt_run.mkdir()
+    spec = generate_initial_bspline_modes(
+        tmp_path / "modes.json",
+        "AIRFOIL",
+        nper_side=4,
+        surface_mode="UPPER",
+    )
+    mode_ids = [mode["id"] for mode in spec["modes"]]
+    fieldnames = ["eval_id", "objective", "status"] + [
+        f"coeff__{mode_id}" for mode_id in mode_ids
+    ]
+    with open(opt_run / "optimization_history.csv", "w", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "eval_id": 5,
+                "objective": 0.1,
+                "status": "rejected_gradient_guard",
+                **{f"coeff__{mode_id}": 0.0 for mode_id in mode_ids},
+            }
+        )
+        writer.writerow(
+            {
+                "eval_id": 4,
+                "objective": 0.8,
+                "status": "ok",
+                **{f"coeff__{mode_id}": 0.0 for mode_id in mode_ids},
+            }
+        )
+
+    selected = find_eval_dir_for_mode_coefficients(opt_run, spec)
+
+    assert selected.name == "eval_0004"
+
+
 def _single_cfg_text(tmp_path, extra_lines=()):
     lines = [
         "MESH_FILENAME= mesh.su2",
@@ -999,6 +1112,17 @@ def test_legacy_candidate_cfg_keys_fail_clearly(tmp_path, cfg_key, cfg_value):
 def test_default_adaptive_sensitivity_weighting_is_nodal():
     settings = validate_adaptive_options(_minimal_settings())
     assert settings["sensitivity_weighting"] == "NODAL"
+
+
+def test_gradient_guard_defaults_use_raw_norm_factor_100():
+    settings = validate_adaptive_options(_minimal_settings())
+
+    assert settings["gradient_guard"] is True
+    assert settings["gradient_guard_factor"] == pytest.approx(100.0)
+    assert settings["gradient_guard_window"] == 5
+    assert settings["gradient_guard_min_history"] == 3
+    assert settings["gradient_guard_floor"] == pytest.approx(1.0e-14)
+    assert settings["gradient_guard_restart_limit"] == 2
 
 
 @pytest.mark.parametrize(

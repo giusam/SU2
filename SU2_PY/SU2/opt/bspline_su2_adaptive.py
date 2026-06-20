@@ -1787,8 +1787,14 @@ def _trigger_refine_from_history(objectives, opts):
 
 
 def _level_summary_row(level, rows, selected_modes, trigger_decision, refine_now, status):
-    objectives = [row["_objective"] for row in rows]
-    best_row = min(rows, key=lambda row: row["_objective"]) if rows else None
+    safe_rows = [
+        row
+        for row in rows
+        if str(row.get("status", "ok")).strip().lower() == "ok"
+        and math.isfinite(float(row["_objective"]))
+    ]
+    objectives = [row["_objective"] for row in safe_rows]
+    best_row = min(safe_rows, key=lambda row: row["_objective"]) if safe_rows else None
     if isinstance(trigger_decision, TriggerDecision):
         trigger_mode = trigger_decision.trigger_mode
         trigger_metric = trigger_decision.metric
@@ -2131,6 +2137,35 @@ def validate_adaptive_options(opts):
     )
     if opts["opt_gradient_factor"] <= 0.0:
         raise BSplineAdaptiveError("--opt-gradient-factor must be positive")
+    opts["gradient_guard"] = _as_bool(
+        opts.get("gradient_guard", True),
+        default=True,
+    )
+    opts["gradient_guard_factor"] = _as_float(
+        opts.get("gradient_guard_factor", 100.0),
+        "BSPLINE_GRADIENT_GUARD_FACTOR",
+    )
+    opts["gradient_guard_window"] = int(opts.get("gradient_guard_window", 5))
+    opts["gradient_guard_min_history"] = int(
+        opts.get("gradient_guard_min_history", 3)
+    )
+    opts["gradient_guard_floor"] = _as_float(
+        opts.get("gradient_guard_floor", 1.0e-14),
+        "BSPLINE_GRADIENT_GUARD_FLOOR",
+    )
+    opts["gradient_guard_restart_limit"] = int(
+        opts.get("gradient_guard_restart_limit", 2)
+    )
+    if opts["gradient_guard_factor"] <= 0.0:
+        raise BSplineAdaptiveError("BSPLINE_GRADIENT_GUARD_FACTOR must be positive")
+    if opts["gradient_guard_window"] < 1:
+        raise BSplineAdaptiveError("BSPLINE_GRADIENT_GUARD_WINDOW must be >= 1")
+    if opts["gradient_guard_min_history"] < 1:
+        raise BSplineAdaptiveError("BSPLINE_GRADIENT_GUARD_MIN_HISTORY must be >= 1")
+    if opts["gradient_guard_floor"] <= 0.0:
+        raise BSplineAdaptiveError("BSPLINE_GRADIENT_GUARD_FLOOR must be positive")
+    if opts["gradient_guard_restart_limit"] < 0:
+        raise BSplineAdaptiveError("BSPLINE_GRADIENT_GUARD_RESTART_LIMIT must be >= 0")
     opts["opt_line_search_bound"] = (
         float(opts["opt_line_search_bound"])
         if opts.get("opt_line_search_bound") is not None
@@ -2707,6 +2742,17 @@ def print_startup_summary(settings):
             f"{float(thickness_options.get('PROGRESSIVE_THICKNESS_SYMMETRY_Y', 0.0))}"
         )
     print(f"[PROGRESSIVE_BSPLINE] online trigger: {settings.get('trigger', 'MAX_ITER')}")
+    print(
+        "[PROGRESSIVE_BSPLINE] raw-gradient guard: {} factor={} window={} "
+        "min_history={} floor={} restart_limit={}".format(
+            "ON" if settings.get("gradient_guard", True) else "OFF",
+            settings.get("gradient_guard_factor", 100.0),
+            settings.get("gradient_guard_window", 5),
+            settings.get("gradient_guard_min_history", 3),
+            settings.get("gradient_guard_floor", 1.0e-14),
+            settings.get("gradient_guard_restart_limit", 2),
+        )
+    )
 
 
 def _settings_from_args(args):
@@ -2783,6 +2829,16 @@ def _settings_from_args(args):
         "opt_bound_lower": args.opt_bound_lower,
         "opt_relax_factor": args.opt_relax_factor,
         "opt_gradient_factor": args.opt_gradient_factor,
+        "gradient_guard": getattr(args, "gradient_guard", True),
+        "gradient_guard_factor": getattr(args, "gradient_guard_factor", 100.0),
+        "gradient_guard_window": getattr(args, "gradient_guard_window", 5),
+        "gradient_guard_min_history": getattr(args, "gradient_guard_min_history", 3),
+        "gradient_guard_floor": getattr(args, "gradient_guard_floor", 1.0e-14),
+        "gradient_guard_restart_limit": getattr(
+            args,
+            "gradient_guard_restart_limit",
+            2,
+        ),
         "opt_line_search_bound": args.opt_line_search_bound,
         "local_step_limit": args.local_step_limit,
         "local_step_limit_ratio": args.local_step_limit_ratio,
@@ -2796,6 +2852,54 @@ def _settings_from_args(args):
         "le_safe_x1": getattr(args, "le_safe_x1", LE_SAFE_DEFAULT_X1),
         "le_safe_power": getattr(args, "le_safe_power", LE_SAFE_DEFAULT_POWER),
     }
+
+
+def gradient_guard_next_action_for_level(
+    level_id,
+    nlevels,
+    current_ndv,
+    nfinal=None,
+):
+    refinement_available = int(level_id) < int(nlevels) - 1
+    if nfinal is not None and int(current_ndv) >= int(nfinal):
+        refinement_available = False
+    return "refine" if refinement_available else "restart_same_level"
+
+
+def run_with_gradient_guard_restarts(
+    run_optimizer,
+    optimizer_kwargs,
+    *,
+    active_modes_start_filename,
+    optimized_modes_filename,
+    next_action,
+    restart_limit=2,
+):
+    """Run a level, resetting SLSQP state by reinvoking the optimizer on restart."""
+
+    restart_count = 0
+    restart_limit = int(restart_limit)
+    while True:
+        result = run_optimizer(**optimizer_kwargs)
+        if not result.get("gradient_guard_triggered", False):
+            break
+        if str(next_action) != "restart_same_level":
+            break
+        if restart_count >= restart_limit:
+            result["gradient_guard_restart_limit_reached"] = True
+            print(
+                "[PROGRESSIVE_BSPLINE] GRADIENT_GUARD restart limit reached; "
+                "terminating successfully with the restored last-safe design"
+            )
+            break
+        shutil.copy2(optimized_modes_filename, active_modes_start_filename)
+        restart_count += 1
+        print(
+            "[PROGRESSIVE_BSPLINE] GRADIENT_GUARD restart_same_level "
+            f"attempt={restart_count}/{restart_limit} from restored last-safe design"
+        )
+    result["gradient_guard_restart_count"] = restart_count
+    return result
 
 
 def progressive_bspline_su2_shape_optimization(settings):
@@ -2862,60 +2966,90 @@ def progressive_bspline_su2_shape_optimization(settings):
             stagnation_window=settings["stag_window"],
         )
 
-        result = run_bspline_su2_optimization(
-            modes_filename=str(level.active_modes_start_filename),
-            base_mesh=settings["base_mesh"],
-            marker=settings["marker"],
-            def_template=settings["def_template"],
-            primal_template=settings["primal_template"],
-            adjoint_template=settings["adjoint_template"],
-            workdir=str(level.opt_workdir),
-            objective_column=settings["objective_column"],
-            maxiter=settings["max_iter_per_level"],
-            mpi_prefix=settings.get("mpi", ""),
-            show_commands=bool(settings.get("show_commands", False)),
-            stream_solver_output=bool(settings.get("stream_solver_output", False)),
-            print_optimizer_table=bool(settings.get("print_optimizer_table", True)),
-            auto_scale_bounds_to_geometry=bool(settings.get("auto_scale_bounds_to_geometry", False)),
-            max_normal_displacement=settings.get("max_normal_displacement"),
-            max_rms_normal_displacement=settings.get("max_rms_normal_displacement"),
-            min_bound_scale=settings.get("min_bound_scale", 0.0),
-            opt_accuracy=settings.get("opt_accuracy"),
-            opt_bound_upper=settings.get("opt_bound_upper"),
-            opt_bound_lower=settings.get("opt_bound_lower"),
-            opt_relax_factor=settings.get("opt_relax_factor", 1.0),
-            opt_gradient_factor=settings.get("opt_gradient_factor", 1.0),
-            opt_line_search_bound=settings.get("opt_line_search_bound"),
-            local_step_limit=settings.get("local_step_limit", False),
-            local_step_limit_ratio=settings.get("local_step_limit_ratio", 200.0),
-            sensitivity_weighting=settings.get("sensitivity_weighting", "NODAL"),
-            thickness_options=settings.get("thickness_options"),
-            eval_layout=settings.get("eval_layout", "DSN"),
-            objective_adjoint=settings.get("objective_adjoint", "drag"),
-            symmetry_coupling=settings.get("symmetry_coupling", "NONE"),
-            surface_mode=settings.get("surface_mode", "BOTH"),
-            trigger_opts=trigger_opts,
-            progressive_label="PROGRESSIVE_BSPLINE",
-            deformation_direction_mode=settings.get("deformation_direction_mode"),
-            le_safe_direction=bool(settings.get("le_safe_direction", False)),
-            le_safe_x0=settings.get("le_safe_x0", LE_SAFE_DEFAULT_X0),
-            le_safe_x1=settings.get("le_safe_x1", LE_SAFE_DEFAULT_X1),
-            le_safe_power=settings.get("le_safe_power", LE_SAFE_DEFAULT_POWER),
+        gradient_guard_action = gradient_guard_next_action_for_level(
+            level_id,
+            settings["nlevels"],
+            current_reduced_ndv,
+            settings.get("nfinal"),
+        )
+        optimizer_kwargs = {
+            "modes_filename": str(level.active_modes_start_filename),
+            "base_mesh": settings["base_mesh"],
+            "marker": settings["marker"],
+            "def_template": settings["def_template"],
+            "primal_template": settings["primal_template"],
+            "adjoint_template": settings["adjoint_template"],
+            "workdir": str(level.opt_workdir),
+            "objective_column": settings["objective_column"],
+            "maxiter": settings["max_iter_per_level"],
+            "mpi_prefix": settings.get("mpi", ""),
+            "show_commands": bool(settings.get("show_commands", False)),
+            "stream_solver_output": bool(settings.get("stream_solver_output", False)),
+            "print_optimizer_table": bool(settings.get("print_optimizer_table", True)),
+            "auto_scale_bounds_to_geometry": bool(settings.get("auto_scale_bounds_to_geometry", False)),
+            "max_normal_displacement": settings.get("max_normal_displacement"),
+            "max_rms_normal_displacement": settings.get("max_rms_normal_displacement"),
+            "min_bound_scale": settings.get("min_bound_scale", 0.0),
+            "opt_accuracy": settings.get("opt_accuracy"),
+            "opt_bound_upper": settings.get("opt_bound_upper"),
+            "opt_bound_lower": settings.get("opt_bound_lower"),
+            "opt_relax_factor": settings.get("opt_relax_factor", 1.0),
+            "opt_gradient_factor": settings.get("opt_gradient_factor", 1.0),
+            "gradient_guard": settings.get("gradient_guard", True),
+            "gradient_guard_factor": settings.get("gradient_guard_factor", 100.0),
+            "gradient_guard_window": settings.get("gradient_guard_window", 5),
+            "gradient_guard_min_history": settings.get("gradient_guard_min_history", 3),
+            "gradient_guard_floor": settings.get("gradient_guard_floor", 1.0e-14),
+            "gradient_guard_next_action": gradient_guard_action,
+            "opt_line_search_bound": settings.get("opt_line_search_bound"),
+            "local_step_limit": settings.get("local_step_limit", False),
+            "local_step_limit_ratio": settings.get("local_step_limit_ratio", 200.0),
+            "sensitivity_weighting": settings.get("sensitivity_weighting", "NODAL"),
+            "thickness_options": settings.get("thickness_options"),
+            "eval_layout": settings.get("eval_layout", "DSN"),
+            "objective_adjoint": settings.get("objective_adjoint", "drag"),
+            "symmetry_coupling": settings.get("symmetry_coupling", "NONE"),
+            "surface_mode": settings.get("surface_mode", "BOTH"),
+            "trigger_opts": trigger_opts,
+            "progressive_label": "PROGRESSIVE_BSPLINE",
+            "deformation_direction_mode": settings.get("deformation_direction_mode"),
+            "le_safe_direction": bool(settings.get("le_safe_direction", False)),
+            "le_safe_x0": settings.get("le_safe_x0", LE_SAFE_DEFAULT_X0),
+            "le_safe_x1": settings.get("le_safe_x1", LE_SAFE_DEFAULT_X1),
+            "le_safe_power": settings.get("le_safe_power", LE_SAFE_DEFAULT_POWER),
+        }
+        result = run_with_gradient_guard_restarts(
+            run_bspline_su2_optimization,
+            optimizer_kwargs,
+            active_modes_start_filename=level.active_modes_start_filename,
+            optimized_modes_filename=level.optimized_modes_filename,
+            next_action=gradient_guard_action,
+            restart_limit=settings.get("gradient_guard_restart_limit", 2),
         )
 
         opt_rows = _read_optimization_history(level.opt_workdir)
         optimized_modes = load_mode_spec(str(level.optimized_modes_filename))
-        adjoint_eval_dir = find_eval_dir_for_mode_coefficients(
-            level.opt_workdir,
-            optimized_modes,
-        )
-        best_objective = min(row["_objective"] for row in opt_rows)
+        safe_opt_rows = [
+            row
+            for row in opt_rows
+            if str(row.get("status", "ok")).strip().lower() == "ok"
+            and math.isfinite(float(row["_objective"]))
+        ]
+        adjoint_eval_dir = None
+        if safe_opt_rows:
+            adjoint_eval_dir = find_eval_dir_for_mode_coefficients(
+                level.opt_workdir,
+                optimized_modes,
+            )
+            best_objective = min(row["_objective"] for row in safe_opt_rows)
+        else:
+            best_objective = float(result.get("objective", math.inf))
         print(
             "[PROGRESSIVE_BSPLINE] Level {} optimization complete | best {} = {:.6e} | adjoint eval = {}".format(
                 level_id,
                 settings["objective_column"],
                 best_objective,
-                adjoint_eval_dir.name,
+                adjoint_eval_dir.name if adjoint_eval_dir is not None else "NONE",
             )
         )
 
@@ -2927,7 +3061,11 @@ def progressive_bspline_su2_shape_optimization(settings):
             )
         )
         trigger_mode = str(settings["trigger"]).upper()
-        if trigger_mode == "MAX_ITER":
+        if result.get("gradient_guard_triggered", False):
+            refine_requested = gradient_guard_action == "refine"
+            trigger_reason = "raw_gradient_guard"
+            trigger_counter = 1
+        elif trigger_mode == "MAX_ITER":
             refine_requested = True
             trigger_reason = "level_complete"
             trigger_counter = 1
@@ -2948,10 +3086,16 @@ def progressive_bspline_su2_shape_optimization(settings):
             refine_now=refine_requested,
             reason=trigger_reason,
         )
-        refine_now = bool(not reached_limits and trigger_decision.refine_now)
+        refine_now = bool(
+            not reached_limits
+            and trigger_decision.refine_now
+            and adjoint_eval_dir is not None
+        )
         if trigger_decision.refine_now and not refine_now:
             if reached_limits:
                 trigger_decision.reason = "limits_reached"
+            elif adjoint_eval_dir is None:
+                trigger_decision.reason = "no_safe_adjoint_for_refinement"
             trigger_decision.refine_now = False
             _log_trigger_decision(trigger_decision)
 
@@ -3159,6 +3303,14 @@ def _build_arg_parser():
     parser.add_argument("--opt-bound-lower", type=float, default=None)
     parser.add_argument("--opt-relax-factor", type=float, default=1.0)
     parser.add_argument("--opt-gradient-factor", type=float, default=1.0)
+    parser.add_argument("--gradient-guard", dest="gradient_guard", action="store_true")
+    parser.add_argument("--no-gradient-guard", dest="gradient_guard", action="store_false")
+    parser.set_defaults(gradient_guard=True)
+    parser.add_argument("--gradient-guard-factor", type=float, default=100.0)
+    parser.add_argument("--gradient-guard-window", type=int, default=5)
+    parser.add_argument("--gradient-guard-min-history", type=int, default=3)
+    parser.add_argument("--gradient-guard-floor", type=float, default=1.0e-14)
+    parser.add_argument("--gradient-guard-restart-limit", type=int, default=2)
     parser.add_argument("--opt-line-search-bound", type=float, default=None)
     parser.add_argument("--local-step-limit", action="store_true", default=False)
     parser.add_argument("--local-step-limit-ratio", type=float, default=200.0)

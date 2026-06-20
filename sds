@@ -1,0 +1,77 @@
+[35mCommon/src/CConfig.cpp[m[36m:[m[32m2364[m[36m:[m  addDoubleOption("[1;31mOPT_RELAX_FACTOR[m", Opt_RelaxFactor, 1.0);
+[35mCommon/src/CConfig.cpp[m[36m:[m[32m2367[m[36m:[m  addDoubleOption("[1;31mOPT_LINE_SEARCH_BOUND[m", Opt_LineSearch_Bound, 1E6);
+[35mCommon/src/CConfig.cpp[m[36m:[m[32m2932[m[36m:[m  addPythonOption("[1;31mOPT_BOUND_UPPER[m");
+[35mCommon/src/CConfig.cpp[m[36m:[m[32m2935[m[36m:[m  addPythonOption("[1;31mOPT_BOUND_LOWER[m");
+[35mSU2_PY/SU2/io/config.py[m[36m:[m[32m739[m[36m:[m    if "[1;31mOPT_RELAX_FACTOR[m" not in data_dict:
+[35mSU2_PY/SU2/io/config.py[m[36m:[m[32m740[m[36m:[m        data_dict["[1;31mOPT_RELAX_FACTOR[m"] = 1.0
+[35mSU2_PY/SU2/io/config.py[m[36m:[m[32m743[m[36m:[m    if "[1;31mOPT_BOUND_UPPER[m" not in data_dict:
+[35mSU2_PY/SU2/io/config.py[m[36m:[m[32m744[m[36m:[m        data_dict["[1;31mOPT_BOUND_UPPER[m"] = 1e10
+[35mSU2_PY/SU2/io/config.py[m[36m:[m[32m745[m[36m:[m    if "[1;31mOPT_BOUND_LOWER[m" not in data_dict:
+[35mSU2_PY/SU2/io/config.py[m[36m:[m[32m746[m[36m:[m        data_dict["[1;31mOPT_BOUND_LOWER[m"] = -1e10
+[35mSU2_PY/SU2/opt/progressive_hh_projection.py[m[36m:[m[32m674[m[36m:[m    lower = _scalar_config_value(cfg, "[1;31mOPT_BOUND_LOWER[m", -np.inf)
+[35mSU2_PY/SU2/opt/progressive_hh_projection.py[m[36m:[m[32m675[m[36m:[m    upper = _scalar_config_value(cfg, "[1;31mOPT_BOUND_UPPER[m", np.inf)
+[35mSU2_PY/shape_optimization.py[m[36m:[m[32m177[m[36m:[m    bound_upper = float(config.[1;31mOPT_BOUND_UPPER[m)
+[35mSU2_PY/shape_optimization.py[m[36m:[m[32m178[m[36m:[m    bound_lower = float(config.[1;31mOPT_BOUND_LOWER[m)
+[35mSU2_PY/shape_optimization.py[m[36m:[m[32m179[m[36m:[m    relax_factor = float(config.[1;31mOPT_RELAX_FACTOR[m)
+[35mTestCases/cont_adj_euler/oneram6/inv_ONERAM6.cfg[m[36m:[m[32m149[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/cont_adj_euler/oneram6/inv_ONERAM6.cfg[m[36m:[m[32m150[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/cont_adj_euler/wedge/inv_wedge_ROE.cfg[m[36m:[m[32m139[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/cont_adj_euler/wedge/inv_wedge_ROE.cfg[m[36m:[m[32m140[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/cont_adj_euler/wedge/inv_wedge_ROE_multiobj.cfg[m[36m:[m[32m146[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/cont_adj_euler/wedge/inv_wedge_ROE_multiobj.cfg[m[36m:[m[32m147[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/deformation/intersection_prevention/def_intersect.cfg[m[36m:[m[32m191[m[36m:[m[1;31mOPT_RELAX_FACTOR[m= 1.0
+[35mTestCases/deformation/intersection_prevention/def_intersect.cfg[m[36m:[m[32m194[m[36m:[m[1;31mOPT_LINE_SEARCH_BOUND[m= 1E6
+[35mTestCases/deformation/intersection_prevention/def_intersect.cfg[m[36m:[m[32m195[m[36m:[m[1;31mOPT_BOUND_UPPER[m =  1e10
+[35mTestCases/deformation/intersection_prevention/def_intersect.cfg[m[36m:[m[32m196[m[36m:[m[1;31mOPT_BOUND_LOWER[m = -1e10
+[35mTestCases/disc_adj_euler/arina2k/Arina2KRS.cfg[m[36m:[m[32m197[m[36m:[m[1;31mOPT_RELAX_FACTOR[m= 1E3
+[35mTestCases/disc_adj_euler/arina2k/Arina2KRS.cfg[m[36m:[m[32m200[m[36m:[m[1;31mOPT_LINE_SEARCH_BOUND[m= 1E6
+[35mTestCases/disc_adj_euler/arina2k/Arina2KRS.cfg[m[36m:[m[32m201[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 5E-3
+[35mTestCases/disc_adj_euler/arina2k/Arina2KRS.cfg[m[36m:[m[32m202[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -5E-3
+[35mTestCases/disc_adj_incomp_navierstokes/cylinder/heated_cylinder.cfg[m[36m:[m[32m180[m[36m:[m[1;31mOPT_RELAX_FACTOR[m= 1.0
+[35mTestCases/disc_adj_incomp_navierstokes/cylinder/heated_cylinder.cfg[m[36m:[m[32m184[m[36m:[m[1;31mOPT_LINE_SEARCH_BOUND[m= 1E6
+[35mTestCases/disc_adj_incomp_navierstokes/cylinder/heated_cylinder.cfg[m[36m:[m[32m185[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.5
+[35mTestCases/disc_adj_incomp_navierstokes/cylinder/heated_cylinder.cfg[m[36m:[m[32m186[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.5
+[35mTestCases/disc_adj_rans/cylinder/cylinder.cfg[m[36m:[m[32m139[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/disc_adj_rans/cylinder/cylinder.cfg[m[36m:[m[32m140[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/disc_adj_rans/cylinder_DT_1ST/cylinder.cfg[m[36m:[m[32m143[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/disc_adj_rans/cylinder_DT_1ST/cylinder.cfg[m[36m:[m[32m144[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/disc_adj_rans/naca0012/naca0012.cfg[m[36m:[m[32m128[m[36m:[m[1;31mOPT_RELAX_FACTOR[m= 1
+[35mTestCases/disc_adj_rans/naca0012/naca0012.cfg[m[36m:[m[32m129[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.05
+[35mTestCases/disc_adj_rans/naca0012/naca0012.cfg[m[36m:[m[32m130[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.05
+[35mTestCases/euler/oneram6/inv_ONERAM6.cfg[m[36m:[m[32m149[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/euler/oneram6/inv_ONERAM6.cfg[m[36m:[m[32m150[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/multiple_ffd/naca0012/inv_NACA0012_ffd.cfg[m[36m:[m[32m152[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/multiple_ffd/naca0012/inv_NACA0012_ffd.cfg[m[36m:[m[32m153[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/optimization_euler/equivalentarea_naca64206/NACA64206.cfg[m[36m:[m[32m157[m[36m:[m[1;31mOPT_RELAX_FACTOR[m= 1E3
+[35mTestCases/optimization_euler/equivalentarea_naca64206/NACA64206.cfg[m[36m:[m[32m160[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 2
+[35mTestCases/optimization_euler/equivalentarea_naca64206/NACA64206.cfg[m[36m:[m[32m161[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -2
+[35mTestCases/optimization_euler/multiobjective_wedge/inv_wedge_ROE_2surf_1obj.cfg[m[36m:[m[32m147[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/optimization_euler/multiobjective_wedge/inv_wedge_ROE_2surf_1obj.cfg[m[36m:[m[32m148[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/optimization_euler/multiobjective_wedge/inv_wedge_ROE_multiobj.cfg[m[36m:[m[32m149[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/optimization_euler/multiobjective_wedge/inv_wedge_ROE_multiobj.cfg[m[36m:[m[32m150[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/optimization_euler/multiobjective_wedge/inv_wedge_ROE_multiobj_1surf.cfg[m[36m:[m[32m148[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/optimization_euler/multiobjective_wedge/inv_wedge_ROE_multiobj_1surf.cfg[m[36m:[m[32m149[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/optimization_euler/multiobjective_wedge/inv_wedge_ROE_multiobj_combo.cfg[m[36m:[m[32m149[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/optimization_euler/multiobjective_wedge/inv_wedge_ROE_multiobj_combo.cfg[m[36m:[m[32m150[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/optimization_euler/multipoint_naca0012/inv_NACA0012_multipoint.cfg[m[36m:[m[32m131[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 1E6
+[35mTestCases/optimization_euler/multipoint_naca0012/inv_NACA0012_multipoint.cfg[m[36m:[m[32m132[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -1E6
+[35mTestCases/optimization_euler/steady_inverse_design/inv_NACA0012.cfg[m[36m:[m[32m133[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/optimization_euler/steady_inverse_design/inv_NACA0012.cfg[m[36m:[m[32m134[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/optimization_euler/steady_naca0012/inv_NACA0012_adv.cfg[m[36m:[m[32m145[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/optimization_euler/steady_naca0012/inv_NACA0012_adv.cfg[m[36m:[m[32m146[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/optimization_euler/steady_naca0012/inv_NACA0012_basic.cfg[m[36m:[m[32m137[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/optimization_euler/steady_naca0012/inv_NACA0012_basic.cfg[m[36m:[m[32m138[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/optimization_euler/steady_oneram6/inv_ONERAM6_adv.cfg[m[36m:[m[32m156[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.1
+[35mTestCases/optimization_euler/steady_oneram6/inv_ONERAM6_adv.cfg[m[36m:[m[32m157[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.1
+[35mTestCases/optimization_euler/steady_oneram6/inv_ONERAM6_basic.cfg[m[36m:[m[32m153[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.3
+[35mTestCases/optimization_euler/steady_oneram6/inv_ONERAM6_basic.cfg[m[36m:[m[32m154[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.3
+[35mTestCases/optimization_rans/naca0012/naca0012.cfg[m[36m:[m[32m130[m[36m:[m[1;31mOPT_RELAX_FACTOR[m= 1
+[35mTestCases/optimization_rans/naca0012/naca0012.cfg[m[36m:[m[32m131[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.05
+[35mTestCases/optimization_rans/naca0012/naca0012.cfg[m[36m:[m[32m132[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.05
+[35mTestCases/rans/restart_directdiff_naca/naca0012.cfg[m[36m:[m[32m128[m[36m:[m[1;31mOPT_RELAX_FACTOR[m= 1
+[35mTestCases/rans/restart_directdiff_naca/naca0012.cfg[m[36m:[m[32m129[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 0.05
+[35mTestCases/rans/restart_directdiff_naca/naca0012.cfg[m[36m:[m[32m130[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -0.05
+[35mconfig_template.cfg[m[36m:[m[32m2575[m[36m:[m[1;31mOPT_RELAX_FACTOR[m= 1E3
+[35mconfig_template.cfg[m[36m:[m[32m2584[m[36m:[m[1;31mOPT_LINE_SEARCH_BOUND[m= 1E6
+[35mconfig_template.cfg[m[36m:[m[32m2587[m[36m:[m[1;31mOPT_BOUND_UPPER[m= 1E10
+[35mconfig_template.cfg[m[36m:[m[32m2590[m[36m:[m[1;31mOPT_BOUND_LOWER[m= -1E10

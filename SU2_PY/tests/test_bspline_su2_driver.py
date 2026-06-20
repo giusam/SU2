@@ -1,6 +1,7 @@
 import copy
 import csv
 import json
+import math
 import sys
 import types
 
@@ -11,6 +12,7 @@ from SU2.opt.bspline_su2_driver import (
     BSplineThicknessConstraint,
     BSplineSU2Driver,
     BSplineSU2DriverError,
+    GradientGuardStop,
     _build_arg_parser,
     active_bounds,
     active_coefficient_vector,
@@ -25,6 +27,7 @@ from SU2.opt.bspline_su2_driver import (
     compute_geometry_aware_bound_scaling,
     expand_reduced_coefficients,
     fixed_driver_options_from_config,
+    gradient_guard_triggered,
     patch_config_template,
     parse_optimizer_config,
     read_bspline_gradients,
@@ -245,6 +248,161 @@ def _install_fake_scipy_minimize(monkeypatch, minimize):
     optimize_module.minimize = minimize
     monkeypatch.setitem(sys.modules, "scipy", scipy_module)
     monkeypatch.setitem(sys.modules, "scipy.optimize", optimize_module)
+
+
+@pytest.mark.parametrize(
+    "gnorm_raw,history,expected,reason",
+    [
+        (math.nan, [], True, "nonfinite_raw_gradient"),
+        (1.0, [], False, "insufficient_history"),
+        (50.0, [1.0, 1.0], False, "insufficient_history"),
+        (10.0, [1.0, 1.0, 1.0], False, "ok"),
+        (50.0, [1.0, 1.0, 1.0], False, "ok"),
+        (100.01, [1.0, 1.0, 1.0], True, "raw_gradient_explosion"),
+    ],
+)
+def test_raw_gradient_guard_policy(gnorm_raw, history, expected, reason):
+    triggered, info = gradient_guard_triggered(
+        {"gnorm_raw": gnorm_raw},
+        history,
+    )
+
+    assert triggered is expected
+    assert info["reason"] == reason
+
+
+def test_small_beta_does_not_mask_raw_gradient_explosion():
+    entry = {
+        "gnorm_raw": 101.0,
+        "gnorm_opt": 0.0303,
+        "beta_eff": 0.0003,
+    }
+
+    triggered, info = gradient_guard_triggered(entry, [1.0, 1.0, 1.0])
+
+    assert triggered is True
+    assert info["ratio"] == pytest.approx(101.0)
+
+
+def test_guard_rollback_restores_last_safe_modes_and_rejects_bad_state(tmp_path):
+    driver = _make_driver(
+        tmp_path,
+        gradient_guard=True,
+        gradient_guard_factor=100.0,
+        gradient_guard_min_history=3,
+    )
+    safe_modes = tmp_path / "safe_modes.json"
+    bad_modes = tmp_path / "bad_modes.json"
+    safe_spec = update_mode_coefficients(driver.mode_spec, [0.003, -0.004])
+    bad_spec = update_mode_coefficients(driver.mode_spec, [0.02, 0.02])
+    safe_modes.write_text(json.dumps(safe_spec, indent=2))
+    bad_modes.write_text(json.dumps(bad_spec, indent=2))
+    driver.optimized_modes_filename.parent.mkdir(parents=True, exist_ok=True)
+    driver.optimized_modes_filename.write_text(bad_modes.read_text())
+
+    safe_entry = {
+        "eval_id": 4,
+        "objective": 0.8,
+        "requested_x": [0.003, -0.004],
+        "evaluated_x": [0.003, -0.004],
+        "beta_eff": 1.0,
+        "was_clipped": False,
+        "gnorm_raw": 1.0,
+        "gnorm_opt": 1.0,
+        "eval_dir": tmp_path / "eval_0004",
+        "modes_file": safe_modes,
+    }
+    bad_entry = {
+        "eval_id": 5,
+        "objective": 0.1,
+        "requested_x": [0.02, 0.02],
+        "evaluated_x": [0.02, 0.02],
+        "beta_eff": 0.001,
+        "was_clipped": True,
+        "gnorm_raw": 101.0,
+        "gnorm_opt": 0.101,
+        "eval_dir": tmp_path / "eval_0005",
+        "modes_file": bad_modes,
+    }
+    driver.last_safe_entry = safe_entry
+    driver.best_physical_entry = safe_entry
+    driver.recent_safe_raw_gnorms.extend([1.0, 1.0, 1.0])
+
+    with pytest.raises(GradientGuardStop) as exc_info:
+        driver.register_gradient_entry(bad_entry)
+
+    assert exc_info.value.last_safe_entry is safe_entry
+    assert driver.last_safe_entry is safe_entry
+    assert driver.best_physical_entry is safe_entry
+    assert list(driver.recent_safe_raw_gnorms) == [1.0, 1.0, 1.0]
+    assert json.loads(driver.optimized_modes_filename.read_text()) == json.loads(
+        safe_modes.read_text()
+    )
+
+
+def test_gradient_entry_logs_raw_and_actual_optimizer_norm_separately(tmp_path):
+    driver = _make_driver(
+        tmp_path,
+        opt_relax_factor=2.0,
+        opt_gradient_factor=3.0,
+    )
+    paths = build_eval_paths(tmp_path / "eval_0000")
+    entry = driver._gradient_entry(
+        {
+            "eval_id": 0,
+            "objective": 1.0,
+            "gradient": [3.0, 4.0],
+            "coefficients": [0.0, 0.0],
+        },
+        paths,
+        line_search_info={"line_search_beta": 0.01},
+    )
+
+    assert entry["gnorm_raw"] == pytest.approx(5.0)
+    assert entry["gnorm_opt"] == pytest.approx(0.3)
+
+
+def test_slsqp_guard_stop_returns_success_with_restored_safe_design(
+    tmp_path,
+    monkeypatch,
+):
+    driver = _make_driver(
+        tmp_path,
+        gradient_guard_next_action="refine",
+    )
+    safe_modes = tmp_path / "safe_modes.json"
+    safe_spec = update_mode_coefficients(driver.mode_spec, [0.003, -0.004])
+    safe_modes.write_text(json.dumps(safe_spec, indent=2))
+    safe_entry = {
+        "eval_id": 4,
+        "objective": 0.8,
+        "evaluated_x": [0.003, -0.004],
+        "modes_file": safe_modes,
+    }
+    bad_entry = {"eval_id": 5}
+    stop = GradientGuardStop(
+        safe_entry,
+        bad_entry,
+        {"reason": "raw_gradient_explosion", "ratio": 101.0},
+    )
+
+    def fake_minimize(*args, **kwargs):
+        raise stop
+
+    _install_fake_scipy_minimize(monkeypatch, fake_minimize)
+
+    result = driver.optimize(maxiter=2)
+
+    assert result["success"] is True
+    assert result["status"] == "gradient_guard_stop"
+    assert result["coefficients"] == pytest.approx([0.003, -0.004])
+    assert result["refinement_triggered"] is True
+    restored = json.loads(driver.optimized_modes_filename.read_text())
+    assert [
+        mode["coefficient"]
+        for mode in restored["modes"]
+        if mode.get("active", True) is not False
+    ] == pytest.approx([0.003, -0.004])
 
 
 def test_update_mode_coefficients_preserves_non_coefficient_fields():
@@ -997,6 +1155,28 @@ def test_driver_config_maps_surface_mode_alias():
         {"BSPLINE_SURFACE_MODE": "HALF_UPPER"}
     )
     assert options["surface_mode"] == "HALF_UPPER"
+
+
+def test_driver_config_maps_gradient_guard_options():
+    options = fixed_driver_options_from_config(
+        {
+            "BSPLINE_GRADIENT_GUARD": False,
+            "BSPLINE_GRADIENT_GUARD_FACTOR": 125.0,
+            "BSPLINE_GRADIENT_GUARD_WINDOW": 7,
+            "BSPLINE_GRADIENT_GUARD_MIN_HISTORY": 4,
+            "BSPLINE_GRADIENT_GUARD_FLOOR": 1.0e-12,
+            "BSPLINE_GRADIENT_GUARD_RESTART_LIMIT": 3,
+        }
+    )
+
+    assert options == {
+        "gradient_guard": False,
+        "gradient_guard_factor": 125.0,
+        "gradient_guard_window": 7,
+        "gradient_guard_min_history": 4,
+        "gradient_guard_floor": 1.0e-12,
+        "gradient_guard_restart_limit": 3,
+    }
 
 
 def test_command_builder_keeps_legacy_le_safe_activation(tmp_path):

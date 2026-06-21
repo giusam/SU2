@@ -1041,12 +1041,75 @@ def apply_knot_depth_penalty(step_rows, span_depths, settings):
     return step_rows
 
 
+def _knot_intra_batch_penalty(depth, settings, has_selected_insertions=False):
+    mode = _knot_depth_penalty_mode(settings)
+    depth = int(depth)
+    child_depth = int(depth) + 1
+
+    if mode == "NONE":
+        return 1.0
+
+    # In the legacy intra-batch wrapper, a fresh span before any batch
+    # insertion starts from parent_depth=1 and child_depth=2, matching
+    # the persistent depth-penalty convention. Once the batch already
+    # contains selected insertions, however, a span on a fresh branch
+    # must remain unpenalized so it can compete with nested descendants.
+    if bool(has_selected_insertions) and depth <= 1:
+        return 1.0
+
+    if mode == "STREUBER_DEPTH":
+        return _streuber_depth_penalty(child_depth)
+
+    if mode == "POWER":
+        gamma = _knot_depth_power_gamma(settings)
+        return float(gamma) ** (child_depth - 1)
+
+    raise BSplineAdaptiveError(
+        f"unsupported knot depth penalty mode {mode!r}; "
+        f"allowed values are {ALLOWED_KNOT_DEPTH_PENALTY_MODES}"
+    )
+
+
 def apply_knot_batch_penalty(step_rows, selected_insertions, settings):
-    span_depths = {}
+    mode = _knot_depth_penalty_mode(settings)
+    has_selected_insertions = bool(selected_insertions)
+
     for row in step_rows:
         depth = _knot_batch_depth(row, selected_insertions)
-        span_depths[_span_key(row["span_left"], row["span_right"])] = int(depth)
-    return apply_knot_depth_penalty(step_rows, span_depths, settings)
+        score_unpenalized = float(row.get("score_raw", row.get("score", 0.0)))
+        penalty = _knot_intra_batch_penalty(
+            depth,
+            settings,
+            has_selected_insertions=has_selected_insertions,
+        )
+        score_effective = score_unpenalized * penalty
+
+        row["span_key"] = row.get(
+            "span_key",
+            _span_key(row["span_left"], row["span_right"]),
+        )
+        row["parent_depth"] = int(depth)
+        row["child_depth"] = int(depth) + 1
+        row["depth_penalty"] = float(penalty)
+        row["depth_penalty_mode"] = mode
+        row["batch_depth"] = int(depth)
+        row["batch_penalty"] = float(penalty)
+        row["batch_penalty_mode"] = mode
+        row["score_effective"] = float(score_effective)
+        row["selection_score"] = float(score_effective)
+
+    if mode != "NONE":
+        step_rows.sort(
+            key=lambda row: (
+                -float(row["selection_score"]),
+                float(row["span_left"]),
+                float(row["span_right"]),
+            )
+        )
+        for rank, row in enumerate(step_rows, start=1):
+            row["rank"] = rank
+
+    return step_rows
 
 
 def _knot_multiplicity(knots, u, tol=1.0e-12):

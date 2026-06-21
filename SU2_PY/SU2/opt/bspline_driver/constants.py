@@ -1,0 +1,7 @@
+"""Constants for the fixed-mode B-spline/SU2 driver."""
+
+DEFAULT_BOUNDS = (-0.01, 0.01)
+
+ALLOWED_EVAL_LAYOUTS = ("DSN",)
+
+ALLOWED_SYMMETRY_COUPLINGS = ("NONE", "NORMAL_EQUAL", "NORMAL_OPPOSITE")

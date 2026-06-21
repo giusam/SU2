@@ -76,6 +76,18 @@ ALLOWED_TRIGGERS = (
 ALLOWED_NADD_MODES = ("GROWTH_RATIO", "FIXED")
 ALLOWED_REFINE_MODES = ("KNOT_INSERTION",)
 ALLOWED_KNOT_SCORE_MODES = ("VIRTUAL_INSERTION", "RESIDUAL_ENERGY")
+ALLOWED_KNOT_BATCH_PENALTY_MODES = ("NONE", "STREUBER_DEPTH", "POWER")
+ALLOWED_KNOT_DEPTH_PENALTY_MODES = ALLOWED_KNOT_BATCH_PENALTY_MODES
+KNOT_DEPTH_PENALTY_MODE_CHOICES = (
+    *ALLOWED_KNOT_DEPTH_PENALTY_MODES,
+    "STREUBER",
+)
+SAFE_OPTIMIZATION_STATUSES = {
+    "ok",
+    "ok_clipped_benign",
+    "benign_clipped_legacy",
+    "accepted_clipped_restart",
+}
 REMOVED_CANDIDATE_CONFIG_KEYS = (
     "BSPLINE_SCORE_MODE",
     "BSPLINE_CANDIDATE_SOURCE",
@@ -97,9 +109,11 @@ GLOBAL_MODE_KEYS = (
     "chord",
     "normal_displacement",
     "class_shape",
+    "class_shape_exponent",
     "normalize_basis",
     "normalization_mode",
     "surface_mode",
+    "knot_span_depths",
 )
 KNOT_SCORE_FIELDNAMES = [
     "batch_step",
@@ -112,6 +126,16 @@ KNOT_SCORE_FIELDNAMES = [
     "score_mode",
     "score",
     "score_raw",
+    "score_effective",
+    "selection_score",
+    "span_key",
+    "parent_depth",
+    "child_depth",
+    "depth_penalty",
+    "depth_penalty_mode",
+    "batch_depth",
+    "batch_penalty",
+    "batch_penalty_mode",
     "residual_energy",
     "incremental_rank",
     "incremental_columns",
@@ -471,6 +495,138 @@ def insert_knot_midpoint(knot_vector, span):
     return tuple(new_knots)
 
 
+def _span_key(left, right, digits=14):
+    return (
+        f"{round(float(left), int(digits)):.{int(digits)}f}|"
+        f"{round(float(right), int(digits)):.{int(digits)}f}"
+    )
+
+
+def _as_knot_depth(value, name):
+    try:
+        depth = int(value)
+        value_float = float(value)
+    except Exception:
+        raise BSplineAdaptiveError(f"{name} must be an integer >= 1")
+    if not math.isfinite(value_float) or value_float != float(depth) or depth < 1:
+        raise BSplineAdaptiveError(f"{name} must be an integer >= 1")
+    return depth
+
+
+def _knot_initial_span_depth(settings):
+    depth = _as_knot_depth(
+        settings.get("knot_initial_span_depth", 1),
+        "BSPLINE_KNOT_INITIAL_SPAN_DEPTH",
+    )
+    if depth < 1:
+        raise BSplineAdaptiveError("BSPLINE_KNOT_INITIAL_SPAN_DEPTH must be >= 1")
+    return depth
+
+
+def initialize_knot_span_depths(knot_vector, min_width=1.0e-8, initial_depth=1):
+    initial_depth = _as_knot_depth(initial_depth, "initial knot span depth")
+    return {
+        _span_key(left, right): initial_depth
+        for left, right, _inserted in knot_insertion_spans(
+            knot_vector,
+            min_width=min_width,
+        )
+    }
+
+
+def _validated_knot_span_depths(raw_depths):
+    if not isinstance(raw_depths, dict):
+        raise BSplineAdaptiveError("knot_span_depths must be a JSON object")
+    span_depths = {}
+    for key, value in raw_depths.items():
+        depth = _as_knot_depth(value, f"knot_span_depths[{key!r}]")
+        span_depths[str(key)] = depth
+    return span_depths
+
+
+def _normalize_knot_depth_penalty_mode(value):
+    mode = str(value).strip().upper()
+    if mode == "STREUBER":
+        mode = "STREUBER_DEPTH"
+    if mode not in ALLOWED_KNOT_DEPTH_PENALTY_MODES:
+        raise BSplineAdaptiveError(
+            f"unsupported knot depth penalty mode {mode!r}; "
+            f"allowed values are {ALLOWED_KNOT_DEPTH_PENALTY_MODES}"
+        )
+    return mode
+
+
+def _knot_depth_penalty_mode(settings):
+    mode = _normalize_knot_depth_penalty_mode(
+        settings.get(
+            "knot_depth_penalty_mode",
+            settings.get("knot_batch_penalty_mode", "NONE"),
+        )
+    )
+    enabled = _as_bool(
+        settings.get(
+            "knot_depth_penalty",
+            settings.get("knot_batch_diversity", mode != "NONE"),
+        ),
+        default=False,
+    )
+    if enabled and mode == "NONE":
+        raise BSplineAdaptiveError(
+            "BSPLINE_KNOT_DEPTH_PENALTY=YES requires "
+            "BSPLINE_KNOT_DEPTH_PENALTY_MODE=STREUBER_DEPTH or POWER"
+        )
+    return mode if enabled else "NONE"
+
+
+def _knot_depth_power_gamma(settings):
+    gamma = _as_float(
+        settings.get(
+            "knot_depth_power_gamma",
+            settings.get("knot_batch_power_gamma", 0.25),
+        ),
+        "BSPLINE_KNOT_DEPTH_POWER_GAMMA",
+    )
+    if not (0.0 < gamma <= 1.0):
+        raise BSplineAdaptiveError(
+            "BSPLINE_KNOT_DEPTH_POWER_GAMMA must satisfy 0 < gamma <= 1"
+        )
+    return gamma
+
+
+def get_or_initialize_knot_span_depths(spec, knot_vector, settings):
+    settings = dict(settings or {})
+    min_width = settings.get("knot_min_span_width", 1.0e-8)
+    current_keys = [
+        _span_key(left, right)
+        for left, right, _inserted in knot_insertion_spans(
+            knot_vector,
+            min_width=min_width,
+        )
+    ]
+    if spec.get("knot_span_depths") is None:
+        return initialize_knot_span_depths(
+            knot_vector,
+            min_width=min_width,
+            initial_depth=_knot_initial_span_depth(settings),
+        )
+
+    span_depths = _validated_knot_span_depths(spec["knot_span_depths"])
+    missing = [key for key in current_keys if key not in span_depths]
+    if missing:
+        if _knot_depth_penalty_mode(settings) != "NONE":
+            raise BSplineAdaptiveError(
+                "knot_span_depths is missing current spans required by the active "
+                f"knot depth penalty: {missing[:5]}"
+            )
+        initial_depth = _knot_initial_span_depth(settings)
+        for key in missing:
+            span_depths[key] = initial_depth
+    return {
+        key: span_depths[key]
+        for key in current_keys
+    }
+
+
 def _representative_bounds(group):
     counts = {}
     by_key = {}
@@ -801,6 +957,98 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
     return rows
 
 
+def _span_contains(parent_left, parent_right, child_left, child_right, tol=1.0e-12):
+    return (
+        float(child_left) >= float(parent_left) - float(tol)
+        and float(child_right) <= float(parent_right) + float(tol)
+    )
+
+
+def _knot_batch_depth(row, selected_insertions, tol=1.0e-12):
+    child_left = float(row["span_left"])
+    child_right = float(row["span_right"])
+    depth = 1
+    for selected in selected_insertions:
+        if _span_contains(
+            selected["span_left"],
+            selected["span_right"],
+            child_left,
+            child_right,
+            tol=tol,
+        ):
+            depth += 1
+    return depth
+
+
+def _streuber_depth_penalty(depth):
+    value = 1.0 - 0.5 * (
+        math.tanh(3.0) + math.tanh((float(depth) - 1.0) - 3.0)
+    )
+    return min(1.0, max(0.0, float(value)))
+
+
+def _knot_batch_penalty(depth, settings):
+    mode = _knot_depth_penalty_mode(settings)
+    if mode == "NONE":
+        return 1.0
+    if mode == "STREUBER_DEPTH":
+        return _streuber_depth_penalty(depth)
+    if mode == "POWER":
+        gamma = _knot_depth_power_gamma(settings)
+        return float(gamma) ** (int(depth) - 1)
+    raise BSplineAdaptiveError(
+        f"unsupported knot depth penalty mode {mode!r}; "
+        f"allowed values are {ALLOWED_KNOT_DEPTH_PENALTY_MODES}"
+    )
+
+
+def apply_knot_depth_penalty(step_rows, span_depths, settings):
+    mode = _knot_depth_penalty_mode(settings)
+
+    for row in step_rows:
+        key = _span_key(row["span_left"], row["span_right"])
+        if key not in span_depths:
+            raise BSplineAdaptiveError(
+                "knot_span_depths is missing current span "
+                f"[{float(row['span_left']):.14g}, {float(row['span_right']):.14g}]"
+            )
+        parent_depth = int(span_depths[key])
+        child_depth = parent_depth + 1
+        score_unpenalized = float(row.get("score_raw", row.get("score", 0.0)))
+        penalty = 1.0 if mode == "NONE" else _knot_batch_penalty(child_depth, settings)
+        score_effective = score_unpenalized * penalty
+        row["span_key"] = key
+        row["parent_depth"] = int(parent_depth)
+        row["child_depth"] = int(child_depth)
+        row["depth_penalty"] = float(penalty)
+        row["depth_penalty_mode"] = mode
+        row["score_effective"] = float(score_effective)
+        row["selection_score"] = float(score_effective)
+        row["batch_depth"] = int(child_depth)
+        row["batch_penalty"] = float(penalty)
+        row["batch_penalty_mode"] = mode
+
+    if mode != "NONE":
+        step_rows.sort(
+            key=lambda row: (
+                -float(row["selection_score"]),
+                float(row["span_left"]),
+                float(row["span_right"]),
+            )
+        )
+        for rank, row in enumerate(step_rows, start=1):
+            row["rank"] = rank
+    return step_rows
+
+
+def apply_knot_batch_penalty(step_rows, selected_insertions, settings):
+    span_depths = {}
+    for row in step_rows:
+        depth = _knot_batch_depth(row, selected_insertions)
+        span_depths[_span_key(row["span_left"], row["span_right"])] = int(depth)
+    return apply_knot_depth_penalty(step_rows, span_depths, settings)
+
+
 def _knot_multiplicity(knots, u, tol=1.0e-12):
     return sum(
         1
@@ -958,9 +1206,14 @@ def _mode_normalization_factors(modes, spec):
     if not bool(spec.get("normalize_basis", True)):
         return np.ones(len(modes), dtype=float)
     class_shape = spec.get("class_shape", "sqrt_x_one_minus_x")
+    class_shape_exponent = spec.get("class_shape_exponent", 0.5)
     factors = np.asarray(
         [
-            mode_normalization_factor(mode, class_shape=class_shape)
+            mode_normalization_factor(
+                mode,
+                class_shape=class_shape,
+                class_shape_exponent=class_shape_exponent,
+            )
             for mode in modes
         ],
         dtype=float,
@@ -1172,9 +1425,15 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
 
     score_rows = []
     selected_insertions = []
-    current_spec = optimized_modes
+    current_spec = dict(optimized_modes)
     current_space = space
     current_knots = tuple(space.knot_vector)
+    span_depths = get_or_initialize_knot_span_depths(
+        current_spec,
+        current_space.knot_vector,
+        settings,
+    )
+    current_spec["knot_span_depths"] = dict(span_depths)
 
     for step in range(1, int(n_insertions) + 1):
         try:
@@ -1186,7 +1445,8 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
         for row in step_rows:
             row["batch_step"] = step
             row["selected"] = False
-        if not step_rows or float(step_rows[0].get("score", 0.0)) <= 0.0:
+        step_rows = apply_knot_depth_penalty(step_rows, span_depths, settings)
+        if not step_rows or float(step_rows[0].get("selection_score", 0.0)) <= 0.0:
             for row in step_rows:
                 row["status"] = "nonpositive_score"
             score_rows.extend(step_rows)
@@ -1200,15 +1460,31 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
             current_space.knot_vector,
             (selected["span_left"], selected["span_right"], selected["inserted_knot"]),
         )
+        parent_key = _span_key(selected["span_left"], selected["span_right"])
+        parent_depth = int(span_depths[parent_key])
+        child_depth = parent_depth + 1
+        span_depths.pop(parent_key)
+        span_depths[_span_key(selected["span_left"], selected["inserted_knot"])] = child_depth
+        span_depths[_span_key(selected["inserted_knot"], selected["span_right"])] = child_depth
         selected_insertions.append(
             {
                 "step": step,
+                "span_key": str(selected.get("span_key", parent_key)),
                 "span_left": float(selected["span_left"]),
                 "span_right": float(selected["span_right"]),
                 "inserted_knot": float(selected["inserted_knot"]),
                 "side": str(selected.get("side", "BOTH")).upper(),
                 "score": float(selected["score"]),
                 "score_raw": float(selected["score_raw"]),
+                "score_effective": float(selected.get("score_effective", selected["score"])),
+                "selection_score": float(selected.get("selection_score", selected.get("score_effective", selected["score"]))),
+                "parent_depth": int(selected.get("parent_depth", parent_depth)),
+                "child_depth": int(selected.get("child_depth", child_depth)),
+                "depth_penalty": float(selected.get("depth_penalty", 1.0)),
+                "depth_penalty_mode": str(selected.get("depth_penalty_mode", "NONE")),
+                "batch_depth": int(selected.get("batch_depth", 1)),
+                "batch_penalty": float(selected.get("batch_penalty", 1.0)),
+                "batch_penalty_mode": str(selected.get("batch_penalty_mode", "NONE")),
                 "residual_energy": float(selected["residual_energy"]),
                 "old_knot_vector": [float(value) for value in old_knots],
                 "new_knot_vector": [float(value) for value in new_knots],
@@ -1218,18 +1494,36 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
             }
         )
         score_rows.extend(step_rows)
-        print(
-            "[PROGRESSIVE_BSPLINE] KNOT_INSERTION selected | "
-            "step={} side={} span=[{:.6f},{:.6f}] knot={:.6f} score={:.6e}".format(
-                step,
-                str(selected.get("side", "BOTH")).upper(),
-                float(selected["span_left"]),
-                float(selected["span_right"]),
-                float(selected["inserted_knot"]),
-                float(selected["score"]),
+        if str(selected.get("batch_penalty_mode", "NONE")).upper() == "NONE":
+            print(
+                "[PROGRESSIVE_BSPLINE] KNOT_INSERTION selected | "
+                "step={} side={} span=[{:.6f},{:.6f}] knot={:.6f} score={:.6e}".format(
+                    step,
+                    str(selected.get("side", "BOTH")).upper(),
+                    float(selected["span_left"]),
+                    float(selected["span_right"]),
+                    float(selected["inserted_knot"]),
+                    float(selected["score"]),
+                )
             )
-        )
+        else:
+            print(
+                "[PROGRESSIVE_BSPLINE] KNOT_INSERTION selected | "
+                "step={} side={} span=[{:.6f},{:.6f}] knot={:.6f} "
+                "score_eff={:.6e} score_raw={:.6e} depth={} penalty={:.6e}".format(
+                    step,
+                    str(selected.get("side", "BOTH")).upper(),
+                    float(selected["span_left"]),
+                    float(selected["span_right"]),
+                    float(selected["inserted_knot"]),
+                    float(selected.get("score_effective", selected["score"])),
+                    float(selected["score_raw"]),
+                    int(selected.get("child_depth", selected.get("batch_depth", 1))),
+                    float(selected.get("depth_penalty", selected.get("batch_penalty", 1.0))),
+                )
+            )
         current_spec = regenerate_clamped_modes(current_space, new_knots)
+        current_spec["knot_span_depths"] = dict(span_depths)
         current_space = extract_clamped_knot_space(current_spec, settings)
         current_knots = tuple(new_knots)
 
@@ -1248,6 +1542,7 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
         settings=settings,
     )
     next_modes = regenerate_clamped_modes(space, new_knots, coefficients_by_side)
+    next_modes["knot_span_depths"] = dict(span_depths)
     _check_transferred_coefficients_within_bounds(next_modes, settings)
     if settings.get("nfinal") is not None and refinement_limit_ndv(next_modes, settings) > int(settings["nfinal"]):
         return None, score_rows, {
@@ -1264,12 +1559,19 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
         "selected": True,
         "refine_mode": "KNOT_INSERTION",
         "knot_score_mode": str(settings.get("knot_score_mode", "VIRTUAL_INSERTION")).upper(),
+        "span_key": str(first.get("span_key", "")),
         "span_left": float(first["span_left"]),
         "span_right": float(first["span_right"]),
         "inserted_knot": float(first["inserted_knot"]),
         "side": str(first.get("side", "BOTH")).upper(),
         "score": float(first["score"]),
         "score_raw": float(first["score_raw"]),
+        "score_effective": float(first.get("score_effective", first["score"])),
+        "selection_score": float(first.get("selection_score", first.get("score_effective", first["score"]))),
+        "parent_depth": int(first.get("parent_depth", 1)),
+        "child_depth": int(first.get("child_depth", 1)),
+        "depth_penalty": float(first.get("depth_penalty", 1.0)),
+        "depth_penalty_mode": str(first.get("depth_penalty_mode", "NONE")),
         "residual_energy": float(first["residual_energy"]),
         "ndv_before": len(active_mode_ids(optimized_modes)),
         "ndv_after": len(active_mode_ids(next_modes)),
@@ -1531,13 +1833,16 @@ def find_best_eval_dir(opt_run_dir, objective_column="objective"):
             f"{history_file} has no evaluation with a finite objective"
         )
 
-    ok_rows = [row for row in valid_rows if row[2] == "ok" and math.isfinite(row[0])]
+    ok_rows = [
+        row
+        for row in valid_rows
+        if row[2] in SAFE_OPTIMIZATION_STATUSES and math.isfinite(row[0])
+    ]
     if not ok_rows:
-        # Do NOT fall back to status != "ok" rows: a failed evaluation may
-        # have written a partial/garbage objective, and its adjoint (used
-        # downstream for residual projection) is unreliable. Refuse instead.
+        # Do not fall back to rejected/failed rows: their adjoint is not a
+        # valid adaptive-scoring source.
         raise BSplineAdaptiveError(
-            f"{history_file} has no successful (status='ok') evaluation with a finite objective"
+            f"{history_file} has no safe evaluation with a finite objective"
         )
     best = min(ok_rows, key=lambda item: item[0])
     return opt_run_dir / f"eval_{best[1]:04d}"
@@ -1563,7 +1868,7 @@ def find_eval_dir_for_mode_coefficients(
                 continue
 
             status = str(row.get("status", "ok")).strip().lower()
-            if status and status != "ok":
+            if status and status not in SAFE_OPTIMIZATION_STATUSES:
                 continue
 
             matched = True
@@ -1790,7 +2095,8 @@ def _level_summary_row(level, rows, selected_modes, trigger_decision, refine_now
     safe_rows = [
         row
         for row in rows
-        if str(row.get("status", "ok")).strip().lower() == "ok"
+        if str(row.get("status", "ok")).strip().lower()
+        in SAFE_OPTIMIZATION_STATUSES
         and math.isfinite(float(row["_objective"]))
     ]
     objectives = [row["_objective"] for row in safe_rows]
@@ -1948,6 +2254,47 @@ def validate_adaptive_options(opts):
         raise BSplineAdaptiveError(
             f"unsupported knot score mode {opts['knot_score_mode']!r}; allowed values are {ALLOWED_KNOT_SCORE_MODES}"
         )
+    mode = _normalize_knot_depth_penalty_mode(
+        opts.get(
+            "knot_depth_penalty_mode",
+            opts.get("knot_batch_penalty_mode", "NONE"),
+        )
+    )
+    depth_penalty = _as_bool(
+        opts.get(
+            "knot_depth_penalty",
+            opts.get("knot_batch_diversity", mode != "NONE"),
+        ),
+        default=False,
+    )
+    if depth_penalty and mode == "NONE":
+        raise BSplineAdaptiveError(
+            "BSPLINE_KNOT_DEPTH_PENALTY=YES requires "
+            "BSPLINE_KNOT_DEPTH_PENALTY_MODE=STREUBER_DEPTH or POWER"
+        )
+    if not depth_penalty:
+        mode = "NONE"
+    opts["knot_depth_penalty"] = depth_penalty
+    opts["knot_depth_penalty_mode"] = mode
+    opts["knot_depth_power_gamma"] = _as_float(
+        opts.get(
+            "knot_depth_power_gamma",
+            opts.get("knot_batch_power_gamma", 0.25),
+        ),
+        "BSPLINE_KNOT_DEPTH_POWER_GAMMA",
+    )
+    if not (0.0 < opts["knot_depth_power_gamma"] <= 1.0):
+        raise BSplineAdaptiveError(
+            "BSPLINE_KNOT_DEPTH_POWER_GAMMA must satisfy 0 < gamma <= 1"
+        )
+    opts["knot_initial_span_depth"] = _as_knot_depth(
+        opts.get("knot_initial_span_depth", 1),
+        "BSPLINE_KNOT_INITIAL_SPAN_DEPTH",
+    )
+    # Legacy aliases remain populated for old cfg/CLI consumers and logs.
+    opts["knot_batch_diversity"] = depth_penalty
+    opts["knot_batch_penalty_mode"] = mode
+    opts["knot_batch_power_gamma"] = opts["knot_depth_power_gamma"]
     knot_insertions = opts.get("knot_insertions_per_refine", 1)
     if str(knot_insertions).strip().upper() == "AUTO":
         opts["knot_insertions_per_refine"] = "AUTO"
@@ -2166,6 +2513,43 @@ def validate_adaptive_options(opts):
         raise BSplineAdaptiveError("BSPLINE_GRADIENT_GUARD_FLOOR must be positive")
     if opts["gradient_guard_restart_limit"] < 0:
         raise BSplineAdaptiveError("BSPLINE_GRADIENT_GUARD_RESTART_LIMIT must be >= 0")
+    opts["trust_clip_policy"] = str(
+        opts.get("trust_clip_policy", "OFF")
+    ).strip().upper()
+    if opts["trust_clip_policy"] not in ("OFF", "ACCEPT_RESTART"):
+        raise BSplineAdaptiveError(
+            "BSPLINE_TRUST_CLIP_POLICY must be OFF or ACCEPT_RESTART"
+        )
+    for key, default in (
+        ("trust_clip_beta_tol", 1.0e-12),
+        ("trust_clip_legacy_beta_min", 0.50),
+        ("trust_clip_severe_beta", 0.50),
+        ("trust_clip_worsening_tol", 0.05),
+        ("trust_clip_soft_gnorm_factor", 20.0),
+        ("trust_clip_stag_tol", 1.0e-6),
+    ):
+        opts[key] = float(opts.get(key, default))
+    opts["trust_clip_bad_patience"] = int(
+        opts.get("trust_clip_bad_patience", 2)
+    )
+    opts["trust_clip_bad_window"] = int(opts.get("trust_clip_bad_window", 5))
+    opts["trust_clip_restart_limit"] = int(
+        opts.get("trust_clip_restart_limit", 1)
+    )
+    if opts["trust_clip_beta_tol"] < 0.0:
+        raise BSplineAdaptiveError("BSPLINE_TRUST_CLIP_BETA_TOL must be non-negative")
+    if not 0.0 <= opts["trust_clip_legacy_beta_min"] <= 1.0:
+        raise BSplineAdaptiveError("BSPLINE_TRUST_CLIP_LEGACY_BETA_MIN must be in [0, 1]")
+    if not 0.0 <= opts["trust_clip_severe_beta"] <= 1.0:
+        raise BSplineAdaptiveError("BSPLINE_TRUST_CLIP_SEVERE_BETA must be in [0, 1]")
+    if opts["trust_clip_worsening_tol"] < 0.0 or opts["trust_clip_stag_tol"] < 0.0:
+        raise BSplineAdaptiveError("trust-clip tolerances must be non-negative")
+    if opts["trust_clip_soft_gnorm_factor"] <= 0.0:
+        raise BSplineAdaptiveError("BSPLINE_TRUST_CLIP_SOFT_GNORM_FACTOR must be positive")
+    if opts["trust_clip_bad_patience"] < 1 or opts["trust_clip_bad_window"] < 1:
+        raise BSplineAdaptiveError("trust-clip bad patience/window must be >= 1")
+    if opts["trust_clip_restart_limit"] < 0:
+        raise BSplineAdaptiveError("BSPLINE_TRUST_CLIP_RESTART_LIMIT must be >= 0")
     opts["opt_line_search_bound"] = (
         float(opts["opt_line_search_bound"])
         if opts.get("opt_line_search_bound") is not None
@@ -2260,6 +2644,7 @@ def adaptive_options_from_config(config_values):
         "BSPLINE_INITIAL_BOUND_UPPER": "initial_bound_upper",
         "BSPLINE_INITIAL_NORMALIZE_BASIS": "initial_normalize_basis",
         "BSPLINE_INITIAL_NORMALIZATION_MODE": "initial_normalization_mode",
+        "BSPLINE_INITIAL_CLASS_SHAPE_EXPONENT": "initial_class_shape_exponent",
     }
     for key, dest in case_mapping.items():
         if key in config_values:
@@ -2313,6 +2698,13 @@ def adaptive_options_from_config(config_values):
         "BSPLINE_KNOT_SCORE_MODE": "knot_score_mode",
         "BSPLINE_KNOT_INSERTIONS_PER_REFINE": "knot_insertions_per_refine",
         "BSPLINE_KNOT_MIN_SPAN_WIDTH": "knot_min_span_width",
+        "BSPLINE_KNOT_DEPTH_PENALTY": "knot_depth_penalty",
+        "BSPLINE_KNOT_DEPTH_PENALTY_MODE": "knot_depth_penalty_mode",
+        "BSPLINE_KNOT_DEPTH_POWER_GAMMA": "knot_depth_power_gamma",
+        "BSPLINE_KNOT_INITIAL_SPAN_DEPTH": "knot_initial_span_depth",
+        "BSPLINE_KNOT_BATCH_DIVERSITY": "knot_batch_diversity",
+        "BSPLINE_KNOT_BATCH_PENALTY_MODE": "knot_batch_penalty_mode",
+        "BSPLINE_KNOT_BATCH_POWER_GAMMA": "knot_batch_power_gamma",
         "BSPLINE_TRANSFER_METHOD": "transfer_method",
         "BSPLINE_TRANSFER_BOUND_POLICY": "transfer_bound_policy",
         "BSPLINE_TRANSFER_GEOMETRY_ABS_TOL": "transfer_geometry_abs_tol",
@@ -2337,6 +2729,27 @@ def adaptive_options_from_config(config_values):
     for key, dest in mapping.items():
         if key in config_values:
             options[dest] = config_values[key]
+    if (
+        "BSPLINE_KNOT_DEPTH_PENALTY" not in config_values
+        and "BSPLINE_KNOT_BATCH_DIVERSITY" in config_values
+    ):
+        options["knot_depth_penalty"] = config_values[
+            "BSPLINE_KNOT_BATCH_DIVERSITY"
+        ]
+    if (
+        "BSPLINE_KNOT_DEPTH_PENALTY_MODE" not in config_values
+        and "BSPLINE_KNOT_BATCH_PENALTY_MODE" in config_values
+    ):
+        options["knot_depth_penalty_mode"] = config_values[
+            "BSPLINE_KNOT_BATCH_PENALTY_MODE"
+        ]
+    if (
+        "BSPLINE_KNOT_DEPTH_POWER_GAMMA" not in config_values
+        and "BSPLINE_KNOT_BATCH_POWER_GAMMA" in config_values
+    ):
+        options["knot_depth_power_gamma"] = config_values[
+            "BSPLINE_KNOT_BATCH_POWER_GAMMA"
+        ]
     return options
 
 
@@ -2412,6 +2825,7 @@ def generate_initial_bspline_modes(
     bound_lower=-0.01,
     bound_upper=0.01,
     class_shape="sqrt_x_one_minus_x",
+    class_shape_exponent=0.5,
     normalize_basis=True,
     normalization_mode="max",
     surface_mode="BOTH",
@@ -2426,6 +2840,14 @@ def generate_initial_bspline_modes(
     bound_upper = float(bound_upper)
     if bound_upper < bound_lower:
         raise BSplineAdaptiveError("BSPLINE_INITIAL_BOUND_UPPER must be >= lower")
+    class_shape_exponent = _as_float(
+        class_shape_exponent,
+        "BSPLINE_INITIAL_CLASS_SHAPE_EXPONENT",
+    )
+    if class_shape_exponent < 0.0:
+        raise BSplineAdaptiveError(
+            "BSPLINE_INITIAL_CLASS_SHAPE_EXPONENT must be finite and >= 0"
+        )
     marker = str(marker or "").strip()
     if not marker:
         raise BSplineAdaptiveError("BSPLINE_MARKER is required to generate initial B-spline modes")
@@ -2463,6 +2885,7 @@ def generate_initial_bspline_modes(
         "chord": {"mode": "auto"},
         "normal_displacement": True,
         "class_shape": str(class_shape),
+        "class_shape_exponent": float(class_shape_exponent),
         "normalize_basis": _as_bool(normalize_basis, default=True),
         "normalization_mode": str(normalization_mode),
         "surface_mode": surface_mode,
@@ -2664,6 +3087,10 @@ def prepare_bspline_launch_settings(settings):
                     "initial_class_shape",
                     "sqrt_x_one_minus_x",
                 ),
+                class_shape_exponent=settings.get(
+                    "initial_class_shape_exponent",
+                    0.5,
+                ),
                 normalize_basis=settings.get("initial_normalize_basis", True),
                 normalization_mode=settings.get("initial_normalization_mode", "max"),
                 surface_mode=settings["surface_mode"],
@@ -2710,6 +3137,14 @@ def print_startup_summary(settings):
     print("[PROGRESSIVE_BSPLINE] eval layout: DSN")
     print("[PROGRESSIVE_BSPLINE] sensitivity weighting: NODAL")
     print("[PROGRESSIVE_BSPLINE] refinement: KNOT_INSERTION")
+    print(
+        "[PROGRESSIVE_BSPLINE] KNOT_DEPTH penalty={} mode={} gamma={} initial_depth={}".format(
+            "YES" if settings.get("knot_depth_penalty", False) else "NO",
+            settings.get("knot_depth_penalty_mode", "NONE"),
+            settings.get("knot_depth_power_gamma", 0.25),
+            settings.get("knot_initial_span_depth", 1),
+        )
+    )
     print("[PROGRESSIVE_BSPLINE] refinement state: INITIAL_MESH_KEEP_DV")
     print(
         "[PROGRESSIVE_BSPLINE] deformation direction: "
@@ -2753,6 +3188,17 @@ def print_startup_summary(settings):
             settings.get("gradient_guard_restart_limit", 2),
         )
     )
+    print(
+        "[PROGRESSIVE_BSPLINE] trust-clip policy: {} legacy_beta_min={} "
+        "severe_beta={} bad_patience={}/{} restart_limit={}".format(
+            settings.get("trust_clip_policy", "OFF"),
+            settings.get("trust_clip_legacy_beta_min", 0.50),
+            settings.get("trust_clip_severe_beta", 0.50),
+            settings.get("trust_clip_bad_patience", 2),
+            settings.get("trust_clip_bad_window", 5),
+            settings.get("trust_clip_restart_limit", 1),
+        )
+    )
 
 
 def _settings_from_args(args):
@@ -2780,6 +3226,10 @@ def _settings_from_args(args):
         "knot_score_mode": args.knot_score_mode,
         "knot_insertions_per_refine": args.knot_insertions_per_refine,
         "knot_min_span_width": args.knot_min_span_width,
+        "knot_depth_penalty": getattr(args, "knot_depth_penalty", False),
+        "knot_depth_penalty_mode": getattr(args, "knot_depth_penalty_mode", "NONE"),
+        "knot_depth_power_gamma": getattr(args, "knot_depth_power_gamma", 0.25),
+        "knot_initial_span_depth": getattr(args, "knot_initial_span_depth", 1),
         "transfer_method": args.transfer_method,
         "transfer_bound_policy": args.transfer_bound_policy,
         "transfer_geometry_abs_tol": args.transfer_geometry_abs_tol,
@@ -2815,7 +3265,16 @@ def _settings_from_args(args):
         "initial_coefficient": getattr(args, "initial_coefficient", 0.0),
         "initial_bound_lower": getattr(args, "initial_bound_lower", -0.01),
         "initial_bound_upper": getattr(args, "initial_bound_upper", 0.01),
-        "initial_class_shape": getattr(args, "initial_class_shape", "sqrt_x_one_minus_x"),
+        "initial_class_shape": getattr(
+            args,
+            "initial_class_shape",
+            "sqrt_x_one_minus_x",
+        ),
+        "initial_class_shape_exponent": getattr(
+            args,
+            "initial_class_shape_exponent",
+            0.5,
+        ),
         "initial_normalize_basis": getattr(args, "initial_normalize_basis", True),
         "initial_normalization_mode": getattr(args, "initial_normalization_mode", "max"),
         "opt_objective": getattr(args, "opt_objective", None),
@@ -2839,6 +3298,22 @@ def _settings_from_args(args):
             "gradient_guard_restart_limit",
             2,
         ),
+        "trust_clip_policy": getattr(args, "trust_clip_policy", "OFF"),
+        "trust_clip_beta_tol": getattr(args, "trust_clip_beta_tol", 1.0e-12),
+        "trust_clip_legacy_beta_min": getattr(
+            args, "trust_clip_legacy_beta_min", 0.50
+        ),
+        "trust_clip_severe_beta": getattr(args, "trust_clip_severe_beta", 0.50),
+        "trust_clip_worsening_tol": getattr(
+            args, "trust_clip_worsening_tol", 0.05
+        ),
+        "trust_clip_soft_gnorm_factor": getattr(
+            args, "trust_clip_soft_gnorm_factor", 20.0
+        ),
+        "trust_clip_bad_patience": getattr(args, "trust_clip_bad_patience", 2),
+        "trust_clip_bad_window": getattr(args, "trust_clip_bad_window", 5),
+        "trust_clip_stag_tol": getattr(args, "trust_clip_stag_tol", 1.0e-6),
+        "trust_clip_restart_limit": getattr(args, "trust_clip_restart_limit", 1),
         "opt_line_search_bound": args.opt_line_search_bound,
         "local_step_limit": args.local_step_limit,
         "local_step_limit_ratio": args.local_step_limit_ratio,
@@ -2873,32 +3348,71 @@ def run_with_gradient_guard_restarts(
     active_modes_start_filename,
     optimized_modes_filename,
     next_action,
+    refinement_available=None,
     restart_limit=2,
+    trust_clip_restart_limit=1,
 ):
-    """Run a level, resetting SLSQP state by reinvoking the optimizer on restart."""
+    """Run a level, resetting SLSQP state after controlled safety stops."""
 
     restart_count = 0
+    trust_clip_restart_count = 0
     restart_limit = int(restart_limit)
+    trust_clip_restart_limit = int(trust_clip_restart_limit)
+    if refinement_available is None:
+        refinement_available = str(next_action) == "refine"
+    refinement_available = bool(refinement_available)
     while True:
         result = run_optimizer(**optimizer_kwargs)
-        if not result.get("gradient_guard_triggered", False):
+        gradient_triggered = result.get("gradient_guard_triggered", False)
+        trust_clip_triggered = result.get("trust_clip_triggered", False)
+        if not gradient_triggered and not trust_clip_triggered:
             break
-        if str(next_action) != "restart_same_level":
-            break
-        if restart_count >= restart_limit:
-            result["gradient_guard_restart_limit_reached"] = True
-            print(
-                "[PROGRESSIVE_BSPLINE] GRADIENT_GUARD restart limit reached; "
-                "terminating successfully with the restored last-safe design"
+        if gradient_triggered:
+            if str(next_action) != "restart_same_level":
+                break
+            if restart_count >= restart_limit:
+                result["gradient_guard_restart_limit_reached"] = True
+                print(
+                    "[PROGRESSIVE_BSPLINE] GRADIENT_GUARD restart limit reached; "
+                    "terminating successfully with the restored best-safe design"
+                )
+                break
+            restart_count += 1
+            label = "GRADIENT_GUARD"
+            count = restart_count
+            limit = restart_limit
+        else:
+            requested_action = str(
+                result.get("trust_clip_next_action", "restart_same_level")
             )
-            break
+            if requested_action == "refine" and refinement_available:
+                result["trust_clip_force_refine"] = True
+                break
+            if trust_clip_restart_count >= trust_clip_restart_limit:
+                result["trust_clip_restart_limit_reached"] = True
+                if refinement_available:
+                    result["trust_clip_force_refine"] = True
+                    result["trust_clip_next_action"] = "refine"
+                print(
+                    "[PROGRESSIVE_BSPLINE] TRUST_CLIP restart limit reached; "
+                    + (
+                        "forcing refinement from best-safe"
+                        if refinement_available
+                        else "terminating successfully with best-safe"
+                    )
+                )
+                break
+            trust_clip_restart_count += 1
+            label = "TRUST_CLIP"
+            count = trust_clip_restart_count
+            limit = trust_clip_restart_limit
         shutil.copy2(optimized_modes_filename, active_modes_start_filename)
-        restart_count += 1
         print(
-            "[PROGRESSIVE_BSPLINE] GRADIENT_GUARD restart_same_level "
-            f"attempt={restart_count}/{restart_limit} from restored last-safe design"
+            f"[PROGRESSIVE_BSPLINE] {label} restart_same_level "
+            f"attempt={count}/{limit} from restored physical design"
         )
     result["gradient_guard_restart_count"] = restart_count
+    result["trust_clip_restart_count"] = trust_clip_restart_count
     return result
 
 
@@ -2972,6 +3486,13 @@ def progressive_bspline_su2_shape_optimization(settings):
             current_reduced_ndv,
             settings.get("nfinal"),
         )
+        refinement_available = (
+            int(level_id) < int(settings["nlevels"]) - 1
+            and (
+                settings.get("nfinal") is None
+                or int(current_reduced_ndv) < int(settings["nfinal"])
+            )
+        )
         optimizer_kwargs = {
             "modes_filename": str(level.active_modes_start_filename),
             "base_mesh": settings["base_mesh"],
@@ -3001,6 +3522,22 @@ def progressive_bspline_su2_shape_optimization(settings):
             "gradient_guard_min_history": settings.get("gradient_guard_min_history", 3),
             "gradient_guard_floor": settings.get("gradient_guard_floor", 1.0e-14),
             "gradient_guard_next_action": gradient_guard_action,
+            "refinement_available": refinement_available,
+            "trust_clip_policy": settings.get("trust_clip_policy", "OFF"),
+            "trust_clip_beta_tol": settings.get("trust_clip_beta_tol", 1.0e-12),
+            "trust_clip_legacy_beta_min": settings.get(
+                "trust_clip_legacy_beta_min", 0.50
+            ),
+            "trust_clip_severe_beta": settings.get("trust_clip_severe_beta", 0.50),
+            "trust_clip_worsening_tol": settings.get(
+                "trust_clip_worsening_tol", 0.05
+            ),
+            "trust_clip_soft_gnorm_factor": settings.get(
+                "trust_clip_soft_gnorm_factor", 20.0
+            ),
+            "trust_clip_bad_patience": settings.get("trust_clip_bad_patience", 2),
+            "trust_clip_bad_window": settings.get("trust_clip_bad_window", 5),
+            "trust_clip_stag_tol": settings.get("trust_clip_stag_tol", 1.0e-6),
             "opt_line_search_bound": settings.get("opt_line_search_bound"),
             "local_step_limit": settings.get("local_step_limit", False),
             "local_step_limit_ratio": settings.get("local_step_limit_ratio", 200.0),
@@ -3024,7 +3561,9 @@ def progressive_bspline_su2_shape_optimization(settings):
             active_modes_start_filename=level.active_modes_start_filename,
             optimized_modes_filename=level.optimized_modes_filename,
             next_action=gradient_guard_action,
+            refinement_available=refinement_available,
             restart_limit=settings.get("gradient_guard_restart_limit", 2),
+            trust_clip_restart_limit=settings.get("trust_clip_restart_limit", 1),
         )
 
         opt_rows = _read_optimization_history(level.opt_workdir)
@@ -3032,7 +3571,8 @@ def progressive_bspline_su2_shape_optimization(settings):
         safe_opt_rows = [
             row
             for row in opt_rows
-            if str(row.get("status", "ok")).strip().lower() == "ok"
+            if str(row.get("status", "ok")).strip().lower()
+            in SAFE_OPTIMIZATION_STATUSES
             and math.isfinite(float(row["_objective"]))
         ]
         adjoint_eval_dir = None
@@ -3061,7 +3601,18 @@ def progressive_bspline_su2_shape_optimization(settings):
             )
         )
         trigger_mode = str(settings["trigger"]).upper()
-        if result.get("gradient_guard_triggered", False):
+        if result.get("trust_clip_triggered", False):
+            diagnostics = result.get("trust_clip_diagnostics") or {}
+            toxic_reasons = diagnostics.get("toxic_reasons") or []
+            refine_requested = bool(result.get("trust_clip_force_refine", False))
+            if "clipped_stagnation_plateau" in toxic_reasons:
+                trigger_reason = "clipped_stagnation_plateau"
+            elif "toxic_clipped_repeated" in toxic_reasons:
+                trigger_reason = "toxic_clipped_plateau"
+            else:
+                trigger_reason = "trust_clip_restart_limit"
+            trigger_counter = 1
+        elif result.get("gradient_guard_triggered", False):
             refine_requested = gradient_guard_action == "refine"
             trigger_reason = "raw_gradient_guard"
             trigger_counter = 1
@@ -3250,6 +3801,14 @@ def _build_arg_parser():
     parser.add_argument("--knot-score-mode", default="VIRTUAL_INSERTION", choices=ALLOWED_KNOT_SCORE_MODES)
     parser.add_argument("--knot-insertions-per-refine", default="1")
     parser.add_argument("--knot-min-span-width", type=float, default=1.0e-8)
+    parser.add_argument("--knot-depth-penalty", action="store_true", default=False)
+    parser.add_argument("--no-knot-depth-penalty", dest="knot_depth_penalty", action="store_false")
+    parser.add_argument("--knot-depth-penalty-mode", default="NONE", choices=KNOT_DEPTH_PENALTY_MODE_CHOICES)
+    parser.add_argument("--knot-depth-power-gamma", type=float, default=0.25)
+    parser.add_argument("--knot-initial-span-depth", type=int, default=1)
+    parser.add_argument("--knot-batch-diversity", dest="knot_depth_penalty", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--knot-batch-penalty-mode", dest="knot_depth_penalty_mode", choices=KNOT_DEPTH_PENALTY_MODE_CHOICES, help=argparse.SUPPRESS)
+    parser.add_argument("--knot-batch-power-gamma", dest="knot_depth_power_gamma", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--transfer-method", default="BOEHM")
     parser.add_argument("--transfer-bound-policy", default="ERROR")
     parser.add_argument("--transfer-geometry-abs-tol", type=float, default=1.0e-10)
@@ -3286,6 +3845,7 @@ def _build_arg_parser():
     parser.add_argument("--initial-bound-lower", type=float, default=-0.01)
     parser.add_argument("--initial-bound-upper", type=float, default=0.01)
     parser.add_argument("--initial-class-shape", default="sqrt_x_one_minus_x")
+    parser.add_argument("--initial-class-shape-exponent", type=float, default=0.5)
     parser.add_argument("--initial-normalize-basis", default=True)
     parser.add_argument("--initial-normalization-mode", default="max")
     parser.add_argument("--dry-run", action="store_true")
@@ -3311,6 +3871,20 @@ def _build_arg_parser():
     parser.add_argument("--gradient-guard-min-history", type=int, default=3)
     parser.add_argument("--gradient-guard-floor", type=float, default=1.0e-14)
     parser.add_argument("--gradient-guard-restart-limit", type=int, default=2)
+    parser.add_argument(
+        "--trust-clip-policy",
+        default="OFF",
+        choices=("OFF", "ACCEPT_RESTART"),
+    )
+    parser.add_argument("--trust-clip-beta-tol", type=float, default=1.0e-12)
+    parser.add_argument("--trust-clip-legacy-beta-min", type=float, default=0.50)
+    parser.add_argument("--trust-clip-severe-beta", type=float, default=0.50)
+    parser.add_argument("--trust-clip-worsening-tol", type=float, default=0.05)
+    parser.add_argument("--trust-clip-soft-gnorm-factor", type=float, default=20.0)
+    parser.add_argument("--trust-clip-bad-patience", type=int, default=2)
+    parser.add_argument("--trust-clip-bad-window", type=int, default=5)
+    parser.add_argument("--trust-clip-stag-tol", type=float, default=1.0e-6)
+    parser.add_argument("--trust-clip-restart-limit", type=int, default=1)
     parser.add_argument("--opt-line-search-bound", type=float, default=None)
     parser.add_argument("--local-step-limit", action="store_true", default=False)
     parser.add_argument("--local-step-limit-ratio", type=float, default=200.0)

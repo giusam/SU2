@@ -230,13 +230,18 @@ def validate_mode_spec(spec):
 
     if not isinstance(spec.get("normal_displacement", True), bool):
         raise BSplineModeError("normal_displacement must be a JSON boolean")
-    if str(spec.get("class_shape", "sqrt_x_one_minus_x")).strip().lower() not in (
+    class_shape = str(spec.get("class_shape", "sqrt_x_one_minus_x")).strip().lower()
+    if class_shape not in (
         "sqrt_x_one_minus_x",
         "none",
     ):
         raise BSplineModeError(
             "class_shape must be 'sqrt_x_one_minus_x' or 'none'"
         )
+    if class_shape != "none":
+        alpha = _as_float(spec.get("class_shape_exponent", 0.5), "class_shape_exponent")
+        if alpha < 0.0:
+            raise BSplineModeError("class_shape_exponent must be >= 0")
     if not isinstance(spec.get("normalize_basis", True), bool):
         raise BSplineModeError("normalize_basis must be a JSON boolean")
     if str(spec.get("normalization_mode", "max")).strip().lower() != "max":
@@ -303,23 +308,21 @@ def clamped_basis_value(x, degree, knot_vector, basis_index):
     return cox_de_boor_basis(x, degree, knot_vector, basis_index)
 
 
-def class_shape_factor(x, class_shape="sqrt_x_one_minus_x"):
+def class_shape_factor(x, class_shape="sqrt_x_one_minus_x", class_shape_exponent=0.5):
     class_shape = str(class_shape or "sqrt_x_one_minus_x").strip().lower()
     if class_shape == "none":
         return 1.0
     if class_shape != "sqrt_x_one_minus_x":
         raise BSplineModeError(f"Unsupported class_shape {class_shape!r}")
+    alpha = _as_float(class_shape_exponent, "class_shape_exponent")
+    if not math.isfinite(alpha) or alpha < 0.0:
+        raise BSplineModeError("class_shape_exponent must be finite and >= 0")
 
     x = float(x)
     if x <= 0.0 or x >= 1.0:
         return 0.0
 
-    # Regularized replacement for the original sqrt(x) * (1 - x).
-    # It keeps the public class_shape name unchanged for compatibility,
-    # but behaves as O(x) at the leading edge, preserving the vertical
-    # LE tangent while recovering a sqrt-like profile away from x=0.
-    eps = 1.0e-2
-    return x * (1.0 - x) / math.sqrt(x + eps)
+    return (x ** alpha) * (1.0 - x)
 
 
 def normalize_deformation_direction_mode(value=None, le_safe_direction=False):
@@ -516,6 +519,7 @@ def _mode_characteristic_samples(mode, left, right):
 def mode_normalization_factor(
     mode,
     class_shape="sqrt_x_one_minus_x",
+    class_shape_exponent=0.5,
     normalization_samples=DEFAULT_NORMALIZATION_SAMPLES,
 ):
     if "normalization_factor" in mode:
@@ -532,7 +536,11 @@ def mode_normalization_factor(
     for x in samples:
         value = mode_basis_value(mode, x)
         if use_class_shape:
-            value *= class_shape_factor(x, class_shape)
+            value *= class_shape_factor(
+                x,
+                class_shape,
+                class_shape_exponent=class_shape_exponent,
+            )
         max_abs = max(max_abs, abs(value))
 
     return max_abs if max_abs > 0.0 else 1.0
@@ -555,6 +563,7 @@ def evaluate_mode_values(
     mode,
     x_over_c,
     class_shape="sqrt_x_one_minus_x",
+    class_shape_exponent=0.5,
     normalize=True,
     normalization_mode="max",
     normalization_samples=DEFAULT_NORMALIZATION_SAMPLES,
@@ -566,7 +575,11 @@ def evaluate_mode_values(
     for x in x_over_c:
         value = mode_basis_value(mode, x)
         if use_class_shape:
-            value *= class_shape_factor(x, class_shape)
+            value *= class_shape_factor(
+                x,
+                class_shape,
+                class_shape_exponent=class_shape_exponent,
+            )
         values.append(value)
 
     if normalize:
@@ -575,6 +588,7 @@ def evaluate_mode_values(
         factor = mode_normalization_factor(
             mode,
             class_shape=class_shape,
+            class_shape_exponent=class_shape_exponent,
             normalization_samples=normalization_samples,
         )
         if factor > 0.0:
@@ -595,6 +609,7 @@ def evaluate_all_modes(spec, x_over_c, sides=None):
             raise BSplineModeError("sides must have the same length as x_over_c")
 
     class_shape = spec.get("class_shape", "sqrt_x_one_minus_x")
+    class_shape_exponent = spec.get("class_shape_exponent", 0.5)
     normalize = bool(spec.get("normalize_basis", True))
     normalization_mode = spec.get("normalization_mode", "max")
 
@@ -606,6 +621,7 @@ def evaluate_all_modes(spec, x_over_c, sides=None):
             mode,
             x_values,
             class_shape=class_shape,
+            class_shape_exponent=class_shape_exponent,
             normalize=normalize,
             normalization_mode=normalization_mode,
         )

@@ -13,6 +13,7 @@ from SU2.opt.bspline_su2_driver import (
     BSplineSU2Driver,
     BSplineSU2DriverError,
     GradientGuardStop,
+    TrustClipStop,
     _build_arg_parser,
     active_bounds,
     active_coefficient_vector,
@@ -22,6 +23,7 @@ from SU2.opt.bspline_su2_driver import (
     build_eval_paths,
     build_reduced_variables,
     cache_key,
+    classify_clipped_trial,
     collapse_full_gradient,
     collapse_full_jacobian,
     compute_geometry_aware_bound_scaling,
@@ -284,6 +286,235 @@ def test_small_beta_does_not_mask_raw_gradient_explosion():
     assert info["ratio"] == pytest.approx(101.0)
 
 
+def _clip_entry(beta=1.0, objective=0.9, gnorm_raw=1.0, eval_id=1):
+    return {
+        "eval_id": eval_id,
+        "objective": objective,
+        "beta_eff": beta,
+        "was_clipped": beta < 1.0,
+        "gnorm_raw": gnorm_raw,
+        "gnorm_opt": beta * gnorm_raw,
+        "evaluated_x": [0.0, 0.0],
+        "modes_file": None,
+    }
+
+
+def _safe_clip_reference(objective=1.0, eval_id=0):
+    return _clip_entry(beta=1.0, objective=objective, gnorm_raw=1.0, eval_id=eval_id)
+
+
+def test_trust_clip_classifies_normal_unclipped_evaluation():
+    classification, diagnostics = classify_clipped_trial(
+        _clip_entry(beta=1.0),
+        [1.0],
+        _safe_clip_reference(),
+        _safe_clip_reference(),
+        [],
+    )
+
+    assert classification == "not_clipped"
+    assert diagnostics["clipped"] is False
+
+
+def test_trust_clip_unclipped_status_remains_ok(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+
+    assert driver._trust_clip_status("not_clipped") == "ok"
+
+
+def test_trust_clip_classifies_benign_moderate_improving_clip():
+    classification, diagnostics = classify_clipped_trial(
+        _clip_entry(beta=0.636, objective=0.9),
+        [1.0, 1.0, 1.0],
+        _safe_clip_reference(),
+        _safe_clip_reference(),
+        [],
+    )
+
+    assert classification == "benign_clipped_legacy"
+    assert diagnostics["significant_improvement"] is True
+
+
+def test_trust_clip_moderate_beta_alone_does_not_hide_worsening():
+    classification, diagnostics = classify_clipped_trial(
+        _clip_entry(beta=0.8, objective=1.1),
+        [1.0, 1.0, 1.0],
+        _safe_clip_reference(),
+        _safe_clip_reference(),
+        [],
+    )
+
+    assert classification == "rejected_toxic_clip"
+    assert "worsening_vs_best_safe" in diagnostics["toxic_reasons"]
+
+
+def test_trust_clip_classifies_useful_severe_clip_for_restart():
+    classification, diagnostics = classify_clipped_trial(
+        _clip_entry(beta=0.4, objective=0.9),
+        [1.0, 1.0, 1.0],
+        _safe_clip_reference(),
+        _safe_clip_reference(),
+        [],
+    )
+
+    assert classification == "accepted_clipped_restart"
+    assert diagnostics["toxic_reasons"] == []
+
+
+def test_trust_clip_rejects_soft_raw_gradient_explosion():
+    classification, diagnostics = classify_clipped_trial(
+        _clip_entry(beta=0.8, objective=0.9, gnorm_raw=21.0),
+        [1.0, 1.0, 1.0],
+        _safe_clip_reference(),
+        _safe_clip_reference(),
+        [],
+    )
+
+    assert classification == "rejected_toxic_clip"
+    assert "soft_raw_gradient_ratio" in diagnostics["toxic_reasons"]
+
+
+def test_trust_clip_repeated_toxic_detection_uses_sliding_window():
+    events = [
+        {"toxic": True, "clipped": True},
+        {"toxic": False, "clipped": False},
+    ]
+    classification, diagnostics = classify_clipped_trial(
+        _clip_entry(beta=0.8, objective=1.1),
+        [1.0, 1.0, 1.0],
+        _safe_clip_reference(),
+        _safe_clip_reference(),
+        events,
+    )
+
+    assert classification == "rejected_toxic_clip"
+    assert "toxic_clipped_repeated" in diagnostics["toxic_reasons"]
+
+
+def test_trust_clip_repeated_weak_improvements_form_stagnation_plateau():
+    events = [
+        {"clipped": True, "weak_improvement": True, "toxic": False},
+    ]
+    classification, diagnostics = classify_clipped_trial(
+        _clip_entry(beta=0.8, objective=1.0 - 1.0e-7),
+        [1.0, 1.0, 1.0],
+        _safe_clip_reference(),
+        _safe_clip_reference(),
+        events,
+    )
+
+    assert classification == "rejected_toxic_clip"
+    assert "clipped_stagnation_plateau" in diagnostics["toxic_reasons"]
+
+
+def test_trust_clip_single_weak_improvement_is_observed_without_rejection():
+    classification, diagnostics = classify_clipped_trial(
+        _clip_entry(beta=0.8, objective=1.0 - 1.0e-7),
+        [1.0, 1.0, 1.0],
+        _safe_clip_reference(),
+        _safe_clip_reference(),
+        [],
+    )
+
+    assert classification == "weak_clipped_progress"
+    assert diagnostics["weak_improvement"] is True
+    assert diagnostics["clipped_stagnation_plateau"] is False
+
+
+def test_trust_clip_objective_ratios_use_objective_floor_not_gnorm_floor():
+    entry = _clip_entry(beta=0.8, objective=-1.0e-13)
+    best = _safe_clip_reference(objective=0.0)
+    anchor = _safe_clip_reference(objective=0.0)
+
+    _classification, diagnostics = classify_clipped_trial(
+        entry,
+        [1.0e-8, 1.0e-8, 1.0e-8],
+        best,
+        anchor,
+        [],
+        options={"objective_floor": 1.0e-6, "gnorm_floor": 1.0e-2},
+    )
+    _classification_changed, diagnostics_changed = classify_clipped_trial(
+        entry,
+        [1.0e-8, 1.0e-8, 1.0e-8],
+        best,
+        anchor,
+        [],
+        options={"objective_floor": 1.0e-6, "gnorm_floor": 1.0e-20},
+    )
+
+    assert diagnostics["improvement_rel"] == pytest.approx(1.0e-7)
+    assert diagnostics["relative_worsening"] == pytest.approx(-1.0e-7)
+    assert diagnostics["improvement_rel"] == pytest.approx(
+        diagnostics_changed["improvement_rel"]
+    )
+    assert diagnostics["relative_worsening"] == pytest.approx(
+        diagnostics_changed["relative_worsening"]
+    )
+
+
+def test_trust_clip_gnorm_reference_uses_gnorm_floor_not_objective_floor():
+    entry = _clip_entry(beta=0.8, objective=0.9, gnorm_raw=1.0e-8)
+
+    _classification, diagnostics = classify_clipped_trial(
+        entry,
+        [1.0e-20, 1.0e-20, 1.0e-20],
+        _safe_clip_reference(),
+        _safe_clip_reference(),
+        [],
+        options={"objective_floor": 1.0e-1, "gnorm_floor": 1.0e-6},
+    )
+    _classification_changed, diagnostics_changed = classify_clipped_trial(
+        entry,
+        [1.0e-20, 1.0e-20, 1.0e-20],
+        _safe_clip_reference(),
+        _safe_clip_reference(),
+        [],
+        options={"objective_floor": 1.0e-20, "gnorm_floor": 1.0e-6},
+    )
+
+    assert diagnostics["gnorm_reference"] == pytest.approx(1.0e-6)
+    assert diagnostics["gnorm_ratio"] == pytest.approx(1.0e-2)
+    assert diagnostics["gnorm_reference"] == pytest.approx(
+        diagnostics_changed["gnorm_reference"]
+    )
+    assert diagnostics["gnorm_ratio"] == pytest.approx(
+        diagnostics_changed["gnorm_ratio"]
+    )
+
+
+def test_trust_clip_cd_scale_objective_ratios_ignore_floor():
+    entry = _clip_entry(beta=0.8, objective=0.0095)
+    best = _safe_clip_reference(objective=0.0100)
+    anchor = _safe_clip_reference(objective=0.0100)
+
+    _classification_a, diagnostics_a = classify_clipped_trial(
+        entry,
+        [1.0, 1.0, 1.0],
+        best,
+        anchor,
+        [],
+        options={"objective_floor": 1.0e-12, "gnorm_floor": 1.0e-14},
+    )
+    _classification_b, diagnostics_b = classify_clipped_trial(
+        entry,
+        [1.0, 1.0, 1.0],
+        best,
+        anchor,
+        [],
+        options={"objective_floor": 1.0e-20, "gnorm_floor": 1.0e-14},
+    )
+
+    assert diagnostics_a["improvement_rel"] == pytest.approx(0.05)
+    assert diagnostics_a["relative_worsening"] == pytest.approx(-0.05)
+    assert diagnostics_a["improvement_rel"] == pytest.approx(
+        diagnostics_b["improvement_rel"]
+    )
+    assert diagnostics_a["relative_worsening"] == pytest.approx(
+        diagnostics_b["relative_worsening"]
+    )
+
+
 def test_guard_rollback_restores_last_safe_modes_and_rejects_bad_state(tmp_path):
     driver = _make_driver(
         tmp_path,
@@ -360,6 +591,369 @@ def test_gradient_entry_logs_raw_and_actual_optimizer_norm_separately(tmp_path):
 
     assert entry["gnorm_raw"] == pytest.approx(5.0)
     assert entry["gnorm_opt"] == pytest.approx(0.3)
+
+
+def test_benign_clip_keeps_frozen_beta_optimizer_gradient_scaling(tmp_path):
+    driver = _make_driver(
+        tmp_path,
+        opt_relax_factor=2.0,
+        opt_gradient_factor=3.0,
+        trust_clip_policy="ACCEPT_RESTART",
+    )
+
+    gradient = driver._optimizer_gradient_for_logging(
+        [3.0, 4.0],
+        {"line_search_beta": 0.6},
+    )
+
+    assert gradient == pytest.approx([10.8, 14.4])
+
+
+def test_accepted_clipped_restart_is_not_best_safe_during_evaluation(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    old_safe = _safe_clip_reference(objective=1.0)
+    accepted = _clip_entry(beta=0.4, objective=0.8, eval_id=2)
+    driver._promote_safe_entry(old_safe)
+
+    classification, _diagnostics = driver._classify_trust_clip_entry(accepted)
+
+    assert classification == "accepted_clipped_restart"
+    assert driver.best_safe_entry is old_safe
+    assert driver.last_safe_entry is old_safe
+
+
+def test_accepted_clipped_restart_becomes_best_safe_in_matching_callback(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    modes_file = tmp_path / "accepted_modes.json"
+    modes_file.write_text(json.dumps(update_mode_coefficients(driver.mode_spec, [0.0, 0.0])))
+    old_safe = _safe_clip_reference(objective=1.0)
+    accepted = dict(
+        _clip_entry(beta=0.4, objective=0.8, eval_id=2),
+        modes_file=modes_file,
+    )
+    driver._promote_safe_entry(old_safe)
+    classification, diagnostics = driver._classify_trust_clip_entry(accepted)
+    requested = [0.0, 0.0]
+    driver._trust_clip_by_requested_key[driver._pending_trust_clip_key(requested)] = {
+        "classification": classification,
+        "diagnostics": diagnostics,
+        "entry": accepted,
+        "result": {},
+    }
+
+    with pytest.raises(TrustClipStop) as exc_info:
+        driver._trust_clip_callback(requested)
+
+    assert classification == "accepted_clipped_restart"
+    assert driver.best_safe_entry is accepted
+    assert driver.last_safe_entry is accepted
+    assert exc_info.value.rollback_entry is accepted
+
+
+def test_internal_accepted_clipped_trial_never_promotes_without_callback(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    old_safe = _safe_clip_reference(objective=1.0)
+    accepted = _clip_entry(beta=0.4, objective=0.8, eval_id=2)
+    driver._promote_safe_entry(old_safe)
+    classification, diagnostics = driver._classify_trust_clip_entry(accepted)
+    requested = [0.0, 0.0]
+    driver._trust_clip_by_requested_key[driver._pending_trust_clip_key(requested)] = {
+        "classification": classification,
+        "diagnostics": diagnostics,
+        "entry": accepted,
+        "result": {},
+    }
+
+    driver._trust_clip_callback([0.1, 0.1])
+
+    assert driver.best_safe_entry is old_safe
+    assert driver.last_safe_entry is old_safe
+    assert driver._trust_clip_by_requested_key == {}
+
+
+def test_rejected_toxic_clip_is_not_promoted_as_best_safe(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    old_safe = _safe_clip_reference(objective=1.0)
+    toxic = _clip_entry(beta=0.8, objective=1.2, eval_id=2)
+    driver._promote_safe_entry(old_safe)
+
+    classification, _diagnostics = driver._classify_trust_clip_entry(toxic)
+
+    assert classification == "rejected_toxic_clip"
+    assert driver.best_safe_entry is old_safe
+    assert driver.last_safe_entry is old_safe
+
+
+def test_hard_gradient_guard_rollback_prefers_best_safe_over_last_safe(tmp_path):
+    driver = _make_driver(tmp_path, gradient_guard_factor=100.0)
+    best_file = tmp_path / "best.json"
+    last_file = tmp_path / "last.json"
+    best_file.write_text(json.dumps(update_mode_coefficients(driver.mode_spec, [0.001, 0.001])))
+    last_file.write_text(json.dumps(update_mode_coefficients(driver.mode_spec, [0.002, 0.002])))
+    best = dict(_safe_clip_reference(objective=0.5, eval_id=1), modes_file=best_file)
+    last = dict(_safe_clip_reference(objective=0.8, eval_id=2), modes_file=last_file)
+    driver.best_safe_entry = best
+    driver.last_safe_entry = last
+    driver.recent_safe_raw_gnorms.extend([1.0, 1.0, 1.0])
+
+    with pytest.raises(GradientGuardStop) as exc_info:
+        driver.register_gradient_entry(_clip_entry(gnorm_raw=101.0, eval_id=3))
+
+    assert exc_info.value.last_safe_entry is best
+    assert json.loads(driver.optimized_modes_filename.read_text()) == json.loads(
+        best_file.read_text()
+    )
+
+
+def test_trust_clip_stop_requires_matching_requested_x_and_anchor(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    modes_file = tmp_path / "accepted_modes.json"
+    modes_file.write_text(json.dumps(update_mode_coefficients(driver.mode_spec, [0.0, 0.0])))
+    entry = dict(
+        _clip_entry(beta=0.4, objective=0.8, eval_id=2),
+        modes_file=modes_file,
+    )
+    driver._promote_safe_entry(_safe_clip_reference(objective=1.0))
+    classification, diagnostics = driver._classify_trust_clip_entry(entry)
+    assert classification == "accepted_clipped_restart"  # Trial classification itself does not stop.
+    requested = [0.0, 0.0]
+    driver._trust_clip_by_requested_key[driver._pending_trust_clip_key(requested)] = {
+        "classification": classification,
+        "diagnostics": diagnostics,
+        "entry": entry,
+        "result": {},
+    }
+
+    driver._trust_clip_callback([0.1, 0.1])  # unrelated accepted iterate
+    driver._trust_clip_callback(requested)  # same requested x, different anchor
+
+    assert driver._trust_clip_by_requested_key == {}
+    assert driver.best_safe_entry["objective"] == pytest.approx(1.0)
+
+
+def test_trust_clip_policy_off_preserves_legacy_callback_behavior(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="OFF")
+
+    assert driver._trust_clip_enabled() is False
+    driver._trust_clip_callback([0.0, 0.0])
+
+
+def test_toxic_trust_clip_stop_rolls_callback_back_to_best_safe(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    best_file = tmp_path / "best_modes.json"
+    best_file.write_text(json.dumps(update_mode_coefficients(driver.mode_spec, [0.001, -0.001])))
+    best = dict(_safe_clip_reference(objective=0.5, eval_id=1), modes_file=best_file)
+    driver.best_safe_entry = best
+    driver.last_safe_entry = _safe_clip_reference(objective=0.8, eval_id=2)
+    toxic = _clip_entry(beta=0.8, objective=1.2, eval_id=3)
+    classification, diagnostics = driver._classify_trust_clip_entry(toxic)
+    requested = [0.0, 0.0]
+    driver._trust_clip_by_requested_key[driver._pending_trust_clip_key(requested)] = {
+        "classification": classification,
+        "diagnostics": diagnostics,
+        "entry": toxic,
+        "result": {},
+    }
+
+    with pytest.raises(TrustClipStop) as exc_info:
+        driver._trust_clip_callback(requested)
+
+    assert classification == "rejected_toxic_clip"
+    assert exc_info.value.rollback_entry is best
+
+
+def test_pending_trust_clip_key_includes_line_search_anchor(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    requested = [0.0, 0.0]
+
+    key_at_initial_anchor = driver._pending_trust_clip_key(requested)
+    driver._line_search_anchor_physical = [0.1, 0.0]
+    key_at_new_anchor = driver._pending_trust_clip_key(requested)
+
+    assert key_at_initial_anchor[0] == key_at_new_anchor[0]
+    assert key_at_initial_anchor[1] != key_at_new_anchor[1]
+
+
+def test_pending_trust_clip_evaluation_get_preserves_func_fprime_sharing(tmp_path, monkeypatch):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    calls = []
+
+    def fake_evaluate(coefficients, line_search_info=None):
+        calls.append(list(coefficients))
+        return {
+            "eval_id": len(calls),
+            "objective": 1.0,
+            "gradient": [1.0, 0.0],
+            "coefficients": list(coefficients),
+            "status": "ok",
+        }
+
+    monkeypatch.setattr(driver, "evaluate", fake_evaluate)
+
+    first, _info = driver._evaluate_optimizer_variables([0.0, 0.0])
+    pending_key = driver._pending_trust_clip_key([0.0, 0.0])
+    driver._trust_clip_by_requested_key[pending_key] = {
+        "classification": "weak_clipped_progress",
+        "diagnostics": {},
+        "entry": _clip_entry(beta=0.8, objective=1.0, eval_id=1),
+        "result": first,
+    }
+
+    second, _info = driver._evaluate_optimizer_variables([0.0, 0.0])
+    third, _info = driver._evaluate_optimizer_variables([0.0, 0.0])
+
+    assert first is second is third
+    assert calls == [[0.0, 0.0]]
+    assert pending_key in driver._trust_clip_by_requested_key
+
+
+def test_pending_trust_clip_anchor_mismatch_does_not_reuse_old_result(tmp_path, monkeypatch):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    calls = []
+
+    def fake_evaluate(coefficients, line_search_info=None):
+        calls.append(list(coefficients))
+        return {
+            "eval_id": len(calls),
+            "objective": float(len(calls)),
+            "gradient": [1.0, 0.0],
+            "coefficients": list(coefficients),
+            "status": "ok",
+        }
+
+    monkeypatch.setattr(driver, "evaluate", fake_evaluate)
+    requested = [0.0, 0.0]
+    old_key = driver._pending_trust_clip_key(requested)
+    driver._trust_clip_by_requested_key[old_key] = {
+        "classification": "accepted_clipped_restart",
+        "diagnostics": {},
+        "entry": _clip_entry(beta=0.4, objective=0.8, eval_id=1),
+        "result": {"eval_id": 99, "objective": 99.0, "gradient": [0.0, 0.0]},
+    }
+
+    driver._line_search_anchor_physical = [0.1, 0.0]
+    result, _info = driver._evaluate_optimizer_variables(requested)
+
+    assert result["eval_id"] == 1
+    assert calls == [[0.0, 0.0]]
+
+
+def test_stale_pending_entry_cannot_trigger_callback_stop_after_anchor_change(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    old_safe = _safe_clip_reference(objective=1.0)
+    driver._promote_safe_entry(old_safe)
+    accepted = _clip_entry(beta=0.4, objective=0.8, eval_id=2)
+    requested = [0.0, 0.0]
+    driver._trust_clip_by_requested_key[driver._pending_trust_clip_key(requested)] = {
+        "classification": "accepted_clipped_restart",
+        "diagnostics": {},
+        "entry": accepted,
+        "result": {},
+    }
+    driver._line_search_anchor_physical = [0.1, 0.0]
+
+    driver._trust_clip_callback(requested)
+
+    assert driver.best_safe_entry is old_safe
+    assert driver._trust_clip_by_requested_key == {}
+
+
+def test_stale_toxic_pending_entry_cannot_trigger_callback_stop_after_anchor_change(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    old_safe = _safe_clip_reference(objective=1.0)
+    driver._promote_safe_entry(old_safe)
+    requested = [0.0, 0.0]
+    driver._trust_clip_by_requested_key[driver._pending_trust_clip_key(requested)] = {
+        "classification": "rejected_toxic_clip",
+        "diagnostics": {"toxic_reasons": ["worsening_vs_best_safe"]},
+        "entry": _clip_entry(beta=0.8, objective=1.2, eval_id=2),
+        "result": {},
+    }
+    driver._line_search_anchor_physical = [0.1, 0.0]
+
+    driver._trust_clip_callback(requested)
+
+    assert driver.best_safe_entry is old_safe
+    assert driver._trust_clip_by_requested_key == {}
+
+
+def test_pending_map_prunes_stale_entries_without_clearing_current_anchor(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    requested = [0.0, 0.0]
+    old_key = driver._pending_trust_clip_key(requested)
+    driver._line_search_anchor_physical = [0.1, 0.0]
+    current_key = driver._pending_trust_clip_key(requested)
+    driver._trust_clip_by_requested_key[old_key] = {"result": "old"}
+    driver._trust_clip_by_requested_key[current_key] = {"result": "current"}
+
+    driver._prune_stale_trust_clip_pending()
+
+    assert old_key not in driver._trust_clip_by_requested_key
+    assert driver._trust_clip_by_requested_key[current_key]["result"] == "current"
+
+
+def test_weak_clipped_progress_is_best_safe_by_objective_but_not_recent_safe(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    old_safe = _safe_clip_reference(objective=1.0)
+    weak = _clip_entry(beta=0.8, objective=1.0 - 1.0e-7, eval_id=2)
+    driver._promote_safe_entry(old_safe)
+    classification, diagnostics = driver._classify_trust_clip_entry(weak)
+
+    driver._promote_safe_entry(weak, update_recent_raw_gnorm=False)
+
+    assert classification == "weak_clipped_progress"
+    assert "weak_clipped_progress" in diagnostics["accepted_reasons"]
+    assert driver.best_safe_entry is weak
+    assert list(driver.recent_safe_raw_gnorms) == [1.0]
+
+
+def test_weak_clipped_progress_not_best_safe_when_objective_is_not_lower(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    old_safe = _safe_clip_reference(objective=1.0)
+    weak = _clip_entry(beta=0.8, objective=1.0, eval_id=2)
+    driver._promote_safe_entry(old_safe)
+
+    driver._promote_safe_entry(weak, update_recent_raw_gnorm=False)
+
+    assert driver.best_safe_entry is old_safe
+    assert driver.last_safe_entry is weak
+
+
+def test_rejected_statuses_are_not_best_safe_or_cache_ok(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    old_safe = _safe_clip_reference(objective=1.0)
+    driver._promote_safe_entry(old_safe)
+    toxic = _clip_entry(beta=0.8, objective=1.2, eval_id=2)
+    toxic_class, _diagnostics = driver._classify_trust_clip_entry(toxic)
+    guard = _clip_entry(beta=1.0, objective=0.4, gnorm_raw=101.0, eval_id=3)
+    driver.recent_safe_raw_gnorms.extend([1.0, 1.0, 1.0])
+
+    with pytest.raises(GradientGuardStop):
+        driver.register_gradient_entry(guard)
+
+    assert toxic_class == "rejected_toxic_clip"
+    assert driver.best_safe_entry is old_safe
+    assert driver._best_ok_history_record() is None
+
+
+def test_best_ok_history_allows_weak_but_not_rejected_or_failed_rows(tmp_path):
+    driver = _make_driver(tmp_path, trust_clip_policy="ACCEPT_RESTART")
+    for eval_id, objective, status in (
+        (1, 0.1, "rejected_toxic_clip"),
+        (2, 0.2, "rejected_gradient_guard"),
+        (3, 0.3, "failed"),
+        (4, 0.8, "ok"),
+        (5, 0.5, "ok_clipped_weak"),
+    ):
+        driver._append_history_record(
+            eval_id,
+            objective,
+            driver.initial_coefficients,
+            [0.0] * len(driver.mode_ids),
+            status,
+        )
+
+    assert driver._best_ok_history_record()["eval_id"] == 5
 
 
 def test_slsqp_guard_stop_returns_success_with_restored_safe_design(
@@ -1179,6 +1773,62 @@ def test_driver_config_maps_gradient_guard_options():
     }
 
 
+def test_driver_config_maps_knot_batch_penalty_options():
+    options = fixed_driver_options_from_config(
+        {
+            "BSPLINE_KNOT_BATCH_DIVERSITY": "YES",
+            "BSPLINE_KNOT_BATCH_PENALTY_MODE": "POWER",
+            "BSPLINE_KNOT_BATCH_POWER_GAMMA": 0.25,
+        }
+    )
+
+    assert options == {
+        "knot_batch_diversity": "YES",
+        "knot_batch_penalty_mode": "POWER",
+        "knot_batch_power_gamma": 0.25,
+    }
+
+
+def test_driver_config_maps_knot_depth_penalty_options():
+    options = fixed_driver_options_from_config(
+        {
+            "BSPLINE_KNOT_DEPTH_PENALTY": "YES",
+            "BSPLINE_KNOT_DEPTH_PENALTY_MODE": "POWER",
+            "BSPLINE_KNOT_DEPTH_POWER_GAMMA": 0.25,
+            "BSPLINE_KNOT_INITIAL_SPAN_DEPTH": 1,
+        }
+    )
+
+    assert options == {
+        "knot_depth_penalty": "YES",
+        "knot_depth_penalty_mode": "POWER",
+        "knot_depth_power_gamma": 0.25,
+        "knot_initial_span_depth": 1,
+    }
+
+
+def test_driver_config_maps_experimental_trust_clip_options():
+    options = fixed_driver_options_from_config(
+        {
+            "BSPLINE_TRUST_CLIP_POLICY": "ACCEPT_RESTART",
+            "BSPLINE_TRUST_CLIP_BETA_TOL": 1.0e-10,
+            "BSPLINE_TRUST_CLIP_LEGACY_BETA_MIN": 0.6,
+            "BSPLINE_TRUST_CLIP_SEVERE_BETA": 0.4,
+            "BSPLINE_TRUST_CLIP_WORSENING_TOL": 0.08,
+            "BSPLINE_TRUST_CLIP_SOFT_GNORM_FACTOR": 25.0,
+            "BSPLINE_TRUST_CLIP_BAD_PATIENCE": 3,
+            "BSPLINE_TRUST_CLIP_BAD_WINDOW": 7,
+            "BSPLINE_TRUST_CLIP_STAG_TOL": 2.0e-6,
+            "BSPLINE_TRUST_CLIP_RESTART_LIMIT": 2,
+        }
+    )
+
+    assert options["trust_clip_policy"] == "ACCEPT_RESTART"
+    assert options["trust_clip_legacy_beta_min"] == pytest.approx(0.6)
+    assert options["trust_clip_bad_window"] == 7
+    assert options["trust_clip_restart_limit"] == 2
+
+
 def test_command_builder_keeps_legacy_le_safe_activation(tmp_path):
     paths = build_eval_paths(tmp_path / "eval_0000")
     command = build_eval_commands(
@@ -1301,6 +1951,13 @@ def test_optimization_history_includes_counter_and_limiter_columns(tmp_path):
         "local_step_limiting_mode",
         "local_step_da",
         "local_step_limit",
+        "trust_clip_class",
+        "trust_clip_action",
+        "trust_clip_beta",
+        "trust_clip_improvement_rel",
+        "trust_clip_relative_worsening",
+        "trust_clip_gnorm_ratio",
+        "trust_clip_reasons",
         "status",
     ):
         assert field in reader.fieldnames

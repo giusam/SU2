@@ -66,7 +66,214 @@ class GradientGuardStop(RuntimeError):
         self.last_safe_entry = last_safe_entry
         self.bad_entry = bad_entry
         self.guard_info = guard_info or {}
-        super().__init__("Raw-gradient guard stop: rollback to last safe evaluation")
+        super().__init__("Raw-gradient guard stop: rollback to best safe evaluation")
+
+
+class TrustClipStop(RuntimeError):
+    def __init__(self, classification, entry, rollback_entry, diagnostics=None, action=None):
+        self.classification = str(classification)
+        self.entry = entry
+        self.rollback_entry = rollback_entry
+        self.diagnostics = diagnostics or {}
+        self.action = str(action or "restart_same_level")
+        super().__init__(
+            f"Trust-clip stop: {self.classification}; action={self.action}"
+        )
+
+
+SAFE_EVALUATION_STATUSES = {
+    "ok",
+    "ok_clipped_benign",
+    "ok_clipped_weak",
+    "benign_clipped_legacy",
+}
+
+ALLOWED_TRUST_CLIP_POLICIES = ("OFF", "ACCEPT_RESTART")
+
+
+def _trust_clip_options(options=None):
+    defaults = {
+        "policy": "ACCEPT_RESTART",
+        "beta_tol": 1.0e-12,
+        "legacy_beta_min": 0.50,
+        "severe_beta": 0.50,
+        "worsening_tol": 0.05,
+        "soft_gnorm_factor": 20.0,
+        "bad_patience": 2,
+        "bad_window": 5,
+        "stag_tol": 1.0e-6,
+        "gnorm_floor": 1.0e-14,
+        "objective_floor": 1.0e-12,
+    }
+    defaults.update(dict(options or {}))
+    defaults["policy"] = str(defaults["policy"]).strip().upper()
+    return defaults
+
+
+def classify_clipped_trial(
+    entry,
+    recent_safe_raw_gnorms,
+    best_safe_entry,
+    anchor_entry,
+    recent_level_clip_events,
+    options=None,
+):
+    """Classify one physical evaluation without stopping the SLSQP block."""
+
+    opts = _trust_clip_options(options)
+    beta = float(entry.get("beta_eff", 1.0))
+    objective = float(entry.get("objective", math.nan))
+    gnorm_raw = float(entry.get("gnorm_raw", math.nan))
+    beta_tol = float(opts["beta_tol"])
+    clipped = bool(entry.get("was_clipped", False)) or beta < 1.0 - beta_tol
+    best_objective = (
+        None if best_safe_entry is None else float(best_safe_entry["objective"])
+    )
+    anchor_objective = (
+        None if anchor_entry is None else float(anchor_entry["objective"])
+    )
+    if anchor_objective is None:
+        anchor_objective = best_objective
+    gnorm_floor = max(float(opts.get("gnorm_floor", 1.0e-14)), 1.0e-30)
+    obj_floor = float(opts.get("objective_floor", 1.0e-12))
+    if not np.isfinite(obj_floor) or obj_floor <= 0.0:
+        obj_floor = 1.0e-12
+    improvement_rel = (
+        None
+        if anchor_objective is None or not np.isfinite(anchor_objective)
+        else (anchor_objective - objective) / max(abs(anchor_objective), obj_floor)
+    )
+    relative_worsening = (
+        None
+        if best_objective is None or not np.isfinite(best_objective)
+        else (objective - best_objective) / max(abs(best_objective), obj_floor)
+    )
+    best_improvement_rel = (
+        None
+        if best_objective is None or not np.isfinite(best_objective)
+        else (best_objective - objective) / max(abs(best_objective), obj_floor)
+    )
+    stag_tol = float(opts["stag_tol"])
+    significant_improvement = bool(
+        improvement_rel is not None and improvement_rel >= stag_tol
+    )
+    significant_best_improvement = bool(
+        best_improvement_rel is not None and best_improvement_rel >= stag_tol
+    )
+    weak_improvement = bool(
+        improvement_rel is not None and abs(improvement_rel) < stag_tol
+    )
+
+    good_gnorms = [
+        float(value)
+        for value in recent_safe_raw_gnorms
+        if np.isfinite(value) and float(value) > 0.0
+    ]
+    gnorm_reference = (
+        max(float(np.median(good_gnorms[-5:])), gnorm_floor)
+        if good_gnorms
+        else None
+    )
+    gnorm_ratio = (
+        gnorm_raw / gnorm_reference
+        if gnorm_reference is not None and np.isfinite(gnorm_raw)
+        else None
+    )
+    objective_finite = bool(np.isfinite(objective))
+    gradient_finite = bool(np.isfinite(gnorm_raw))
+
+    recent = list(recent_level_clip_events or [])
+    current_weak_event = bool(clipped and weak_improvement)
+    plateau_events = recent[-max(0, int(opts["bad_window"]) - 1) :] + [
+        {"clipped": clipped, "weak_improvement": current_weak_event}
+    ]
+    clipped_stagnation_plateau = (
+        sum(
+            1
+            for event in plateau_events
+            if event.get("clipped") and event.get("weak_improvement")
+        )
+        >= int(opts["bad_patience"])
+    )
+
+    toxic_reasons = []
+    accepted_reasons = []
+    if clipped:
+        if not objective_finite:
+            toxic_reasons.append("nonfinite_objective")
+        if not gradient_finite:
+            toxic_reasons.append("nonfinite_gradient")
+        if (
+            relative_worsening is not None
+            and relative_worsening > float(opts["worsening_tol"])
+        ):
+            toxic_reasons.append("worsening_vs_best_safe")
+        if improvement_rel is not None and improvement_rel < -stag_tol:
+            toxic_reasons.append("worsening_vs_anchor")
+        if (
+            gnorm_ratio is not None
+            and gnorm_ratio > float(opts["soft_gnorm_factor"])
+        ):
+            toxic_reasons.append("soft_raw_gradient_ratio")
+        if beta < float(opts["severe_beta"]) and not (
+            significant_improvement or significant_best_improvement
+        ):
+            toxic_reasons.append("severe_clip_without_strong_improvement")
+        if clipped_stagnation_plateau:
+            toxic_reasons.append("clipped_stagnation_plateau")
+
+    base_toxic = bool(toxic_reasons)
+    toxic_events = recent[-max(0, int(opts["bad_window"]) - 1) :] + [
+        {"toxic": bool(clipped and base_toxic)}
+    ]
+    toxic_repeated = (
+        bool(clipped and base_toxic)
+        and sum(1 for event in toxic_events if event.get("toxic"))
+        >= int(opts["bad_patience"])
+    )
+    if toxic_repeated:
+        toxic_reasons.append("toxic_clipped_repeated")
+
+    if not clipped:
+        classification = "not_clipped"
+        accepted_reasons.append("unclipped")
+    elif toxic_reasons:
+        classification = "rejected_toxic_clip"
+    elif beta >= float(opts["legacy_beta_min"]) and significant_improvement:
+        classification = "benign_clipped_legacy"
+        accepted_reasons.extend(["moderate_beta", "significant_improvement", "sane_gradient"])
+    elif beta < float(opts["legacy_beta_min"]) and (
+        significant_improvement or significant_best_improvement
+    ):
+        classification = "accepted_clipped_restart"
+        accepted_reasons.extend(["useful_severe_clip", "significant_improvement", "sane_gradient"])
+    else:
+        # A single weak clipped step is observed but not rejected until the
+        # sliding-window plateau condition becomes active.
+        classification = "weak_clipped_progress"
+        accepted_reasons.append("weak_clipped_progress")
+
+    diagnostics = {
+        "beta_eff": beta,
+        "objective": objective,
+        "best_objective": best_objective,
+        "anchor_objective": anchor_objective,
+        "improvement_rel": improvement_rel,
+        "relative_worsening": relative_worsening,
+        "gnorm_raw": gnorm_raw,
+        "objective_floor": obj_floor,
+        "gnorm_floor": gnorm_floor,
+        "gnorm_reference": gnorm_reference,
+        "gnorm_ratio": gnorm_ratio,
+        "clipped": clipped,
+        "significant_improvement": significant_improvement,
+        "weak_improvement": weak_improvement,
+        "clipped_stagnation_plateau": clipped_stagnation_plateau,
+        "toxic_repeated": toxic_repeated,
+        "toxic_reasons": toxic_reasons,
+        "accepted_reasons": accepted_reasons,
+    }
+    return classification, diagnostics
 
 
 def gradient_guard_triggered(
@@ -148,18 +355,36 @@ SUPPORTED_OPT_CONFIG_KEYS = {
     "BSPLINE_GRADIENT_GUARD_MIN_HISTORY",
     "BSPLINE_GRADIENT_GUARD_FLOOR",
     "BSPLINE_GRADIENT_GUARD_RESTART_LIMIT",
+    "BSPLINE_TRUST_CLIP_POLICY",
+    "BSPLINE_TRUST_CLIP_BETA_TOL",
+    "BSPLINE_TRUST_CLIP_LEGACY_BETA_MIN",
+    "BSPLINE_TRUST_CLIP_SEVERE_BETA",
+    "BSPLINE_TRUST_CLIP_WORSENING_TOL",
+    "BSPLINE_TRUST_CLIP_SOFT_GNORM_FACTOR",
+    "BSPLINE_TRUST_CLIP_BAD_PATIENCE",
+    "BSPLINE_TRUST_CLIP_BAD_WINDOW",
+    "BSPLINE_TRUST_CLIP_STAG_TOL",
+    "BSPLINE_TRUST_CLIP_RESTART_LIMIT",
     *THICKNESS_PROGRESSIVE_KEYS,
     "BSPLINE_NLEVELS",
     "BSPLINE_NFINAL",
     "BSPLINE_KNOT_SCORE_MODE",
     "BSPLINE_KNOT_INSERTIONS_PER_REFINE",
     "BSPLINE_KNOT_MIN_SPAN_WIDTH",
+    "BSPLINE_KNOT_DEPTH_PENALTY",
+    "BSPLINE_KNOT_DEPTH_PENALTY_MODE",
+    "BSPLINE_KNOT_DEPTH_POWER_GAMMA",
+    "BSPLINE_KNOT_INITIAL_SPAN_DEPTH",
+    "BSPLINE_KNOT_BATCH_DIVERSITY",
+    "BSPLINE_KNOT_BATCH_PENALTY_MODE",
+    "BSPLINE_KNOT_BATCH_POWER_GAMMA",
     "BSPLINE_TRANSFER_METHOD",
     "BSPLINE_TRANSFER_BOUND_POLICY",
     "BSPLINE_TRANSFER_GEOMETRY_ABS_TOL",
     "BSPLINE_TRANSFER_GEOMETRY_REL_TOL",
     "BSPLINE_USE_CLASS_SHAPE",
     "BSPLINE_INITIAL_CLASS_SHAPE",
+    "BSPLINE_INITIAL_CLASS_SHAPE_EXPONENT",
     "BSPLINE_TRIGGER",
     "BSPLINE_TRIGGER_WINDOW",
     "BSPLINE_TRIGGER_RATIO",
@@ -321,10 +546,27 @@ def fixed_driver_options_from_config(config_values):
         "BSPLINE_GRADIENT_GUARD_MIN_HISTORY": "gradient_guard_min_history",
         "BSPLINE_GRADIENT_GUARD_FLOOR": "gradient_guard_floor",
         "BSPLINE_GRADIENT_GUARD_RESTART_LIMIT": "gradient_guard_restart_limit",
+        "BSPLINE_TRUST_CLIP_POLICY": "trust_clip_policy",
+        "BSPLINE_TRUST_CLIP_BETA_TOL": "trust_clip_beta_tol",
+        "BSPLINE_TRUST_CLIP_LEGACY_BETA_MIN": "trust_clip_legacy_beta_min",
+        "BSPLINE_TRUST_CLIP_SEVERE_BETA": "trust_clip_severe_beta",
+        "BSPLINE_TRUST_CLIP_WORSENING_TOL": "trust_clip_worsening_tol",
+        "BSPLINE_TRUST_CLIP_SOFT_GNORM_FACTOR": "trust_clip_soft_gnorm_factor",
+        "BSPLINE_TRUST_CLIP_BAD_PATIENCE": "trust_clip_bad_patience",
+        "BSPLINE_TRUST_CLIP_BAD_WINDOW": "trust_clip_bad_window",
+        "BSPLINE_TRUST_CLIP_STAG_TOL": "trust_clip_stag_tol",
+        "BSPLINE_TRUST_CLIP_RESTART_LIMIT": "trust_clip_restart_limit",
         "BSPLINE_LE_SAFE_DIRECTION": "le_safe_direction",
         "BSPLINE_LE_SAFE_X0": "le_safe_x0",
         "BSPLINE_LE_SAFE_X1": "le_safe_x1",
         "BSPLINE_LE_SAFE_POWER": "le_safe_power",
+        "BSPLINE_KNOT_DEPTH_PENALTY": "knot_depth_penalty",
+        "BSPLINE_KNOT_DEPTH_PENALTY_MODE": "knot_depth_penalty_mode",
+        "BSPLINE_KNOT_DEPTH_POWER_GAMMA": "knot_depth_power_gamma",
+        "BSPLINE_KNOT_INITIAL_SPAN_DEPTH": "knot_initial_span_depth",
+        "BSPLINE_KNOT_BATCH_DIVERSITY": "knot_batch_diversity",
+        "BSPLINE_KNOT_BATCH_PENALTY_MODE": "knot_batch_penalty_mode",
+        "BSPLINE_KNOT_BATCH_POWER_GAMMA": "knot_batch_power_gamma",
     }
     for key, dest in mapping.items():
         if key in config_values:
@@ -1745,6 +1987,16 @@ class BSplineSU2Driver:
         gradient_guard_min_history=3,
         gradient_guard_floor=1.0e-14,
         gradient_guard_next_action="restart_same_level",
+        refinement_available=None,
+        trust_clip_policy="OFF",
+        trust_clip_beta_tol=1.0e-12,
+        trust_clip_legacy_beta_min=0.50,
+        trust_clip_severe_beta=0.50,
+        trust_clip_worsening_tol=0.05,
+        trust_clip_soft_gnorm_factor=20.0,
+        trust_clip_bad_patience=2,
+        trust_clip_bad_window=5,
+        trust_clip_stag_tol=1.0e-6,
         opt_line_search_bound=None,
         thickness_options=None,
         eval_layout="DSN",
@@ -1875,6 +2127,57 @@ class BSplineSU2Driver:
                 "gradient guard next action must be refine, restart_same_level, "
                 "or terminate_last_safe"
             )
+        self.refinement_available = (
+            self.gradient_guard_next_action == "refine"
+            if refinement_available is None
+            else bool(refinement_available)
+        )
+        self.trust_clip_options = _trust_clip_options(
+            {
+                "policy": trust_clip_policy,
+                "beta_tol": _as_float(trust_clip_beta_tol, "BSPLINE_TRUST_CLIP_BETA_TOL"),
+                "legacy_beta_min": _as_float(
+                    trust_clip_legacy_beta_min,
+                    "BSPLINE_TRUST_CLIP_LEGACY_BETA_MIN",
+                ),
+                "severe_beta": _as_float(
+                    trust_clip_severe_beta,
+                    "BSPLINE_TRUST_CLIP_SEVERE_BETA",
+                ),
+                "worsening_tol": _as_float(
+                    trust_clip_worsening_tol,
+                    "BSPLINE_TRUST_CLIP_WORSENING_TOL",
+                ),
+                "soft_gnorm_factor": _as_float(
+                    trust_clip_soft_gnorm_factor,
+                    "BSPLINE_TRUST_CLIP_SOFT_GNORM_FACTOR",
+                ),
+                "bad_patience": int(trust_clip_bad_patience),
+                "bad_window": int(trust_clip_bad_window),
+                "stag_tol": _as_float(
+                    trust_clip_stag_tol,
+                    "BSPLINE_TRUST_CLIP_STAG_TOL",
+                ),
+                "gnorm_floor": self.gradient_guard_floor,
+                "objective_floor": 1.0e-12,
+            }
+        )
+        if self.trust_clip_options["policy"] not in ALLOWED_TRUST_CLIP_POLICIES:
+            raise BSplineSU2DriverError(
+                "BSPLINE_TRUST_CLIP_POLICY must be OFF or ACCEPT_RESTART"
+            )
+        for key in ("beta_tol", "worsening_tol", "stag_tol"):
+            if float(self.trust_clip_options[key]) < 0.0:
+                raise BSplineSU2DriverError(f"trust-clip {key} must be non-negative")
+        for key in ("legacy_beta_min", "severe_beta"):
+            if not 0.0 <= float(self.trust_clip_options[key]) <= 1.0:
+                raise BSplineSU2DriverError(f"trust-clip {key} must be in [0, 1]")
+        if float(self.trust_clip_options["soft_gnorm_factor"]) <= 0.0:
+            raise BSplineSU2DriverError("trust-clip soft_gnorm_factor must be positive")
+        if int(self.trust_clip_options["bad_patience"]) < 1:
+            raise BSplineSU2DriverError("trust-clip bad_patience must be >= 1")
+        if int(self.trust_clip_options["bad_window"]) < 1:
+            raise BSplineSU2DriverError("trust-clip bad_window must be >= 1")
         self.opt_line_search_bound = (
             None
             if opt_line_search_bound is None
@@ -1966,9 +2269,16 @@ class BSplineSU2Driver:
         self._cache = {}
         self._history_records = []
         self.last_safe_entry = None
+        self.best_safe_entry = None
         self.best_physical_entry = None
         self.recent_safe_raw_gnorms = deque(maxlen=self.gradient_guard_window)
         self.last_gradient_guard_stop = None
+        self.anchor_entry = None
+        self.recent_level_clip_events = deque(
+            maxlen=int(self.trust_clip_options["bad_window"])
+        )
+        self._trust_clip_by_requested_key = {}
+        self.last_trust_clip_stop = None
         self._slsqp_major_iter = 0
         self._run_eval_count = 0
         self._printed_commands_log_path = False
@@ -2519,10 +2829,11 @@ class BSplineSU2Driver:
         return self.optimized_modes_filename
 
     def _log_gradient_guard_stop(self, bad_entry, guard_info):
+        rollback = self.best_safe_entry or self.last_safe_entry
         safe_eval = (
             None
-            if self.last_safe_entry is None
-            else self.last_safe_entry.get("eval_id")
+            if rollback is None
+            else rollback.get("eval_id")
         )
         print("GRADIENT_GUARD_STOP")
         print(f"  reason          = {guard_info.get('reason')}")
@@ -2533,10 +2844,24 @@ class BSplineSU2Driver:
         print(f"  raw_ratio       = {guard_info.get('ratio')}")
         print(f"  gnorm_opt_bad   = {bad_entry.get('gnorm_opt')}")
         print(f"  beta_eff_bad    = {bad_entry.get('beta_eff')}")
-        print("  action          = rollback_to_last_safe")
+        print("  action          = rollback_to_best_safe")
         print(f"  next_action     = {self.gradient_guard_next_action}")
 
-    def register_gradient_entry(self, entry):
+    def _promote_safe_entry(self, entry, update_recent_raw_gnorm=True):
+        self.last_safe_entry = entry
+        if update_recent_raw_gnorm:
+            self.recent_safe_raw_gnorms.append(float(entry["gnorm_raw"]))
+        objective = float(entry["objective"])
+        if np.isfinite(objective) and (
+            self.best_safe_entry is None
+            or objective < float(self.best_safe_entry["objective"])
+        ):
+            self.best_safe_entry = entry
+            self.best_physical_entry = entry
+        if self.anchor_entry is None:
+            self.anchor_entry = entry
+
+    def register_gradient_entry(self, entry, promote=True):
         triggered = False
         guard_info = {
             "reason": "disabled",
@@ -2554,25 +2879,139 @@ class BSplineSU2Driver:
                 floor=self.gradient_guard_floor,
             )
         if triggered:
-            self.restore_modes_from_entry(self.last_safe_entry)
+            rollback_entry = self.best_safe_entry or self.last_safe_entry
+            self.restore_modes_from_entry(rollback_entry)
             self._log_gradient_guard_stop(entry, guard_info)
             stop = GradientGuardStop(
-                self.last_safe_entry,
+                rollback_entry,
                 bad_entry=entry,
                 guard_info=guard_info,
             )
             self.last_gradient_guard_stop = stop
             raise stop
 
-        self.last_safe_entry = entry
-        self.recent_safe_raw_gnorms.append(float(entry["gnorm_raw"]))
-        objective = float(entry["objective"])
-        if np.isfinite(objective) and (
-            self.best_physical_entry is None
-            or objective < float(self.best_physical_entry["objective"])
-        ):
-            self.best_physical_entry = entry
+        if promote:
+            self._promote_safe_entry(entry)
         return guard_info
+
+    def _trust_clip_enabled(self):
+        return self.trust_clip_options["policy"] == "ACCEPT_RESTART"
+
+    def _requested_optimizer_key(self, variables):
+        return cache_key(variables, self.cache_tol)
+
+    def _line_search_anchor_key(self):
+        return cache_key(list(self._line_search_anchor_physical), self.cache_tol)
+
+    def _pending_trust_clip_key(self, optimizer_variables):
+        return (
+            self._requested_optimizer_key(optimizer_variables),
+            self._line_search_anchor_key(),
+        )
+
+    def _prune_stale_trust_clip_pending(self):
+        current_anchor_key = self._line_search_anchor_key()
+        for key in list(self._trust_clip_by_requested_key):
+            _request_key, anchor_key = key
+            if anchor_key != current_anchor_key:
+                del self._trust_clip_by_requested_key[key]
+
+    def _classify_trust_clip_entry(self, entry):
+        classification, diagnostics = classify_clipped_trial(
+            entry,
+            self.recent_safe_raw_gnorms,
+            self.best_safe_entry,
+            self.anchor_entry,
+            self.recent_level_clip_events,
+            self.trust_clip_options,
+        )
+        event = {
+            "classification": classification,
+            "clipped": bool(diagnostics["clipped"]),
+            "weak_improvement": bool(diagnostics["weak_improvement"]),
+            "toxic": classification == "rejected_toxic_clip",
+            "clipped_stagnation_plateau": bool(
+                diagnostics["clipped_stagnation_plateau"]
+            ),
+        }
+        self.recent_level_clip_events.append(event)
+        return classification, diagnostics
+
+    def _trust_clip_status(self, classification):
+        return {
+            "not_clipped": "ok",
+            "benign_clipped_legacy": "ok_clipped_benign",
+            "weak_clipped_progress": "ok_clipped_weak",
+            "accepted_clipped_restart": "accepted_clipped_restart",
+            "rejected_toxic_clip": "rejected_toxic_clip",
+        }[classification]
+
+    def _log_trust_clip_stop(self, stop):
+        diagnostics = stop.diagnostics
+        print("TRUST_CLIP_STOP")
+        print(f"  class           = {stop.classification}")
+        print(f"  eval             = {stop.entry.get('eval_id')}")
+        print(
+            "  restore_eval     = "
+            f"{None if stop.rollback_entry is None else stop.rollback_entry.get('eval_id')}"
+        )
+        print(f"  beta_eff         = {diagnostics.get('beta_eff')}")
+        print(f"  improvement_rel  = {diagnostics.get('improvement_rel')}")
+        print(f"  relative_worsen  = {diagnostics.get('relative_worsening')}")
+        print(f"  gnorm_ratio      = {diagnostics.get('gnorm_ratio')}")
+        print(f"  reasons          = {','.join(diagnostics.get('toxic_reasons', []))}")
+        print(f"  action           = {stop.action}")
+
+    def _trust_clip_callback(self, optimizer_variables):
+        if not self._trust_clip_enabled():
+            self._update_line_search_anchor_from_optimizer_variables(optimizer_variables)
+            return
+        key = self._pending_trust_clip_key(optimizer_variables)
+        pending = self._trust_clip_by_requested_key.pop(key, None)
+        if pending is None:
+            self._update_line_search_anchor_from_optimizer_variables(optimizer_variables)
+            self._prune_stale_trust_clip_pending()
+            return
+        classification = pending["classification"]
+        entry = pending["entry"]
+        diagnostics = pending["diagnostics"]
+        if classification in (
+            "not_clipped",
+            "benign_clipped_legacy",
+            "weak_clipped_progress",
+        ):
+            self._update_line_search_anchor_from_optimizer_variables(optimizer_variables)
+            self.anchor_entry = entry
+            self._prune_stale_trust_clip_pending()
+            return
+        if classification == "accepted_clipped_restart":
+            self._promote_safe_entry(entry)
+            self._update_line_search_anchor_from_optimizer_variables(optimizer_variables)
+            self.anchor_entry = entry
+            rollback_entry = entry
+            action = "restart_from_evaluated"
+        else:
+            rollback_entry = self.best_safe_entry or self.last_safe_entry
+            toxic_reasons = set(diagnostics.get("toxic_reasons", []))
+            force_refine = bool(
+                self.refinement_available
+                and toxic_reasons.intersection(
+                    {"toxic_clipped_repeated", "clipped_stagnation_plateau"}
+                )
+            )
+            action = "refine" if force_refine else "rollback_best_safe_restart"
+        self._prune_stale_trust_clip_pending()
+        self.restore_modes_from_entry(rollback_entry)
+        stop = TrustClipStop(
+            classification,
+            entry,
+            rollback_entry,
+            diagnostics=diagnostics,
+            action=action,
+        )
+        self.last_trust_clip_stop = stop
+        self._log_trust_clip_stop(stop)
+        raise stop
 
     def _evaluate_optimizer_variables(self, variables):
         reduced_trial = self.optimizer_to_physical(variables)
@@ -2580,6 +3019,13 @@ class BSplineSU2Driver:
         physical_eval, info = self._apply_line_search_bound(physical_trial)
         info["requested_x"] = list(physical_trial)
         info["evaluated_x"] = list(physical_eval)
+        info["requested_optimizer_x"] = [float(value) for value in variables]
+        if self._trust_clip_enabled():
+            pending = self._trust_clip_by_requested_key.get(
+                self._pending_trust_clip_key(variables)
+            )
+            if pending is not None:
+                return pending["result"], info
         return self.evaluate(physical_eval, line_search_info=info), info
 
     def _evaluate_reduced_physical(self, reduced_coefficients):
@@ -2737,6 +3183,24 @@ class BSplineSU2Driver:
             json.dump(data, fp, indent=2, sort_keys=True)
             fp.write("\n")
 
+    def _write_trust_clip_summary(self, paths, classification, diagnostics, action):
+        data = {}
+        if paths.summary.exists():
+            try:
+                with open(paths.summary, "r") as fp:
+                    data = json.load(fp)
+            except Exception:
+                data = {}
+        data["trust_clip"] = {
+            "policy": self.trust_clip_options["policy"],
+            "classification": classification,
+            "action": action,
+            **dict(diagnostics),
+        }
+        with open(paths.summary, "w") as fp:
+            json.dump(data, fp, indent=2, sort_keys=True)
+            fp.write("\n")
+
     def _append_history_record(
         self,
         eval_id,
@@ -2749,6 +3213,9 @@ class BSplineSU2Driver:
         eval_index=None,
         gradient_guard_info=None,
         gradient_entry=None,
+        trust_clip_classification="",
+        trust_clip_diagnostics=None,
+        trust_clip_action="",
     ):
         line_search_info = {
             **self._line_search_default_info(),
@@ -2770,6 +3237,7 @@ class BSplineSU2Driver:
         )
         gradient_guard_info = dict(gradient_guard_info or {})
         gradient_entry = dict(gradient_entry or {})
+        trust_clip_diagnostics = dict(trust_clip_diagnostics or {})
         record = {
             "eval_index": eval_index,
             "slsqp_iter": self._slsqp_major_iter,
@@ -2784,6 +3252,20 @@ class BSplineSU2Driver:
             "gradient_guard_reason": gradient_guard_info.get("reason", ""),
             "gradient_guard_reference": gradient_guard_info.get("reference", ""),
             "gradient_guard_ratio": gradient_guard_info.get("ratio", ""),
+            "trust_clip_class": trust_clip_classification,
+            "trust_clip_action": trust_clip_action,
+            "trust_clip_beta": trust_clip_diagnostics.get("beta_eff", ""),
+            "trust_clip_improvement_rel": trust_clip_diagnostics.get(
+                "improvement_rel", ""
+            ),
+            "trust_clip_relative_worsening": trust_clip_diagnostics.get(
+                "relative_worsening", ""
+            ),
+            "trust_clip_gnorm_ratio": trust_clip_diagnostics.get("gnorm_ratio", ""),
+            "trust_clip_reasons": ",".join(
+                trust_clip_diagnostics.get("toxic_reasons", [])
+                or trust_clip_diagnostics.get("accepted_reasons", [])
+            ),
             "status": status,
             "line_search_beta": line_search_info["line_search_beta"],
             "line_search_maxdiff": line_search_info["line_search_maxdiff"],
@@ -2829,6 +3311,13 @@ class BSplineSU2Driver:
                 "gradient_guard_reason",
                 "gradient_guard_reference",
                 "gradient_guard_ratio",
+                "trust_clip_class",
+                "trust_clip_action",
+                "trust_clip_beta",
+                "trust_clip_improvement_rel",
+                "trust_clip_relative_worsening",
+                "trust_clip_gnorm_ratio",
+                "trust_clip_reasons",
             ]
             + [f"coeff__{mode_id}" for mode_id in self.mode_ids]
             + (
@@ -2865,8 +3354,10 @@ class BSplineSU2Driver:
         ok_records = [
             record
             for record in self._history_records
-            if str(record.get("status", "")).strip().lower() == "ok"
+            if str(record.get("status", "")).strip().lower()
+            in SAFE_EVALUATION_STATUSES
             and record.get("objective") is not None
+            and np.isfinite(float(record.get("objective")))
         ]
         if not ok_records:
             return None
@@ -2893,7 +3384,7 @@ class BSplineSU2Driver:
             )
 
         key = cache_key(coefficients, self.cache_tol)
-        if key in self._cache:
+        if key in self._cache and not self._trust_clip_enabled():
             return self._cache[key]
 
         eval_id, paths = self._next_paths()
@@ -2978,7 +3469,9 @@ class BSplineSU2Driver:
             gradient = read_gradient_vector(
                 paths.gradients,
                 self.mode_ids,
-                allow_nonfinite=self.gradient_guard_enabled,
+                allow_nonfinite=(
+                    self.gradient_guard_enabled or self._trust_clip_enabled()
+                ),
             )
 
             result = {
@@ -2996,7 +3489,10 @@ class BSplineSU2Driver:
                 line_search_info=line_search_info,
             )
             try:
-                guard_info = self.register_gradient_entry(gradient_entry)
+                guard_info = self.register_gradient_entry(
+                    gradient_entry,
+                    promote=not self._trust_clip_enabled(),
+                )
             except GradientGuardStop as stop:
                 result.update(
                     {
@@ -3026,11 +3522,75 @@ class BSplineSU2Driver:
                 )
                 raise
 
+            trust_clip_classification = ""
+            trust_clip_diagnostics = {}
+            trust_clip_action = ""
+            status = "ok"
+            cache_as_safe = True
+            if self._trust_clip_enabled():
+                (
+                    trust_clip_classification,
+                    trust_clip_diagnostics,
+                ) = self._classify_trust_clip_entry(gradient_entry)
+                status = self._trust_clip_status(trust_clip_classification)
+                trust_clip_action = {
+                    "not_clipped": "continue",
+                    "benign_clipped_legacy": "legacy_continue",
+                    "weak_clipped_progress": "weak_continue",
+                    "accepted_clipped_restart": "defer_restart_to_callback",
+                    "rejected_toxic_clip": "defer_rollback_to_callback",
+                }[trust_clip_classification]
+                finite_safe_candidate = bool(
+                    np.isfinite(float(gradient_entry["objective"]))
+                    and np.isfinite(float(gradient_entry["gnorm_raw"]))
+                )
+                if trust_clip_classification in (
+                    "not_clipped",
+                    "benign_clipped_legacy",
+                    "weak_clipped_progress",
+                ) and finite_safe_candidate:
+                    self._promote_safe_entry(
+                        gradient_entry,
+                        update_recent_raw_gnorm=(
+                            trust_clip_classification != "weak_clipped_progress"
+                        ),
+                    )
+                cache_as_safe = (
+                    finite_safe_candidate
+                    and trust_clip_classification
+                    in (
+                        "not_clipped",
+                        "benign_clipped_legacy",
+                        "weak_clipped_progress",
+                    )
+                )
+                requested_optimizer_x = (line_search_info or {}).get(
+                    "requested_optimizer_x"
+                )
+                if requested_optimizer_x is not None:
+                    request_key = self._pending_trust_clip_key(requested_optimizer_x)
+                    self._trust_clip_by_requested_key[request_key] = {
+                        "classification": trust_clip_classification,
+                        "diagnostics": trust_clip_diagnostics,
+                        "entry": gradient_entry,
+                        "result": result,
+                    }
+                self._write_trust_clip_summary(
+                    paths,
+                    trust_clip_classification,
+                    trust_clip_diagnostics,
+                    trust_clip_action,
+                )
+
             result.update(
                 {
+                    "status": status,
                     "gnorm_raw": gradient_entry["gnorm_raw"],
                     "gnorm_opt": gradient_entry["gnorm_opt"],
                     "gradient_guard_info": guard_info,
+                    "trust_clip_class": trust_clip_classification,
+                    "trust_clip_diagnostics": trust_clip_diagnostics,
+                    "trust_clip_action": trust_clip_action,
                 }
             )
             self._write_gradient_guard_summary(
@@ -3039,19 +3599,23 @@ class BSplineSU2Driver:
                 guard_info,
                 "safe",
             )
-            self._cache[key] = result
+            if cache_as_safe:
+                self._cache[key] = result
             self._print_iteration_row(result, line_search_info=line_search_info)
             self._append_history_record(
                 eval_id,
                 objective,
                 coefficients,
                 gradient,
-                "ok",
+                status,
                 line_search_info=line_search_info,
                 eval_dir=paths.eval_dir,
                 eval_index=eval_index,
                 gradient_guard_info=guard_info,
                 gradient_entry=gradient_entry,
+                trust_clip_classification=trust_clip_classification,
+                trust_clip_diagnostics=trust_clip_diagnostics,
+                trust_clip_action=trust_clip_action,
             )
             return result
         except GradientGuardStop:
@@ -3108,6 +3672,16 @@ class BSplineSU2Driver:
                 self.gradient_guard_window,
                 self.gradient_guard_min_history,
                 self.gradient_guard_floor,
+            )
+        )
+        print(
+            "Trust-clip policy: {} legacy_beta_min={} severe_beta={} "
+            "bad_patience={}/{}".format(
+                self.trust_clip_options["policy"],
+                self.trust_clip_options["legacy_beta_min"],
+                self.trust_clip_options["severe_beta"],
+                self.trust_clip_options["bad_patience"],
+                self.trust_clip_options["bad_window"],
             )
         )
         print(
@@ -3259,6 +3833,41 @@ class BSplineSU2Driver:
             "refinement_triggered": refine,
         }
 
+    def _controlled_trust_clip_result(self, stop, optimizer="SLSQP"):
+        rollback = stop.rollback_entry
+        self.restore_modes_from_entry(rollback)
+        if rollback is None:
+            coefficients = list(self.initial_coefficients)
+            objective = math.inf
+            restore_eval_id = None
+        else:
+            coefficients = [float(value) for value in rollback["evaluated_x"]]
+            objective = float(rollback["objective"])
+            restore_eval_id = int(rollback["eval_id"])
+        next_action = (
+            "refine" if stop.action == "refine" else "restart_same_level"
+        )
+        refine = next_action == "refine"
+        if refine:
+            self.trigger_project.refinement_triggered = True
+        return {
+            "optimizer": optimizer,
+            "success": True,
+            "message": f"Trust-clip controlled stop: {stop.classification}",
+            "objective": objective,
+            "coefficients": coefficients,
+            "status": "trust_clip_stop",
+            "trust_clip_triggered": True,
+            "trust_clip_class": stop.classification,
+            "trust_clip_diagnostics": dict(stop.diagnostics),
+            "trust_clip_action": stop.action,
+            "trust_clip_bad_eval_id": stop.entry.get("eval_id"),
+            "trust_clip_restore_eval_id": restore_eval_id,
+            "trust_clip_next_action": next_action,
+            "early_refine_triggered": refine,
+            "refinement_triggered": refine,
+        }
+
     def optimize(self, maxiter=5, fallback_step=0.1, gradient_tol=1.0e-8):
         self.trigger_project.trigger_history = []
         self.trigger_project.trigger_state = None
@@ -3292,7 +3901,15 @@ class BSplineSU2Driver:
 
         def fun(x):
             result, _info = self._evaluate_optimizer_variables(list(x))
-            record_objective_and_check(self.trigger_project, float(result["objective"]))
+            if result.get("trust_clip_class") not in (
+                "weak_clipped_progress",
+                "accepted_clipped_restart",
+                "rejected_toxic_clip",
+            ):
+                record_objective_and_check(
+                    self.trigger_project,
+                    float(result["objective"]),
+                )
             return float(result["objective"]) * self.opt_gradient_factor
 
         def jac(x):
@@ -3306,7 +3923,7 @@ class BSplineSU2Driver:
 
         def callback(x):
             self._slsqp_major_iter += 1
-            self._update_line_search_anchor_from_optimizer_variables(list(x))
+            self._trust_clip_callback(list(x))
 
         options = {
             "maxiter": int(maxiter),
@@ -3328,6 +3945,8 @@ class BSplineSU2Driver:
                 callback=callback,
                 options=options,
             )
+        except TrustClipStop as stop:
+            return self._controlled_trust_clip_result(stop, optimizer="SLSQP")
         except GradientGuardStop as stop:
             return self._controlled_gradient_guard_result(stop, optimizer="SLSQP")
         except RefinementTriggered:
@@ -3487,6 +4106,16 @@ def run_bspline_su2_optimization(
     gradient_guard_min_history=3,
     gradient_guard_floor=1.0e-14,
     gradient_guard_next_action="restart_same_level",
+    refinement_available=None,
+    trust_clip_policy="OFF",
+    trust_clip_beta_tol=1.0e-12,
+    trust_clip_legacy_beta_min=0.50,
+    trust_clip_severe_beta=0.50,
+    trust_clip_worsening_tol=0.05,
+    trust_clip_soft_gnorm_factor=20.0,
+    trust_clip_bad_patience=2,
+    trust_clip_bad_window=5,
+    trust_clip_stag_tol=1.0e-6,
     opt_line_search_bound=None,
     thickness_options=None,
     eval_layout="DSN",
@@ -3536,6 +4165,16 @@ def run_bspline_su2_optimization(
         gradient_guard_min_history=gradient_guard_min_history,
         gradient_guard_floor=gradient_guard_floor,
         gradient_guard_next_action=gradient_guard_next_action,
+        refinement_available=refinement_available,
+        trust_clip_policy=trust_clip_policy,
+        trust_clip_beta_tol=trust_clip_beta_tol,
+        trust_clip_legacy_beta_min=trust_clip_legacy_beta_min,
+        trust_clip_severe_beta=trust_clip_severe_beta,
+        trust_clip_worsening_tol=trust_clip_worsening_tol,
+        trust_clip_soft_gnorm_factor=trust_clip_soft_gnorm_factor,
+        trust_clip_bad_patience=trust_clip_bad_patience,
+        trust_clip_bad_window=trust_clip_bad_window,
+        trust_clip_stag_tol=trust_clip_stag_tol,
         opt_line_search_bound=opt_line_search_bound,
         thickness_options=thickness_options,
         eval_layout=eval_layout,
@@ -3697,6 +4336,19 @@ def _build_arg_parser():
     parser.add_argument("--gradient-guard-min-history", type=int, default=3)
     parser.add_argument("--gradient-guard-floor", type=float, default=1.0e-14)
     parser.add_argument(
+        "--trust-clip-policy",
+        default="OFF",
+        choices=ALLOWED_TRUST_CLIP_POLICIES,
+    )
+    parser.add_argument("--trust-clip-beta-tol", type=float, default=1.0e-12)
+    parser.add_argument("--trust-clip-legacy-beta-min", type=float, default=0.50)
+    parser.add_argument("--trust-clip-severe-beta", type=float, default=0.50)
+    parser.add_argument("--trust-clip-worsening-tol", type=float, default=0.05)
+    parser.add_argument("--trust-clip-soft-gnorm-factor", type=float, default=20.0)
+    parser.add_argument("--trust-clip-bad-patience", type=int, default=2)
+    parser.add_argument("--trust-clip-bad-window", type=int, default=5)
+    parser.add_argument("--trust-clip-stag-tol", type=float, default=1.0e-6)
+    parser.add_argument(
         "--opt-line-search-bound",
         type=float,
         default=None,
@@ -3805,6 +4457,15 @@ def main(argv=None):
             gradient_guard_window=args.gradient_guard_window,
             gradient_guard_min_history=args.gradient_guard_min_history,
             gradient_guard_floor=args.gradient_guard_floor,
+            trust_clip_policy=args.trust_clip_policy,
+            trust_clip_beta_tol=args.trust_clip_beta_tol,
+            trust_clip_legacy_beta_min=args.trust_clip_legacy_beta_min,
+            trust_clip_severe_beta=args.trust_clip_severe_beta,
+            trust_clip_worsening_tol=args.trust_clip_worsening_tol,
+            trust_clip_soft_gnorm_factor=args.trust_clip_soft_gnorm_factor,
+            trust_clip_bad_patience=args.trust_clip_bad_patience,
+            trust_clip_bad_window=args.trust_clip_bad_window,
+            trust_clip_stag_tol=args.trust_clip_stag_tol,
             opt_line_search_bound=args.opt_line_search_bound,
             thickness_options=getattr(args, "thickness_options", None),
             eval_layout=args.eval_layout,

@@ -16,6 +16,12 @@ from SU2.opt.bspline_su2_adaptive import (
     _boehm_insert_to_target_knots,
     _build_arg_parser,
     _check_transferred_coefficients_within_bounds,
+    _knot_batch_depth,
+    _span_key,
+    _streuber_depth_penalty,
+    adaptive_options_from_config,
+    apply_knot_depth_penalty,
+    apply_knot_batch_penalty,
     build_next_knot_inserted_modes,
     build_scalar_deformation_sensitivity,
     extract_clamped_knot_space,
@@ -129,6 +135,39 @@ def test_gradient_guard_restarts_final_level_with_clean_optimizer_state():
     ) == "restart_same_level"
 
 
+@pytest.mark.parametrize(
+    "level_id,nlevels,current_ndv,nfinal",
+    [
+        (0, 1, 4, None),
+        (0, 2, 4, None),
+        (1, 2, 4, None),
+        (0, 3, 4, 5),
+        (0, 3, 5, 5),
+        (2, 3, 4, 9),
+    ],
+)
+def test_refinement_available_matches_legacy_gradient_guard_refine_decision(
+    level_id,
+    nlevels,
+    current_ndv,
+    nfinal,
+):
+    refinement_available = (
+        level_id < nlevels - 1
+        and (nfinal is None or current_ndv < nfinal)
+    )
+
+    assert refinement_available is (
+        gradient_guard_next_action_for_level(
+            level_id,
+            nlevels,
+            current_ndv,
+            nfinal,
+        )
+        == "refine"
+    )
+
+
 def test_gradient_guard_refine_action_does_not_restart_same_level(tmp_path):
     calls = []
 
@@ -174,6 +213,156 @@ def test_gradient_guard_final_level_reinvokes_optimizer_from_safe_modes(tmp_path
 
     assert len(calls) == 2
     assert result["gradient_guard_restart_count"] == 1
+
+
+def test_trust_clip_accepted_restart_copies_evaluated_modes_and_restarts(tmp_path):
+    start = tmp_path / "active_modes_start.json"
+    optimized = tmp_path / "optimized_modes.json"
+    start.write_text("old")
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            optimized.write_text("accepted-evaluated")
+            return {
+                "trust_clip_triggered": True,
+                "trust_clip_class": "accepted_clipped_restart",
+                "trust_clip_next_action": "restart_same_level",
+                "success": True,
+            }
+        assert start.read_text() == "accepted-evaluated"
+        return {"trust_clip_triggered": False, "success": True}
+
+    result = run_with_gradient_guard_restarts(
+        fake_run,
+        {},
+        active_modes_start_filename=start,
+        optimized_modes_filename=optimized,
+        next_action="restart_same_level",
+        trust_clip_restart_limit=1,
+    )
+
+    assert len(calls) == 2
+    assert result["trust_clip_restart_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["toxic_clipped_repeated", "clipped_stagnation_plateau"],
+)
+def test_repeated_or_stagnant_toxic_clip_forces_refinement(tmp_path, reason):
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+        return {
+            "trust_clip_triggered": True,
+            "trust_clip_class": "rejected_toxic_clip",
+            "trust_clip_next_action": "refine",
+            "trust_clip_diagnostics": {"toxic_reasons": [reason]},
+            "success": True,
+        }
+
+    result = run_with_gradient_guard_restarts(
+        fake_run,
+        {},
+        active_modes_start_filename=tmp_path / "start.json",
+        optimized_modes_filename=tmp_path / "optimized.json",
+        next_action="refine",
+        trust_clip_restart_limit=1,
+    )
+
+    assert len(calls) == 1
+    assert result["trust_clip_force_refine"] is True
+
+
+def test_toxic_clip_plateau_can_refine_when_gradient_guard_action_restarts(tmp_path):
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+        return {
+            "trust_clip_triggered": True,
+            "trust_clip_class": "rejected_toxic_clip",
+            "trust_clip_next_action": "refine",
+            "trust_clip_diagnostics": {
+                "toxic_reasons": ["clipped_stagnation_plateau"],
+            },
+            "success": True,
+        }
+
+    result = run_with_gradient_guard_restarts(
+        fake_run,
+        {},
+        active_modes_start_filename=tmp_path / "start.json",
+        optimized_modes_filename=tmp_path / "optimized.json",
+        next_action="restart_same_level",
+        refinement_available=True,
+        trust_clip_restart_limit=1,
+    )
+
+    assert len(calls) == 1
+    assert result["trust_clip_force_refine"] is True
+
+
+def test_toxic_clip_plateau_does_not_refine_without_refinement_available(tmp_path):
+    start = tmp_path / "active_modes_start.json"
+    optimized = tmp_path / "optimized_modes.json"
+    start.write_text("old")
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+        optimized.write_text(f"safe-{len(calls)}")
+        return {
+            "trust_clip_triggered": True,
+            "trust_clip_class": "rejected_toxic_clip",
+            "trust_clip_next_action": "refine",
+            "trust_clip_diagnostics": {
+                "toxic_reasons": ["clipped_stagnation_plateau"],
+            },
+            "success": True,
+        }
+
+    result = run_with_gradient_guard_restarts(
+        fake_run,
+        {},
+        active_modes_start_filename=start,
+        optimized_modes_filename=optimized,
+        next_action="restart_same_level",
+        refinement_available=False,
+        trust_clip_restart_limit=1,
+    )
+
+    assert len(calls) == 2
+    assert result["trust_clip_restart_limit_reached"] is True
+    assert "trust_clip_force_refine" not in result
+
+
+def test_gradient_guard_still_uses_next_action_not_refinement_available(tmp_path):
+    start = tmp_path / "active_modes_start.json"
+    optimized = tmp_path / "optimized_modes.json"
+    start.write_text("old")
+    optimized.write_text("safe")
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+        return {"gradient_guard_triggered": True, "success": True}
+
+    result = run_with_gradient_guard_restarts(
+        fake_run,
+        {},
+        active_modes_start_filename=start,
+        optimized_modes_filename=optimized,
+        next_action="refine",
+        refinement_available=False,
+        restart_limit=2,
+    )
+
+    assert len(calls) == 1
+    assert result["gradient_guard_restart_count"] == 0
 
 
 def _minimal_settings(**overrides):
@@ -473,6 +662,212 @@ def test_removed_and_fixed_options_fail_clearly(key, value, message):
         validate_adaptive_options(_minimal_settings(**{key: value}))
 
 
+def test_streuber_depth_penalty_values():
+    assert _streuber_depth_penalty(1) == pytest.approx(1.0)
+    assert _streuber_depth_penalty(2) == pytest.approx(0.984, abs=5.0e-4)
+    assert _streuber_depth_penalty(4) == pytest.approx(0.502, abs=5.0e-4)
+    assert _streuber_depth_penalty(5) == pytest.approx(0.122, abs=5.0e-3)
+
+
+def test_legacy_knot_batch_wrapper_starts_fresh_span_at_parent_depth_one():
+    rows = [
+        {
+            "span_left": 0.0,
+            "span_right": 0.25,
+            "score": 10.0,
+            "score_raw": 10.0,
+        }
+    ]
+
+    apply_knot_batch_penalty(
+        rows,
+        selected_insertions=[],
+        settings={
+            "knot_batch_diversity": True,
+            "knot_batch_penalty_mode": "STREUBER_DEPTH",
+        },
+    )
+
+    assert rows[0]["parent_depth"] == 1
+    assert rows[0]["child_depth"] == 2
+    assert rows[0]["depth_penalty"] == pytest.approx(
+        _streuber_depth_penalty(2)
+    )
+
+
+def test_enabled_knot_depth_penalty_rejects_none_mode():
+    with pytest.raises(
+        BSplineAdaptiveError,
+        match="BSPLINE_KNOT_DEPTH_PENALTY=YES requires",
+    ):
+        validate_adaptive_options(
+            _minimal_settings(
+                knot_depth_penalty=True,
+                knot_depth_penalty_mode="NONE",
+            )
+        )
+
+
+def test_disabled_knot_depth_penalty_accepts_none_mode():
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            knot_depth_penalty=False,
+            knot_depth_penalty_mode="NONE",
+        )
+    )
+
+    assert settings["knot_depth_penalty"] is False
+    assert settings["knot_depth_penalty_mode"] == "NONE"
+
+
+def test_streuber_alias_normalizes_for_new_and_legacy_options():
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            knot_depth_penalty=True,
+            knot_depth_penalty_mode="STREUBER",
+        )
+    )
+    legacy_settings = validate_adaptive_options(
+        _minimal_settings(
+            knot_batch_diversity=True,
+            knot_batch_penalty_mode="STREUBER",
+        )
+    )
+
+    assert settings["knot_depth_penalty"] is True
+    assert settings["knot_depth_penalty_mode"] == "STREUBER_DEPTH"
+    assert legacy_settings["knot_depth_penalty"] is True
+    assert legacy_settings["knot_depth_penalty_mode"] == "STREUBER_DEPTH"
+
+
+def test_legacy_streuber_cfg_alias_populates_canonical_depth_options():
+    options = adaptive_options_from_config(
+        {
+            "BSPLINE_KNOT_BATCH_DIVERSITY": "YES",
+            "BSPLINE_KNOT_BATCH_PENALTY_MODE": "STREUBER",
+        }
+    )
+    settings = validate_adaptive_options(_minimal_settings(**options))
+
+    assert settings["knot_depth_penalty"] is True
+    assert settings["knot_depth_penalty_mode"] == "STREUBER_DEPTH"
+
+
+def test_knot_batch_penalty_legacy_mode_preserves_order_and_score():
+    rows = [
+        {"rank": 1, "span_left": 0.0, "span_right": 0.25, "score": 10.0},
+        {"rank": 2, "span_left": 0.25, "span_right": 0.5, "score": 8.0},
+        {"rank": 3, "span_left": 0.5, "span_right": 1.0, "score": 6.0},
+    ]
+    original_ids = [id(row) for row in rows]
+    original_scores = [row["score"] for row in rows]
+
+    result = apply_knot_batch_penalty(
+        rows,
+        selected_insertions=[{"span_left": 0.0, "span_right": 0.5}],
+        settings={"knot_batch_diversity": False},
+    )
+
+    assert result is rows
+    assert [id(row) for row in rows] == original_ids
+    assert [row["score"] for row in rows] == original_scores
+
+
+def test_knot_batch_power_penalty_can_reorder_nested_span():
+    rows = [
+        {
+            "rank": 1,
+            "span_left": 0.0,
+            "span_right": 0.25,
+            "score": 10.0,
+            "score_raw": 10.0,
+        },
+        {
+            "rank": 2,
+            "span_left": 0.5,
+            "span_right": 1.0,
+            "score": 6.0,
+            "score_raw": 6.0,
+        },
+    ]
+
+    apply_knot_batch_penalty(
+        rows,
+        selected_insertions=[{"span_left": 0.0, "span_right": 0.5}],
+        settings={
+            "knot_batch_diversity": True,
+            "knot_batch_penalty_mode": "POWER",
+            "knot_batch_power_gamma": 0.25,
+        },
+    )
+
+    assert rows[0]["span_left"] == pytest.approx(0.5)
+    assert rows[0]["rank"] == 1
+    assert rows[0]["score_effective"] == pytest.approx(6.0)
+    assert rows[1]["span_left"] == pytest.approx(0.0)
+    assert rows[1]["rank"] == 2
+    assert rows[1]["score_effective"] == pytest.approx(0.625)
+    assert rows[1]["score_raw"] == pytest.approx(10.0)
+
+
+def test_knot_batch_streuber_nested_depth():
+    selected_insertions = [
+        {"span_left": 0.0, "span_right": 0.5},
+        {"span_left": 0.0, "span_right": 0.25},
+        {"span_left": 0.0, "span_right": 0.125},
+    ]
+    nested = {"span_left": 0.0, "span_right": 0.0625}
+    independent = {"span_left": 0.5, "span_right": 1.0}
+
+    assert _knot_batch_depth(nested, selected_insertions) == 4
+    assert _streuber_depth_penalty(4) == pytest.approx(0.502, abs=5.0e-4)
+    assert _knot_batch_depth(independent, selected_insertions) == 1
+    assert _streuber_depth_penalty(1) == pytest.approx(1.0)
+
+
+def test_knot_depth_power_penalty_uses_child_depth_and_keeps_raw_score():
+    rows = [
+        {
+            "rank": 1,
+            "span_left": 0.0,
+            "span_right": 0.25,
+            "score": 10.0,
+            "score_raw": 10.0,
+        },
+        {
+            "rank": 2,
+            "span_left": 0.5,
+            "span_right": 0.75,
+            "score": 6.0,
+            "score_raw": 6.0,
+        },
+    ]
+    span_depths = {
+        _span_key(0.0, 0.25): 4,
+        _span_key(0.5, 0.75): 1,
+    }
+
+    apply_knot_depth_penalty(
+        rows,
+        span_depths,
+        {
+            "knot_depth_penalty": True,
+            "knot_depth_penalty_mode": "POWER",
+            "knot_depth_power_gamma": 0.25,
+        },
+    )
+
+    assert rows[0]["span_left"] == pytest.approx(0.5)
+    assert rows[0]["parent_depth"] == 1
+    assert rows[0]["child_depth"] == 2
+    assert rows[0]["selection_score"] == pytest.approx(1.5)
+    assert rows[1]["span_left"] == pytest.approx(0.0)
+    assert rows[1]["parent_depth"] == 4
+    assert rows[1]["child_depth"] == 5
+    assert rows[1]["score"] == pytest.approx(10.0)
+    assert rows[1]["score_effective"] == pytest.approx(10.0 * (0.25**4))
+
+
 def test_le_safe_options_are_accepted_and_forwarded():
     settings = validate_adaptive_options(
         _minimal_settings(
@@ -672,6 +1067,53 @@ def test_explicit_initial_class_shape_precedes_cfg_alias(tmp_path):
     assert spec["class_shape"] == "sqrt_x_one_minus_x"
 
 
+def test_initial_class_shape_exponent_defaults_to_half(tmp_path):
+    cfg = tmp_path / "case.cfg"
+    cfg.write_text(_single_cfg_text(tmp_path))
+
+    settings = parse_adaptive_options(["-f", str(cfg)])
+    spec = json.loads(Path(settings["modes"]).read_text())
+
+    assert spec["class_shape_exponent"] == pytest.approx(0.5)
+
+
+def test_initial_class_shape_exponent_cfg_is_written(tmp_path):
+    cfg = tmp_path / "case.cfg"
+    cfg.write_text(
+        _single_cfg_text(
+            tmp_path,
+            [
+                "BSPLINE_INITIAL_CLASS_SHAPE_EXPONENT= 0.25",
+            ],
+        )
+    )
+
+    settings = parse_adaptive_options(["-f", str(cfg)])
+    spec = json.loads(Path(settings["modes"]).read_text())
+
+    assert settings["initial_class_shape_exponent"] == pytest.approx(0.25)
+    assert spec["class_shape_exponent"] == pytest.approx(0.25)
+
+
+def test_class_shape_none_ignores_class_shape_exponent(tmp_path):
+    spec = generate_initial_bspline_modes(
+        tmp_path / "none.json",
+        "AIRFOIL",
+        class_shape="none",
+        class_shape_exponent=0.25,
+    )
+    changed = dict(spec)
+    changed["class_shape_exponent"] = 4.0
+    x_values = [0.2, 0.5, 0.8]
+    sides = ["upper", "upper", "upper"]
+
+    assert evaluate_all_modes(spec, x_values, sides) == evaluate_all_modes(
+        changed,
+        x_values,
+        sides,
+    )
+
+
 def test_cli_paths_override_cfg_paths(tmp_path):
     cfg_modes = tmp_path / "cfg_modes.json"
     cli_modes = tmp_path / "cli_modes.json"
@@ -827,6 +1269,81 @@ def test_knot_insertion_growth_ratio_and_fixed_remain_supported(tmp_path):
     assert selected["reduced_ndv_after"] == selected["reduced_ndv_before"] + 1
 
 
+def test_knot_span_depths_persist_between_refinements(tmp_path):
+    modes = tmp_path / "modes.json"
+    spec = generate_initial_bspline_modes(
+        modes,
+        "AIRFOIL",
+        nper_side=7,
+        surface_mode="UPPER",
+        class_shape="none",
+    )
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            symmetry_coupling="NONE",
+            surface_mode="UPPER",
+            nfinal=9,
+            nadd_mode="FIXED",
+            fixed_nadd=1,
+            knot_insertions_per_refine=1,
+            knot_score_mode="RESIDUAL_ENERGY",
+            knot_depth_penalty=True,
+            knot_depth_penalty_mode="POWER",
+            knot_depth_power_gamma=0.5,
+        )
+    )
+    metadata = [
+        {"x_over_c": float(x_value), "side": "upper"}
+        for x_value in np.linspace(0.01, 0.24, 24)
+    ]
+    signal = [
+        math.sin(37.0 * math.pi * row["x_over_c"])
+        for row in metadata
+    ]
+
+    next_modes, _rows, selected = build_next_knot_inserted_modes(
+        spec,
+        metadata,
+        signal,
+        settings,
+    )
+
+    assert next_modes is not None
+    assert "knot_span_depths" not in spec
+    assert selected["parent_depth"] == 1
+    assert selected["child_depth"] == 2
+    left = float(selected["span_left"])
+    mid = float(selected["inserted_knot"])
+    right = float(selected["span_right"])
+    span_depths = next_modes["knot_span_depths"]
+    assert span_depths[_span_key(left, mid)] == 2
+    assert span_depths[_span_key(mid, right)] == 2
+
+    child_metadata = [
+        {"x_over_c": float(x_value), "side": "upper"}
+        for x_value in np.linspace(left + 0.05 * (mid - left), mid - 0.05 * (mid - left), 24)
+    ]
+    child_signal = [
+        math.sin(53.0 * math.pi * row["x_over_c"])
+        for row in child_metadata
+    ]
+
+    refined_modes, _rows, child_selected = build_next_knot_inserted_modes(
+        next_modes,
+        child_metadata,
+        child_signal,
+        settings,
+    )
+
+    assert refined_modes is not None
+    assert child_selected["span_key"] == _span_key(left, mid)
+    assert child_selected["parent_depth"] == 2
+    assert child_selected["child_depth"] == 3
+    assert refined_modes["knot_span_depths"][
+        _span_key(child_selected["span_left"], child_selected["inserted_knot"])
+    ] == 3
+
+
 @pytest.mark.parametrize("surface_mode,side", [("UPPER", "upper"), ("LOWER", "lower")])
 def test_knot_insertion_refines_only_active_half_domain(
     tmp_path,
@@ -937,6 +1454,68 @@ def test_rejected_gradient_guard_eval_is_not_adaptive_scoring_source(tmp_path):
                 **{f"coeff__{mode_id}": 0.0 for mode_id in mode_ids},
             }
         )
+
+    selected = find_eval_dir_for_mode_coefficients(opt_run, spec)
+
+    assert selected.name == "eval_0004"
+
+
+def test_rejected_toxic_clip_is_not_adaptive_scoring_source(tmp_path):
+    opt_run = tmp_path / "opt_run"
+    opt_run.mkdir()
+    spec = generate_initial_bspline_modes(
+        tmp_path / "modes.json", "AIRFOIL", nper_side=4, surface_mode="UPPER"
+    )
+    mode_ids = [mode["id"] for mode in spec["modes"]]
+    fields = ["eval_id", "objective", "status"] + [
+        f"coeff__{mode_id}" for mode_id in mode_ids
+    ]
+    with open(opt_run / "optimization_history.csv", "w", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fields)
+        writer.writeheader()
+        for eval_id, objective, status in (
+            (5, 0.1, "rejected_toxic_clip"),
+            (4, 0.8, "accepted_clipped_restart"),
+        ):
+            writer.writerow(
+                {
+                    "eval_id": eval_id,
+                    "objective": objective,
+                    "status": status,
+                    **{f"coeff__{mode_id}": 0.0 for mode_id in mode_ids},
+                }
+            )
+
+    selected = find_eval_dir_for_mode_coefficients(opt_run, spec)
+
+    assert selected.name == "eval_0004"
+
+
+def test_ok_clipped_weak_is_not_adaptive_scoring_source(tmp_path):
+    opt_run = tmp_path / "opt_run"
+    opt_run.mkdir()
+    spec = generate_initial_bspline_modes(
+        tmp_path / "modes.json", "AIRFOIL", nper_side=4, surface_mode="UPPER"
+    )
+    mode_ids = [mode["id"] for mode in spec["modes"]]
+    fields = ["eval_id", "objective", "status"] + [
+        f"coeff__{mode_id}" for mode_id in mode_ids
+    ]
+    with open(opt_run / "optimization_history.csv", "w", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fields)
+        writer.writeheader()
+        for eval_id, objective, status in (
+            (5, 0.1, "ok_clipped_weak"),
+            (4, 0.8, "ok"),
+        ):
+            writer.writerow(
+                {
+                    "eval_id": eval_id,
+                    "objective": objective,
+                    "status": status,
+                    **{f"coeff__{mode_id}": 0.0 for mode_id in mode_ids},
+                }
+            )
 
     selected = find_eval_dir_for_mode_coefficients(opt_run, spec)
 
@@ -1123,6 +1702,18 @@ def test_gradient_guard_defaults_use_raw_norm_factor_100():
     assert settings["gradient_guard_min_history"] == 3
     assert settings["gradient_guard_floor"] == pytest.approx(1.0e-14)
     assert settings["gradient_guard_restart_limit"] == 2
+
+
+def test_trust_clip_policy_defaults_off_with_requested_phase_one_values():
+    settings = validate_adaptive_options(_minimal_settings())
+
+    assert settings["trust_clip_policy"] == "OFF"
+    assert settings["trust_clip_legacy_beta_min"] == pytest.approx(0.5)
+    assert settings["trust_clip_severe_beta"] == pytest.approx(0.5)
+    assert settings["trust_clip_soft_gnorm_factor"] == pytest.approx(20.0)
+    assert settings["trust_clip_bad_patience"] == 2
+    assert settings["trust_clip_bad_window"] == 5
+    assert settings["trust_clip_restart_limit"] == 1
 
 
 @pytest.mark.parametrize(

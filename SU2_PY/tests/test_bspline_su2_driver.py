@@ -1396,7 +1396,10 @@ def test_slsqp_fun_does_not_record_trigger_on_last_eval_cache_hit(tmp_path, monk
 
     _install_fake_scipy_minimize(monkeypatch, fake_minimize)
     monkeypatch.setattr(driver, "evaluate", fake_evaluate)
-    monkeypatch.setattr(bspline_su2_driver, "record_objective_and_check", fake_record)
+    from SU2.opt.bspline_driver import driver as _bspline_driver_module
+    monkeypatch.setattr(
+        _bspline_driver_module, "record_objective_and_check", fake_record
+    )
 
     driver.optimize(maxiter=1)
 

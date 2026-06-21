@@ -8,6 +8,7 @@ import types
 import numpy as np
 import pytest
 
+import SU2.opt.bspline_su2_driver as bspline_su2_driver
 from SU2.opt.bspline_su2_driver import (
     BSplineThicknessConstraint,
     BSplineSU2Driver,
@@ -1268,6 +1269,139 @@ def test_optimizer_variables_convert_to_physical_and_scale_gradient(tmp_path, mo
     assert captured["objective_seen_by_slsqp"] == pytest.approx(12.0)
     assert captured["gradient_seen_by_slsqp"] == pytest.approx([600.0, -1200.0])
     assert result["coefficients"] == pytest.approx([0.2, -0.3])
+
+
+def test_last_eval_cache_reuses_immediate_nonclipped_physical_design(tmp_path, monkeypatch):
+    driver = _make_driver(tmp_path)
+    calls = []
+
+    def fake_evaluate(coefficients, line_search_info=None):
+        calls.append(list(coefficients))
+        return {
+            "eval_id": len(calls),
+            "objective": 1.0,
+            "gradient": [1.0, 0.0],
+            "coefficients": list(coefficients),
+            "status": "ok",
+        }
+
+    monkeypatch.setattr(driver, "evaluate", fake_evaluate)
+
+    first, first_info = driver._evaluate_optimizer_variables([0.0, 0.0])
+    second, second_info = driver._evaluate_optimizer_variables([0.0, 0.0])
+
+    assert first is second
+    assert calls == [[0.0, 0.0]]
+    assert first_info.get("cache_hit", False) is False
+    assert second_info["cache_hit"] is True
+    assert second_info["last_eval_cache_hit"] is True
+
+
+def test_last_eval_cache_ignores_clipped_physical_design(tmp_path, monkeypatch):
+    spec = _base_spec()
+    spec["modes"][0]["coefficient"] = 0.0
+    spec["modes"][1]["coefficient"] = 0.0
+    monkeypatch.setattr(
+        BSplineSU2Driver,
+        "_probe_geometry_aware_bounds",
+        lambda self: ([], [[1.0, 0.0], [0.0, 1.0]]),
+    )
+    driver = _make_driver(tmp_path, spec=spec, opt_line_search_bound=0.25)
+    driver._configure_line_search_bound()
+    calls = []
+
+    def fake_evaluate(coefficients, line_search_info=None):
+        calls.append(list(coefficients))
+        return {
+            "eval_id": len(calls),
+            "objective": 1.0,
+            "gradient": [1.0, 0.0],
+            "coefficients": list(coefficients),
+            "status": "ok",
+        }
+
+    monkeypatch.setattr(driver, "evaluate", fake_evaluate)
+
+    _first, first_info = driver._evaluate_optimizer_variables([1.0, 0.0])
+    _second, second_info = driver._evaluate_optimizer_variables([1.0, 0.0])
+
+    assert first_info["line_search_beta"] == pytest.approx(0.25)
+    assert second_info["line_search_beta"] == pytest.approx(0.25)
+    assert calls == [[0.25, 0.0], [0.25, 0.0]]
+    assert second_info.get("last_eval_cache_hit", False) is False
+
+
+def test_last_eval_cache_ignores_special_trust_clip_classes(tmp_path, monkeypatch):
+    driver = _make_driver(tmp_path)
+    driver._last_eval_physical_key = cache_key([0.0, 0.0], driver.cache_tol)
+    driver._last_eval_result = {
+        "trust_clip_class": "accepted_clipped_restart",
+        "objective": 1.0,
+        "gradient": [1.0, 0.0],
+    }
+    driver._last_eval_info = {"line_search_beta": 1.0}
+    calls = []
+
+    def fake_evaluate(coefficients, line_search_info=None):
+        calls.append(list(coefficients))
+        return {
+            "eval_id": len(calls),
+            "objective": 0.9,
+            "gradient": [1.0, 0.0],
+            "coefficients": list(coefficients),
+            "status": "ok",
+        }
+
+    monkeypatch.setattr(driver, "evaluate", fake_evaluate)
+
+    result, info = driver._evaluate_optimizer_variables([0.0, 0.0])
+
+    assert result["objective"] == pytest.approx(0.9)
+    assert calls == [[0.0, 0.0]]
+    assert info.get("last_eval_cache_hit", False) is False
+
+
+def test_slsqp_fun_does_not_record_trigger_on_last_eval_cache_hit(tmp_path, monkeypatch):
+    driver = _make_driver(tmp_path)
+    recorded = []
+    calls = []
+
+    def fake_record(project, objective):
+        recorded.append(float(objective))
+
+    def fake_evaluate(coefficients, line_search_info=None):
+        calls.append(list(coefficients))
+        return {
+            "eval_id": len(calls),
+            "objective": 2.0,
+            "gradient": [1.0, 0.0],
+            "coefficients": list(coefficients),
+            "status": "ok",
+        }
+
+    def fake_minimize(fun, x0, jac, bounds, constraints, method, callback, options):
+        first = fun(list(x0))
+        second = fun(list(x0))
+        jac(list(x0))
+        return types.SimpleNamespace(
+            x=list(x0),
+            fun=first,
+            success=True,
+            message=f"second={second}",
+            status=0,
+            nit=0,
+            nfev=2,
+            njev=1,
+        )
+
+    _install_fake_scipy_minimize(monkeypatch, fake_minimize)
+    monkeypatch.setattr(driver, "evaluate", fake_evaluate)
+    monkeypatch.setattr(bspline_su2_driver, "record_objective_and_check", fake_record)
+
+    driver.optimize(maxiter=1)
+
+    assert calls == [[0.001, -0.002]]
+    assert recorded == [2.0]
 
 
 def test_line_search_bound_limits_physical_normal_jump(tmp_path, monkeypatch):

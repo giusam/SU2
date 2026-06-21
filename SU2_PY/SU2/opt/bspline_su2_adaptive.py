@@ -3341,6 +3341,53 @@ def gradient_guard_next_action_for_level(
     return "refine" if refinement_available else "restart_same_level"
 
 
+def _trigger_resume_state_from_result(result):
+    return {
+        "trigger_history": list(result.get("trigger_history", [])),
+        "trigger_state": result.get("trigger_state", None),
+        "refinement_triggered": bool(result.get("refinement_triggered", False)),
+    }
+
+
+def _append_restart_history_rows(
+    accumulated_rows,
+    accumulated_fieldnames,
+    history_filename,
+    restart_id,
+    restart_reason,
+):
+    history_filename = Path(history_filename)
+    if not history_filename.exists():
+        return
+    with open(history_filename, "r", newline="") as fp:
+        reader = csv.DictReader(fp)
+        if not reader.fieldnames:
+            return
+        for field in list(reader.fieldnames) + ["restart_id", "restart_reason"]:
+            if field not in accumulated_fieldnames:
+                accumulated_fieldnames.append(field)
+        for row in reader:
+            row["restart_id"] = int(restart_id)
+            row["restart_reason"] = str(restart_reason)
+            accumulated_rows.append(row)
+
+
+def _write_restart_history_rows(history_filename, rows, fieldnames):
+    if not rows:
+        return
+    history_filename = Path(history_filename)
+    history_filename.parent.mkdir(parents=True, exist_ok=True)
+    for row in rows:
+        for field in row:
+            if field not in fieldnames:
+                fieldnames.append(field)
+    with open(history_filename, "w", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+
 def run_with_gradient_guard_restarts(
     run_optimizer,
     optimizer_kwargs,
@@ -3354,15 +3401,36 @@ def run_with_gradient_guard_restarts(
 ):
     """Run a level, resetting SLSQP state after controlled safety stops."""
 
+    optimizer_kwargs = dict(optimizer_kwargs)
     restart_count = 0
     trust_clip_restart_count = 0
+    attempt_id = 0
+    attempt_restart_reason = ""
+    trigger_resume_state = None
+    full_level_history_rows = []
+    full_level_history_fieldnames = []
+    final_history_filename = None
     restart_limit = int(restart_limit)
     trust_clip_restart_limit = int(trust_clip_restart_limit)
     if refinement_available is None:
         refinement_available = str(next_action) == "refine"
     refinement_available = bool(refinement_available)
     while True:
+        if trigger_resume_state is None:
+            optimizer_kwargs.pop("trigger_resume_state", None)
+        else:
+            optimizer_kwargs["trigger_resume_state"] = trigger_resume_state
         result = run_optimizer(**optimizer_kwargs)
+        final_history_filename = result.get("optimization_history", final_history_filename)
+        if final_history_filename:
+            _append_restart_history_rows(
+                full_level_history_rows,
+                full_level_history_fieldnames,
+                final_history_filename,
+                attempt_id,
+                attempt_restart_reason,
+            )
+        current_trigger_resume_state = _trigger_resume_state_from_result(result)
         gradient_triggered = result.get("gradient_guard_triggered", False)
         trust_clip_triggered = result.get("trust_clip_triggered", False)
         if not gradient_triggered and not trust_clip_triggered:
@@ -3407,9 +3475,22 @@ def run_with_gradient_guard_restarts(
             count = trust_clip_restart_count
             limit = trust_clip_restart_limit
         shutil.copy2(optimized_modes_filename, active_modes_start_filename)
+        trigger_resume_state = current_trigger_resume_state
+        print(
+            "[PROGRESSIVE_BSPLINE][TRIGGER] preserve on restart_same_level "
+            f"| history_len={len(trigger_resume_state['trigger_history'])}"
+        )
         print(
             f"[PROGRESSIVE_BSPLINE] {label} restart_same_level "
             f"attempt={count}/{limit} from restored physical design"
+        )
+        attempt_id += 1
+        attempt_restart_reason = label
+    if final_history_filename:
+        _write_restart_history_rows(
+            final_history_filename,
+            full_level_history_rows,
+            full_level_history_fieldnames,
         )
     result["gradient_guard_restart_count"] = restart_count
     result["trust_clip_restart_count"] = trust_clip_restart_count
@@ -3452,6 +3533,10 @@ def progressive_bspline_su2_shape_optimization(settings):
             kept=kept,
             added=added,
             log_active_modes=settings.get("log_active_modes", False),
+        )
+        print(
+            "[PROGRESSIVE_BSPLINE][TRIGGER] reset on new refinement level "
+            f"| level={level_id}"
         )
 
         if settings.get("dry_run", False):

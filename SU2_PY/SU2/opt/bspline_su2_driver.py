@@ -87,6 +87,11 @@ SAFE_EVALUATION_STATUSES = {
     "ok_clipped_weak",
     "benign_clipped_legacy",
 }
+LAST_EVAL_CACHE_BLOCKED_TRUST_CLIP_CLASSES = (
+    "weak_clipped_progress",
+    "accepted_clipped_restart",
+    "rejected_toxic_clip",
+)
 
 ALLOWED_TRUST_CLIP_POLICIES = ("OFF", "ACCEPT_RESTART")
 
@@ -2267,6 +2272,9 @@ class BSplineSU2Driver:
         self._line_search_anchor_physical = list(self.initial_coefficients)
         self._local_step_anchor_reduced = list(self.initial_reduced_coefficients)
         self._cache = {}
+        self._last_eval_physical_key = None
+        self._last_eval_result = None
+        self._last_eval_info = None
         self._history_records = []
         self.last_safe_entry = None
         self.best_safe_entry = None
@@ -3020,13 +3028,44 @@ class BSplineSU2Driver:
         info["requested_x"] = list(physical_trial)
         info["evaluated_x"] = list(physical_eval)
         info["requested_optimizer_x"] = [float(value) for value in variables]
+        physical_key = cache_key(physical_eval, self.cache_tol)
+        beta_tol = float(self.trust_clip_options.get("beta_tol", 1.0e-12))
+        beta_now = float(info.get("beta_eff", info.get("line_search_beta", 1.0)))
+        if (
+            self._last_eval_physical_key == physical_key
+            and self._last_eval_result is not None
+            and self._last_eval_info is not None
+        ):
+            beta_prev = float(
+                self._last_eval_info.get(
+                    "beta_eff",
+                    self._last_eval_info.get("line_search_beta", 1.0),
+                )
+            )
+            prev_class = str(self._last_eval_result.get("trust_clip_class", ""))
+            if (
+                beta_prev >= 1.0 - beta_tol
+                and beta_now >= 1.0 - beta_tol
+                and prev_class not in LAST_EVAL_CACHE_BLOCKED_TRUST_CLIP_CLASSES
+            ):
+                cached_info = dict(self._last_eval_info)
+                cached_info["cache_hit"] = True
+                cached_info["last_eval_cache_hit"] = True
+                cached_info["requested_optimizer_x"] = [float(value) for value in variables]
+                cached_info["requested_x"] = list(physical_trial)
+                cached_info["evaluated_x"] = list(physical_eval)
+                return self._last_eval_result, cached_info
         if self._trust_clip_enabled():
             pending = self._trust_clip_by_requested_key.get(
                 self._pending_trust_clip_key(variables)
             )
             if pending is not None:
                 return pending["result"], info
-        return self.evaluate(physical_eval, line_search_info=info), info
+        result = self.evaluate(physical_eval, line_search_info=info)
+        self._last_eval_physical_key = physical_key
+        self._last_eval_result = result
+        self._last_eval_info = dict(info)
+        return result, info
 
     def _evaluate_reduced_physical(self, reduced_coefficients):
         physical_trial = self.expand_reduced_physical(reduced_coefficients)
@@ -3799,6 +3838,28 @@ class BSplineSU2Driver:
             )
         )
 
+    def _apply_trigger_resume_state(self, trigger_resume_state=None):
+        state = dict(trigger_resume_state or {})
+        self.trigger_project.trigger_history = list(state.get("trigger_history", []))
+        self.trigger_project.trigger_state = state.get("trigger_state", None)
+        self.trigger_project.refinement_triggered = bool(
+            state.get("refinement_triggered", False)
+        )
+
+    def _trigger_resume_state(self):
+        return {
+            "trigger_history": list(self.trigger_project.trigger_history),
+            "trigger_state": self.trigger_project.trigger_state,
+            "refinement_triggered": bool(self.trigger_project.refinement_triggered),
+        }
+
+    def _attach_trigger_state(self, result):
+        result["trigger_history"] = list(self.trigger_project.trigger_history)
+        result["trigger_state"] = self.trigger_project.trigger_state
+        result["trigger_history_len"] = len(self.trigger_project.trigger_history)
+        result["refinement_triggered"] = bool(self.trigger_project.refinement_triggered)
+        return result
+
     def _controlled_gradient_guard_result(self, stop, optimizer="SLSQP"):
         safe = stop.last_safe_entry
         self.restore_modes_from_entry(safe)
@@ -3817,7 +3878,7 @@ class BSplineSU2Driver:
             print("Raw-gradient guard stop    (controlled rollback)")
             print(f"            Restored evaluation: {safe_eval_id}")
             print(f"            Current function value: {objective:.12g}")
-        return {
+        return self._attach_trigger_state({
             "optimizer": optimizer,
             "success": True,
             "message": "Raw-gradient guard stop: restored last safe evaluation",
@@ -3831,7 +3892,7 @@ class BSplineSU2Driver:
             "gradient_guard_next_action": self.gradient_guard_next_action,
             "early_refine_triggered": refine,
             "refinement_triggered": refine,
-        }
+        })
 
     def _controlled_trust_clip_result(self, stop, optimizer="SLSQP"):
         rollback = stop.rollback_entry
@@ -3850,7 +3911,7 @@ class BSplineSU2Driver:
         refine = next_action == "refine"
         if refine:
             self.trigger_project.refinement_triggered = True
-        return {
+        return self._attach_trigger_state({
             "optimizer": optimizer,
             "success": True,
             "message": f"Trust-clip controlled stop: {stop.classification}",
@@ -3866,12 +3927,16 @@ class BSplineSU2Driver:
             "trust_clip_next_action": next_action,
             "early_refine_triggered": refine,
             "refinement_triggered": refine,
-        }
+        })
 
-    def optimize(self, maxiter=5, fallback_step=0.1, gradient_tol=1.0e-8):
-        self.trigger_project.trigger_history = []
-        self.trigger_project.trigger_state = None
-        self.trigger_project.refinement_triggered = False
+    def optimize(
+        self,
+        maxiter=5,
+        fallback_step=0.1,
+        gradient_tol=1.0e-8,
+        trigger_resume_state=None,
+    ):
+        self._apply_trigger_resume_state(trigger_resume_state)
         self.configure_geometry_aware_bounds()
         self._configure_line_search_bound()
         self.configure_thickness_constraint()
@@ -3883,11 +3948,11 @@ class BSplineSU2Driver:
                     "SciPy is required when PROGRESSIVE_THICKNESS_CONSTRAINT=YES"
                 )
             try:
-                return self._optimize_projected_gradient_descent(
+                return self._attach_trigger_state(self._optimize_projected_gradient_descent(
                     maxiter=maxiter,
                     step_size=fallback_step,
                     gradient_tol=gradient_tol,
-                )
+                ))
             except GradientGuardStop as stop:
                 return self._controlled_gradient_guard_result(
                     stop,
@@ -3900,12 +3965,12 @@ class BSplineSU2Driver:
         self._print_slsqp_parameters(maxiter, optimizer_bounds=bounds_u)
 
         def fun(x):
-            result, _info = self._evaluate_optimizer_variables(list(x))
+            result, info = self._evaluate_optimizer_variables(list(x))
             if result.get("trust_clip_class") not in (
                 "weak_clipped_progress",
                 "accepted_clipped_restart",
                 "rejected_toxic_clip",
-            ):
+            ) and not info.get("cache_hit", False):
                 record_objective_and_check(
                     self.trigger_project,
                     float(result["objective"]),
@@ -3986,7 +4051,7 @@ class BSplineSU2Driver:
             print("            Iterations: {}".format(int(getattr(result, "nit", self._slsqp_major_iter))))
             print("            Function evaluations: {}".format(int(getattr(result, "nfev", len(self._history_records)))))
             print("            Gradient evaluations: {}".format(int(getattr(result, "njev", len(self._history_records)))))
-        return {
+        return self._attach_trigger_state({
             "optimizer": "SLSQP",
             "success": True if early_refine_triggered else bool(result.success),
             "message": (
@@ -4005,7 +4070,7 @@ class BSplineSU2Driver:
             "refinement_triggered": bool(
                 getattr(self.trigger_project, "refinement_triggered", False)
             ),
-        }
+        })
 
     def _optimize_projected_gradient_descent(self, maxiter, step_size, gradient_tol):
         self.configure_geometry_aware_bounds()
@@ -4126,6 +4191,7 @@ def run_bspline_su2_optimization(
     local_step_limit=False,
     local_step_limit_ratio=200.0,
     trigger_opts=None,
+    trigger_resume_state=None,
     progressive_label="PROGRESSIVE_BSPLINE",
     deformation_direction_mode=None,
     le_safe_direction=False,
@@ -4192,7 +4258,11 @@ def run_bspline_su2_optimization(
         le_safe_x1=le_safe_x1,
         le_safe_power=le_safe_power,
     )
-    result = driver.optimize(maxiter=maxiter, fallback_step=fallback_step)
+    result = driver.optimize(
+        maxiter=maxiter,
+        fallback_step=fallback_step,
+        trigger_resume_state=trigger_resume_state,
+    )
     result["optimization_history"] = str(driver.optimization_history_filename)
     result["optimized_modes"] = str(driver.optimized_modes_filename)
     result["workdir"] = str(driver.workdir)

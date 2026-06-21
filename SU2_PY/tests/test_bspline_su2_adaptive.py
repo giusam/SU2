@@ -247,6 +247,77 @@ def test_trust_clip_accepted_restart_copies_evaluated_modes_and_restarts(tmp_pat
     assert result["trust_clip_restart_count"] == 1
 
 
+def test_restart_same_level_preserves_trigger_state_and_full_history(tmp_path):
+    start = tmp_path / "active_modes_start.json"
+    optimized = tmp_path / "optimized_modes.json"
+    history = tmp_path / "optimization_history.csv"
+    start.write_text("old")
+    calls = []
+
+    def write_history(eval_id, objective):
+        with open(history, "w", newline="") as fp:
+            writer = csv.DictWriter(
+                fp,
+                fieldnames=["eval_id", "objective", "status"],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "eval_id": eval_id,
+                    "objective": objective,
+                    "status": "ok",
+                }
+            )
+
+    def fake_run(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            optimized.write_text("accepted-evaluated")
+            write_history(0, 1.0)
+            return {
+                "trust_clip_triggered": True,
+                "trust_clip_class": "accepted_clipped_restart",
+                "trust_clip_next_action": "restart_same_level",
+                "trigger_history": [1.2, 1.0],
+                "trigger_state": {"best": 1.0},
+                "refinement_triggered": False,
+                "optimization_history": str(history),
+                "success": True,
+            }
+        assert kwargs["trigger_resume_state"]["trigger_history"] == [1.2, 1.0]
+        assert kwargs["trigger_resume_state"]["trigger_state"] == {"best": 1.0}
+        assert start.read_text() == "accepted-evaluated"
+        write_history(1, 0.9)
+        return {
+            "trust_clip_triggered": False,
+            "trigger_history": [1.2, 1.0, 0.9],
+            "trigger_state": {"best": 0.9},
+            "refinement_triggered": False,
+            "optimization_history": str(history),
+            "success": True,
+        }
+
+    result = run_with_gradient_guard_restarts(
+        fake_run,
+        {},
+        active_modes_start_filename=start,
+        optimized_modes_filename=optimized,
+        next_action="restart_same_level",
+        trust_clip_restart_limit=1,
+    )
+
+    with open(history, "r", newline="") as fp:
+        rows = list(csv.DictReader(fp))
+
+    assert len(calls) == 2
+    assert "trigger_resume_state" not in calls[0]
+    assert result["trust_clip_restart_count"] == 1
+    assert result["trigger_history"] == [1.2, 1.0, 0.9]
+    assert [row["eval_id"] for row in rows] == ["0", "1"]
+    assert [row["restart_id"] for row in rows] == ["0", "1"]
+    assert [row["restart_reason"] for row in rows] == ["", "TRUST_CLIP"]
+
+
 @pytest.mark.parametrize(
     "reason",
     ["toxic_clipped_repeated", "clipped_stagnation_plateau"],

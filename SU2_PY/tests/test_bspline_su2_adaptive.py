@@ -1762,6 +1762,7 @@ def test_legacy_candidate_cfg_keys_fail_clearly(tmp_path, cfg_key, cfg_value):
 def test_default_adaptive_sensitivity_weighting_is_nodal():
     settings = validate_adaptive_options(_minimal_settings())
     assert settings["sensitivity_weighting"] == "NODAL"
+    assert settings["sensitivity_source"] == "DOT_AD_TRANSFER"
 
 
 def test_gradient_guard_defaults_use_raw_norm_factor_100():
@@ -1826,7 +1827,16 @@ def test_generate_initial_modes_writes_expected_knot_vector(tmp_path):
 
 def test_auto_templates_are_generated_under_workdir(tmp_path):
     cfg = tmp_path / "case.cfg"
-    cfg.write_text(_single_cfg_text(tmp_path))
+    cfg.write_text(
+        _single_cfg_text(
+            tmp_path,
+            [
+                "MESH_FORMAT= SU2",
+                "DV_PARAM= ( 1, 0.5 )",
+                "DV_VALUE= 0.0",
+            ],
+        )
+    )
     settings = parse_adaptive_options(["-f", str(cfg)])
 
     templates = tmp_path / "run" / "templates"
@@ -1838,11 +1848,33 @@ def test_auto_templates_are_generated_under_workdir(tmp_path):
     assert "DV_KIND= SURFACE_FILE" in def_text
     assert "DV_FILENAME= surface_positions.dat" in def_text
     assert "DV_MARKER= ( AIRFOIL )" in def_text
+    def_keys = [
+        line.split("=", 1)[0].strip().upper()
+        for line in def_text.splitlines()
+        if line.strip() and not line.lstrip().startswith(("%", "#")) and "=" in line
+    ]
+    assert def_keys.count("MESH_FORMAT") == 1
+    assert def_keys.count("DV_PARAM") == 1
+    assert def_keys.count("DV_VALUE") == 1
 
     primal_text = (templates / "primal_template_auto.cfg").read_text()
     assert "MATH_PROBLEM= DIRECT" in primal_text
+    primal_keys = [
+        line.split("=", 1)[0].strip().upper()
+        for line in primal_text.splitlines()
+        if line.strip() and not line.lstrip().startswith(("%", "#")) and "=" in line
+    ]
+    assert "DV_PARAM" not in primal_keys
+    assert "DV_VALUE" not in primal_keys
     adjoint_text = (templates / "adjoint_template_auto.cfg").read_text()
     assert "MATH_PROBLEM= DISCRETE_ADJOINT" in adjoint_text
+    adjoint_keys = [
+        line.split("=", 1)[0].strip().upper()
+        for line in adjoint_text.splitlines()
+        if line.strip() and not line.lstrip().startswith(("%", "#")) and "=" in line
+    ]
+    assert "DV_PARAM" not in adjoint_keys
+    assert "DV_VALUE" not in adjoint_keys
 
 
 def test_adaptive_settings_json_records_resolved_paths(tmp_path):
@@ -1856,5 +1888,6 @@ def test_adaptive_settings_json_records_resolved_paths(tmp_path):
     assert recorded["modes"] == str((tmp_path / "run" / "generated" / "initial_modes.json").resolve())
     assert recorded["eval_layout"] == "DSN"
     assert recorded["sensitivity_weighting"] == "NODAL"
+    assert recorded["sensitivity_source"] == "DOT_AD_TRANSFER"
     assert recorded["refine_mode"] == "KNOT_INSERTION"
     assert recorded["refine_state"] == "INITIAL_MESH_KEEP_DV"

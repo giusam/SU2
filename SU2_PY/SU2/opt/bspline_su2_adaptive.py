@@ -47,6 +47,7 @@ from SU2.opt.bspline_driver.constants import (
     ALLOWED_EVAL_LAYOUTS,
     ALLOWED_SYMMETRY_COUPLINGS,
 )
+from SU2.opt.bspline_driver.commands import ALLOWED_SENSITIVITY_SOURCES
 from SU2.opt.bspline_driver.errors import BSplineSU2DriverError
 from SU2.opt.bspline_driver.reduction import (
     active_coefficient_vector,
@@ -461,6 +462,12 @@ def _build_arg_parser():
     parser.add_argument("--fixed-nadd", type=int, default=1)
     parser.add_argument("--eval-layout", default="DSN", choices=ALLOWED_EVAL_LAYOUTS)
     parser.add_argument("--objective-adjoint", default="drag")
+    parser.add_argument(
+        "--sensitivity-source",
+        default="DOT_AD_TRANSFER",
+        choices=ALLOWED_SENSITIVITY_SOURCES,
+    )
+    parser.add_argument("--geometry-fd-eps", type=float, default=1.0e-6)
     parser.add_argument("--symmetry-coupling", default="NONE", choices=ALLOWED_SYMMETRY_COUPLINGS)
     parser.add_argument("--surface-mode", default="BOTH", choices=ALLOWED_SURFACE_MODES)
     parser.add_argument(

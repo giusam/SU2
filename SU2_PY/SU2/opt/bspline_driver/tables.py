@@ -9,6 +9,25 @@ from .errors import (
     _normalized_name,
 )
 
+FUNCTION_HISTORY_COLUMNS = {
+    "DRAG": "CD",
+    "LIFT": "CL",
+    "SIDEFORCE": "CSF",
+    "EFFICIENCY": "CL/CD",
+    "MOMENTX": "CMx",
+    "MOMENTY": "CMy",
+    "MOMENTZ": "CMz",
+    "FORCEX": "CFx",
+    "FORCEY": "CFy",
+    "FORCEZ": "CFz",
+}
+
+
+def history_column_for_function(function_name):
+    normalized = _normalized_name(function_name).upper()
+    return FUNCTION_HISTORY_COLUMNS.get(normalized, str(function_name))
+
+
 def _read_table(filename):
     lines = []
     with open(filename, "r") as fp:

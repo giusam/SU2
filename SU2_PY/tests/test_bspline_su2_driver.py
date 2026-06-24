@@ -4,11 +4,14 @@ import json
 import math
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+import SU2.opt.bspline_driver.driver as bspline_driver_module
 import SU2.opt.bspline_su2_driver as bspline_su2_driver
+from SU2.opt.bspline_driver.geometry_constraints import BSplineAirfoilAreaMetric
 from SU2.opt.bspline_su2_driver import (
     BSplineThicknessConstraint,
     BSplineSU2Driver,
@@ -1539,6 +1542,160 @@ def test_disabled_thickness_constraint_passes_no_slsqp_constraints(tmp_path, mon
     assert captured["constraints"] == []
 
 
+def test_airfoil_area_metric_value_and_gradient_for_vertical_bspline_mode():
+    metadata = [
+        {
+            "x": 0.0,
+            "y": 0.0,
+            "normal_x": 0.0,
+            "normal_y": 1.0,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": 1.0,
+        },
+        {
+            "x": 1.0,
+            "y": 0.0,
+            "normal_x": 0.0,
+            "normal_y": 1.0,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": 1.0,
+        },
+        {
+            "x": 1.0,
+            "y": 1.0,
+            "normal_x": 0.0,
+            "normal_y": 1.0,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": 1.0,
+        },
+        {
+            "x": 0.0,
+            "y": 1.0,
+            "normal_x": 0.0,
+            "normal_y": 1.0,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": 1.0,
+        },
+    ]
+    basis = np.asarray([[0.0], [0.0], [1.0], [1.0]], dtype=float)
+    metric = BSplineAirfoilAreaMetric(
+        metadata,
+        basis,
+        ["top"],
+        closed=True,
+    )
+
+    value, gradient = metric.value_and_gradient([0.2])
+
+    assert value == pytest.approx(1.2)
+    assert gradient.tolist() == pytest.approx([1.0])
+
+
+def test_geometry_constraint_uses_su2_geo_fd_backend(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_command(command, cwd, log_file, show_command=False, stream_output=False, stage=None):
+        cwd = Path(cwd)
+        log_file = Path(log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text("$ fake\n")
+        calls.append((stage, list(command), cwd))
+        eval_dir = cwd
+        while eval_dir.name and not eval_dir.name.startswith("eval_"):
+            eval_dir = eval_dir.parent
+        if stage == "geometry_su2_def":
+            (eval_dir / "deform" / "deformed_mesh.su2").write_text("mesh")
+        if stage == "geometry_su2_geo":
+            modes = json.loads((eval_dir / "modes_current.json").read_text())
+            coefficient = float(modes["modes"][0]["coefficient"])
+            value = 1.0 + 2.0 * coefficient
+            (cwd / "of_func.csv").write_text(
+                '"AIRFOIL_AREA"\n{:.16g}\n'.format(value)
+            )
+
+    monkeypatch.setattr(bspline_driver_module, "run_command", fake_run_command)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(coefficient=0.25),
+        geometry_fd_eps=1.0e-5,
+    )
+
+    result = driver.evaluate_geometry_constraint_function([0.25], "AIRFOIL_AREA")
+
+    assert result["source"] == "SU2_GEO"
+    assert result["value"] == pytest.approx(1.5)
+    assert result["gradient"] == pytest.approx([2.0])
+    assert [call[0] for call in calls].count("geometry_su2_geo") == 2
+    geo_cfgs = list((Path(result["eval_dir"]) / "geometry").glob("geo.cfg"))
+    assert geo_cfgs
+    assert "GEO_PARAM= AIRFOIL_AREA" in geo_cfgs[0].read_text()
+    assert "GEO_MODE= FUNCTION" in geo_cfgs[0].read_text()
+
+
+def test_native_su2_constraints_use_slsqp_sign_convention(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_minimize(fun, x0, jac, bounds, constraints, method, callback, options):
+        constraints = list(constraints)
+        captured["types"] = [constraint["type"] for constraint in constraints]
+        captured["values"] = [constraint["fun"](x0) for constraint in constraints]
+        captured["jacs"] = [constraint["jac"](x0).tolist() for constraint in constraints]
+        return types.SimpleNamespace(
+            x=list(x0),
+            fun=1.0,
+            success=True,
+            message="ok",
+            status=0,
+            nit=0,
+            nfev=0,
+            njev=0,
+        )
+
+    _install_fake_scipy_minimize(monkeypatch, fake_minimize)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        native_constraints=(
+            "(LIFT>0.5)*2.0; (DRAG<0.02)*3.0; "
+            "(MOMENT_Z=0.0)*4.0; (AIRFOIL_AREA>0.1)*5.0"
+        ),
+        opt_gradient_factor=10.0,
+        opt_relax_factor=0.5,
+    )
+
+    def fake_constraint_eval(coefficients, function_name):
+        data = {
+            "LIFT": (0.6, [1.0]),
+            "DRAG": (0.03, [2.0]),
+            "MOMENT_Z": (-0.1, [3.0]),
+        }
+        value, gradient = data[str(function_name).upper()]
+        return {"value": value, "gradient": gradient}
+
+    def fake_geometry_constraint_eval(coefficients, function_name):
+        assert str(function_name).upper() == "AIRFOIL_AREA"
+        return {"value": 0.2, "gradient": [4.0]}
+
+    monkeypatch.setattr(
+        driver,
+        "evaluate_constraint_function",
+        fake_constraint_eval,
+    )
+    monkeypatch.setattr(
+        driver,
+        "evaluate_geometry_constraint_function",
+        fake_geometry_constraint_eval,
+    )
+
+    driver.optimize(maxiter=1)
+
+    assert captured["types"] == ["ineq", "ineq", "eq", "ineq"]
+    assert captured["values"] == pytest.approx([2.0, -0.3, -4.0, 5.0])
+    assert np.asarray(captured["jacs"], dtype=float) == pytest.approx(
+        np.asarray([[5.0], [-10.0], [15.0], [20.0]], dtype=float)
+    )
+
+
 def test_enabled_bspline_thickness_constraint_builds_from_closed_airfoil_mesh(
     tmp_path,
     monkeypatch,
@@ -1825,12 +1982,34 @@ def test_command_builder_produces_expected_commands(tmp_path):
         "SU2_CFD_AD",
         "adjoint.cfg",
     ]
+    assert commands["dot_ad"] == [
+        "mpirun",
+        "-n",
+        "6",
+        "SU2_DOT_AD",
+        "dot_ad.cfg",
+    ]
     assert paths.deform_dir == tmp_path / "eval_0000" / "deform"
     assert paths.direct_dir == tmp_path / "eval_0000" / "direct"
     assert paths.adjoint_dir == tmp_path / "eval_0000" / "adjoint_drag"
     assert "--prefer-vector" in commands["bspline_dot"]
     assert "--sensitivity-weighting" in commands["bspline_dot"]
     assert commands["bspline_dot"][commands["bspline_dot"].index("--sensitivity-weighting") + 1] == "NODAL"
+    assert "adjoint_drag/surface_sens.csv" in commands["bspline_dot"]
+
+
+def test_command_builder_legacy_surface_adjoint_source(tmp_path):
+    paths = build_eval_paths(tmp_path / "eval_0000")
+
+    commands = build_eval_commands(
+        paths,
+        base_mesh="/abs/base_mesh.su2",
+        marker="airfoil",
+        sensitivity_source="CFD_ADJOINT_SURFACE",
+    )
+
+    assert "dot_ad" not in commands
+    assert "adjoint_drag/surface_adjoint.csv" in commands["bspline_dot"]
 
 
 def test_command_builder_uses_vertical_direction_without_le_safe_options(tmp_path):
@@ -2010,6 +2189,7 @@ def test_dsn_eval_layout_patches_relative_solver_paths(tmp_path):
     assert paths.def_cfg.exists()
     assert paths.primal_cfg.exists()
     assert paths.adjoint_cfg.exists()
+    assert paths.dot_ad_cfg.exists()
     assert "MESH_FILENAME= ../deform/deformed_mesh.su2" in paths.primal_cfg.read_text()
     adjoint_text = paths.adjoint_cfg.read_text()
     assert "MESH_FILENAME= ../deform/deformed_mesh.su2" in adjoint_text
@@ -2017,6 +2197,14 @@ def test_dsn_eval_layout_patches_relative_solver_paths(tmp_path):
     assert "RESTART_FILENAME= ../direct/restart_flow.dat" in adjoint_text
     assert "SURFACE_ADJ_FILENAME= surface_adjoint" in adjoint_text
     assert "VOLUME_ADJ_FILENAME= volume_adjoint" in adjoint_text
+    dot_text = paths.dot_ad_cfg.read_text()
+    assert "DV_KIND= SURFACE_FILE" in dot_text
+    assert "DV_MARKER= ( airfoil )" in dot_text
+    assert "DV_FILENAME= ../deform/surface_positions.dat" in dot_text
+    assert "SURFACE_SENS_FILENAME= surface_sens" in dot_text
+    assert "VOLUME_SENS_FILENAME= volume_sens" in dot_text
+    assert "OUTPUT_FILES= ( SURFACE_CSV )" in dot_text
+    assert "OUTPUT_PRECISION= 15" in dot_text
 
 
 def test_reused_workdir_eval_id_is_independent_from_run_eval_index(tmp_path):
@@ -2112,6 +2300,7 @@ def test_dsn_eval_aliases_symlink_or_copy_root_compatibility_files(tmp_path):
     paths.surface_adjoint.parent.mkdir(parents=True)
     paths.metadata.write_text("metadata")
     paths.surface_adjoint.write_text("adjoint")
+    paths.surface_sens.write_text("sens")
     paths.primal_history.write_text("primal")
     paths.adjoint_history.write_text("adjoint history")
 
@@ -2119,6 +2308,7 @@ def test_dsn_eval_aliases_symlink_or_copy_root_compatibility_files(tmp_path):
 
     assert (paths.eval_dir / "bspline_surface_metadata.csv").read_text() == "metadata"
     assert (paths.eval_dir / "surface_adjoint.csv").read_text() == "adjoint"
+    assert (paths.eval_dir / "surface_sens.csv").read_text() == "sens"
     assert (paths.eval_dir / "history_primal.csv").read_text() == "primal"
     assert (paths.eval_dir / "history_adjoint.csv").read_text() == "adjoint history"
 
@@ -2398,11 +2588,13 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
         "OPT_BOUND_UPPER= 0.03\n"
         "OPT_LINE_SEARCH_BOUND= 0.004\n"
         "BSPLINE_EVAL_LAYOUT= DSN\n"
+        "BSPLINE_SENSITIVITY_SOURCE= CFD_ADJOINT_SURFACE\n"
+        "BSPLINE_GEOMETRY_FD_EPS= 2e-6\n"
         "BSPLINE_SYMMETRY_COUPLING= NORMAL_EQUAL\n"
         "BSPLINE_DEFORMATION_DIRECTION= VERTICAL\n"
         "BSPLINE_LOCAL_STEP_LIMIT= YES\n"
         "BSPLINE_LOCAL_STEP_LIMIT_RATIO= 150.0\n"
-        "OPT_CONSTRAINT= THICKNESS\n"
+        "OPT_CONSTRAINT= (LIFT>0.5)*2.0; (DRAG<0.02)*0.5\n"
     )
 
     values = parse_optimizer_config(config)
@@ -2417,6 +2609,8 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert values["OPT_BOUND_UPPER"] == pytest.approx(0.03)
     assert values["OPT_LINE_SEARCH_BOUND"] == pytest.approx(0.004)
     assert values["BSPLINE_EVAL_LAYOUT"] == "DSN"
+    assert values["BSPLINE_SENSITIVITY_SOURCE"] == "CFD_ADJOINT_SURFACE"
+    assert values["BSPLINE_GEOMETRY_FD_EPS"] == pytest.approx(2.0e-6)
     assert values["BSPLINE_SYMMETRY_COUPLING"] == "NORMAL_EQUAL"
     assert values["BSPLINE_DEFORMATION_DIRECTION"] == "VERTICAL"
     assert values["BSPLINE_LOCAL_STEP_LIMIT"] is True
@@ -2424,7 +2618,7 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert values["BSPLINE_MAX_NORMAL_DISPLACEMENT"] == pytest.approx(0.03)
     assert "OPT_RELAX_FACTOR is parsed but not implemented yet" not in out
     assert "OPT_GRADIENT_FACTOR is parsed but not implemented yet" not in out
-    assert "OPT_CONSTRAINT is parsed but not implemented yet; ignoring" in out
+    assert "OPT_CONSTRAINT is parsed but not implemented yet; ignoring" not in out
 
     options = fixed_driver_options_from_config(values)
     assert options["objective_column"] == "CD"
@@ -2435,6 +2629,8 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert options["opt_bound_upper"] == pytest.approx(0.03)
     assert options["opt_line_search_bound"] == pytest.approx(0.004)
     assert options["eval_layout"] == "DSN"
+    assert options["sensitivity_source"] == "CFD_ADJOINT_SURFACE"
+    assert options["geometry_fd_eps"] == pytest.approx(2.0e-6)
     assert options["symmetry_coupling"] == "NORMAL_EQUAL"
     assert options["deformation_direction_mode"] == "VERTICAL"
     assert options["objective_adjoint"] == "drag"
@@ -2442,6 +2638,15 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert options["local_step_limit_ratio"] == pytest.approx(150.0)
     assert options["auto_scale_bounds_to_geometry"] is True
     assert options["max_normal_displacement"] == pytest.approx(0.03)
+    constraints = options["native_constraints"]
+    assert [constraint.name for constraint in constraints] == ["LIFT", "DRAG"]
+    assert [constraint.sign for constraint in constraints] == [">", "<"]
+    assert [constraint.target for constraint in constraints] == pytest.approx(
+        [0.5, 0.02]
+    )
+    assert [constraint.scale for constraint in constraints] == pytest.approx(
+        [2.0, 0.5]
+    )
 
     override_config = tmp_path / "override.cfg"
     override_config.write_text("OPT_OBJECTIVE= DRAG\nOBJECTIVE_COLUMN= MY_OBJ\n")
@@ -2484,6 +2689,8 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert args.opt_bound_upper == pytest.approx(0.03)
     assert args.opt_line_search_bound == pytest.approx(0.004)
     assert args.sensitivity_weighting == "NODAL"
+    assert args.sensitivity_source == "CFD_ADJOINT_SURFACE"
+    assert args.geometry_fd_eps == pytest.approx(2.0e-6)
     assert args.eval_layout == "DSN"
     assert args.symmetry_coupling == "NORMAL_EQUAL"
     assert args.deformation_direction_mode == "VERTICAL"

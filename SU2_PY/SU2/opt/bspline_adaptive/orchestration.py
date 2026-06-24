@@ -317,7 +317,10 @@ def progressive_bspline_su2_shape_optimization(settings):
             "local_step_limit": settings.get("local_step_limit", False),
             "local_step_limit_ratio": settings.get("local_step_limit_ratio", 200.0),
             "sensitivity_weighting": settings.get("sensitivity_weighting", "NODAL"),
+            "sensitivity_source": settings.get("sensitivity_source", "DOT_AD_TRANSFER"),
             "thickness_options": settings.get("thickness_options"),
+            "native_constraints": settings.get("native_constraints"),
+            "geometry_fd_eps": settings.get("geometry_fd_eps", 1.0e-6),
             "eval_layout": settings.get("eval_layout", "DSN"),
             "objective_adjoint": settings.get("objective_adjoint", "drag"),
             "symmetry_coupling": settings.get("symmetry_coupling", "NONE"),
@@ -430,8 +433,13 @@ def progressive_bspline_su2_shape_optimization(settings):
         knot_selected_data = {}
         knot_refine_used = False
         if refine_now:
+            sensitivity_filename = (
+                adjoint_eval_dir / "surface_sens.csv"
+                if settings.get("sensitivity_source", "DOT_AD_TRANSFER") == "DOT_AD_TRANSFER"
+                else adjoint_eval_dir / "surface_adjoint.csv"
+            )
             metadata, signal = load_adjoint_signal(
-                adjoint_eval_dir / "surface_adjoint.csv",
+                sensitivity_filename,
                 adjoint_eval_dir / "bspline_surface_metadata.csv",
             )
             next_modes, knot_score_rows, knot_selected_data = build_next_knot_inserted_modes(
@@ -525,6 +533,7 @@ def progressive_bspline_su2_shape_optimization(settings):
                     "knot_refinement": knot_selected_data,
                     "optimizer_result": result,
                     "sensitivity_weighting": settings["sensitivity_weighting"],
+                    "sensitivity_source": settings["sensitivity_source"],
                 },
                 fp,
                 indent=2,

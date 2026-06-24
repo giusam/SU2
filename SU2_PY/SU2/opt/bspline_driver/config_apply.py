@@ -16,15 +16,15 @@ from .config_parse import (
     parse_optimizer_config,
 )
 from .errors import BSplineSU2DriverError
+from .native_constraints import normalize_native_constraints
+from .tables import history_column_for_function
 
 def _objective_column_from_config(config_values):
     if "OBJECTIVE_COLUMN" in config_values:
         return str(config_values["OBJECTIVE_COLUMN"])
     objective = str(config_values.get("OPT_OBJECTIVE", "")).strip().upper()
-    if objective == "DRAG":
-        return "CD"
     if objective:
-        return objective
+        return history_column_for_function(objective)
     return None
 
 def _objective_adjoint_from_config(config_values):
@@ -43,6 +43,10 @@ def fixed_driver_options_from_config(config_values):
     objective_adjoint = _objective_adjoint_from_config(config_values)
     if objective_adjoint is not None:
         options["objective_adjoint"] = objective_adjoint
+    if "OPT_CONSTRAINT" in config_values:
+        options["native_constraints"] = normalize_native_constraints(
+            config_values["OPT_CONSTRAINT"]
+        )
     mapping = {
         "OPT_ITERATIONS": "maxiter",
         "OPT_ACCURACY": "opt_accuracy",
@@ -61,6 +65,8 @@ def fixed_driver_options_from_config(config_values):
         "BSPLINE_STREAM_SOLVER_OUTPUT": "stream_solver_output",
         "BSPLINE_PRINT_OPTIMIZER_TABLE": "print_optimizer_table",
         "BSPLINE_EVAL_LAYOUT": "eval_layout",
+        "BSPLINE_SENSITIVITY_SOURCE": "sensitivity_source",
+        "BSPLINE_GEOMETRY_FD_EPS": "geometry_fd_eps",
         "BSPLINE_SYMMETRY_COUPLING": "symmetry_coupling",
         "BSPLINE_SURFACE_MODE": "surface_mode",
         "BSPLINE_DEFORMATION_DIRECTION": "deformation_direction_mode",

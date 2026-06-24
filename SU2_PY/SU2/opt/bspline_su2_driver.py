@@ -59,6 +59,7 @@ from SU2.opt.thickness_constraint import (
 
 
 from SU2.opt.bspline_driver.commands import (
+    ALLOWED_SENSITIVITY_SOURCES,
     EvalPaths,
     _append_command_log,
     _command_list,
@@ -440,6 +441,18 @@ def _build_arg_parser():
         help="Treat SU2 surface sensitivities as nodal values or densities requiring arc-length weights",
     )
     parser.add_argument(
+        "--sensitivity-source",
+        default="DOT_AD_TRANSFER",
+        choices=ALLOWED_SENSITIVITY_SOURCES,
+        help="Use SU2_DOT_AD mesh-transfer sensitivities or legacy SU2_CFD_AD surface sensitivities",
+    )
+    parser.add_argument(
+        "--geometry-fd-eps",
+        type=float,
+        default=1.0e-6,
+        help="Forward finite-difference step for SU2_GEO constraints with B-spline coefficients",
+    )
+    parser.add_argument(
         "--deformation-direction",
         dest="deformation_direction_mode",
         default=None,
@@ -524,11 +537,14 @@ def main(argv=None):
             trust_clip_stag_tol=args.trust_clip_stag_tol,
             opt_line_search_bound=args.opt_line_search_bound,
             thickness_options=getattr(args, "thickness_options", None),
+            native_constraints=getattr(args, "native_constraints", None),
+            geometry_fd_eps=getattr(args, "geometry_fd_eps", 1.0e-6),
             eval_layout=args.eval_layout,
             objective_adjoint=getattr(args, "objective_adjoint", "drag"),
             symmetry_coupling=args.symmetry_coupling,
             surface_mode=args.surface_mode,
             sensitivity_weighting=args.sensitivity_weighting,
+            sensitivity_source=args.sensitivity_source,
             deformation_direction_mode=args.deformation_direction_mode,
             le_safe_direction=args.le_safe_direction,
             le_safe_x0=args.le_safe_x0,

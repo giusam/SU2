@@ -498,6 +498,27 @@ def test_matching_by_node_id_supports_su2_point_index_header(tmp_path):
     ]
 
 
+def test_matching_by_point_column_from_dot_surface_sens_csv(tmp_path):
+    metadata = _metadata_records()
+    sens_file = tmp_path / "surface_sens.csv"
+    rows = [
+        f"{record['node_id']},{record['x']},{record['y']},0.0,{index + 1}.0,{index + 2}.0\n"
+        for index, record in enumerate(reversed(metadata))
+    ]
+    sens_file.write_text(
+        '"Point","x","y","Sensitivity_x","Sensitivity_y","Surface_Sensitivity"\n'
+        + "".join(rows)
+    )
+
+    sensitivities = read_sensitivity_file(str(sens_file))
+    matched = match_sensitivities_to_metadata(metadata, sensitivities)
+
+    assert [record["node_id"] for record in matched] == [
+        record["node_id"] for record in metadata
+    ]
+    assert all(record["sensitivity_x"] == pytest.approx(0.0) for record in matched)
+
+
 def test_row_order_matching_is_allowed_without_node_ids(tmp_path):
     metadata = _metadata_records()
     sens_file = tmp_path / "sens.csv"

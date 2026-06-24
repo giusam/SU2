@@ -16,12 +16,14 @@ from SU2.opt.bspline_modes import (
     validate_le_safe_direction_options,
     validate_mode_spec,
 )
+from SU2.opt.bspline_driver.commands import normalize_sensitivity_source
 from SU2.opt.bspline_driver.constants import ALLOWED_SYMMETRY_COUPLINGS
 from SU2.opt.bspline_driver.config_apply import (
     fixed_driver_options_from_config,
     resolve_thickness_domain_mode,
 )
 from SU2.opt.bspline_driver.errors import BSplineSU2DriverError
+from SU2.opt.bspline_driver.native_constraints import normalize_native_constraints
 from SU2.opt.bspline_driver.reduction import (
     active_mode_ids,
     write_mode_spec,
@@ -312,6 +314,12 @@ def validate_adaptive_options(opts):
             "adaptive KNOT_INSERTION. NODAL is fixed internally."
         )
     opts["sensitivity_weighting"] = "NODAL"
+    try:
+        opts["sensitivity_source"] = normalize_sensitivity_source(
+            opts.get("sensitivity_source", "DOT_AD_TRANSFER")
+        )
+    except BSplineSU2DriverError as exc:
+        raise BSplineAdaptiveError(str(exc))
 
     opts["eval_layout"] = str(opts.get("eval_layout", "DSN")).upper()
     if opts["eval_layout"] != "DSN":
@@ -488,6 +496,12 @@ def validate_adaptive_options(opts):
     )
     if opts["local_step_limit_ratio"] <= 0.0:
         raise BSplineAdaptiveError("--local-step-limit-ratio must be positive")
+    opts["geometry_fd_eps"] = _as_float(
+        opts.get("geometry_fd_eps", 1.0e-6),
+        "BSPLINE_GEOMETRY_FD_EPS",
+    )
+    if opts["geometry_fd_eps"] <= 0.0:
+        raise BSplineAdaptiveError("BSPLINE_GEOMETRY_FD_EPS must be positive")
     opts["thickness_options"] = dict(opts.get("thickness_options") or {})
     if _as_bool(
         opts["thickness_options"].get("PROGRESSIVE_THICKNESS_CONSTRAINT", False),
@@ -617,6 +631,7 @@ def adaptive_options_from_config(config_values):
         "BSPLINE_REFINE_MODE": "refine_mode",
         "BSPLINE_REFINE_STATE": "refine_state",
         "BSPLINE_SENSITIVITY_WEIGHTING": "sensitivity_weighting",
+        "BSPLINE_SENSITIVITY_SOURCE": "sensitivity_source",
         "BSPLINE_KNOT_SCORE_MODE": "knot_score_mode",
         "BSPLINE_KNOT_INSERTIONS_PER_REFINE": "knot_insertions_per_refine",
         "BSPLINE_KNOT_MIN_SPAN_WIDTH": "knot_min_span_width",
@@ -811,6 +826,7 @@ def generate_initial_bspline_modes(
 
 def _forced_template_lines(case_config, forced):
     skip_prefixes = ("BSPLINE_", "PROGRESSIVE_")
+    forced_keys = {str(key).strip().upper() for key, _value in forced}
     skip_keys = {
         "MATH_PROBLEM",
         "MESH_FILENAME",
@@ -829,6 +845,8 @@ def _forced_template_lines(case_config, forced):
         "DV_KIND",
         "DV_MARKER",
         "DV_FILENAME",
+        "DV_VALUE",
+        "DV_PARAM",
         "DEFINITION_DV",
         "OPT_OBJECTIVE",
         "OPT_ITERATIONS",
@@ -847,7 +865,11 @@ def _forced_template_lines(case_config, forced):
                 key = ""
                 if stripped and not stripped.startswith(("%", "#")) and "=" in stripped:
                     key = stripped.split("=", 1)[0].strip().upper()
-                if key and (key in skip_keys or key.startswith(skip_prefixes)):
+                if key and (
+                    key in forced_keys
+                    or key in skip_keys
+                    or key.startswith(skip_prefixes)
+                ):
                     continue
                 lines.append(line)
     if lines and lines[-1].strip():
@@ -981,6 +1003,13 @@ def prepare_bspline_launch_settings(settings):
     workdir = Path(settings["workdir"]).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     settings["workdir"] = str(workdir)
+    if settings.get("native_constraints") is not None:
+        settings["native_constraints"] = [
+            constraint.as_dict()
+            for constraint in normalize_native_constraints(
+                settings.get("native_constraints")
+            )
+        ]
 
     generated_initial = False
     if not settings.get("modes"):
@@ -1046,6 +1075,10 @@ def print_startup_summary(settings):
     print(f"[PROGRESSIVE_BSPLINE] mpi: {settings.get('mpi', '')}")
     print("[PROGRESSIVE_BSPLINE] eval layout: DSN")
     print("[PROGRESSIVE_BSPLINE] sensitivity weighting: NODAL")
+    print(
+        "[PROGRESSIVE_BSPLINE] sensitivity source: "
+        f"{settings.get('sensitivity_source', 'DOT_AD_TRANSFER')}"
+    )
     print("[PROGRESSIVE_BSPLINE] refinement: KNOT_INSERTION")
     print(
         "[PROGRESSIVE_BSPLINE] KNOT_DEPTH penalty={} mode={} gamma={} initial_depth={}".format(
@@ -1148,6 +1181,8 @@ def _settings_from_args(args):
         "growth_ratio": args.growth_ratio,
         "fixed_nadd": args.fixed_nadd,
         "sensitivity_weighting": getattr(args, "sensitivity_weighting", "NODAL"),
+        "sensitivity_source": getattr(args, "sensitivity_source", "DOT_AD_TRANSFER"),
+        "geometry_fd_eps": getattr(args, "geometry_fd_eps", 1.0e-6),
         "eval_layout": args.eval_layout,
         "objective_adjoint": args.objective_adjoint,
         "symmetry_coupling": args.symmetry_coupling,
@@ -1227,6 +1262,7 @@ def _settings_from_args(args):
         "local_step_limit": args.local_step_limit,
         "local_step_limit_ratio": args.local_step_limit_ratio,
         "thickness_options": getattr(args, "thickness_options", None),
+        "native_constraints": getattr(args, "native_constraints", None),
         "auto_scale_bounds_to_geometry": args.auto_scale_bounds_to_geometry,
         "max_normal_displacement": args.max_normal_displacement,
         "max_rms_normal_displacement": args.max_rms_normal_displacement,

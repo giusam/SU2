@@ -11,6 +11,7 @@ from pathlib import Path
 
 from SU2.opt.bspline_modes import BSplineModeError, load_mode_spec
 from SU2.opt.bspline_su2_driver import (
+    ALLOWED_SENSITIVITY_SOURCES,
     BSplineSU2DriverError,
     active_coefficient_vector,
     active_mode_ids,
@@ -18,6 +19,7 @@ from SU2.opt.bspline_su2_driver import (
     build_eval_paths,
     command_to_string,
     ensure_adjoint_solution_input,
+    _relative_path,
     patch_config_template,
     read_gradient_vector,
     read_objective_from_history,
@@ -148,6 +150,31 @@ def _patch_eval_files(args, mode_spec, coefficients, paths):
             SCREEN_OUTPUT=["INNER_ITER", "RMS_RES"],
         ),
     )
+    patch_config_template(
+        args.adjoint_template,
+        paths.dot_ad_cfg,
+        dict(
+            shared_primal_updates,
+            MATH_PROBLEM="DISCRETE_ADJOINT",
+            MESH_FILENAME=adjoint_mesh_filename,
+            MESH_OUT_FILENAME=paths.adjoint_mesh_out.name,
+            CONV_FILENAME=paths.adjoint_history.stem,
+            SOLUTION_FILENAME=adjoint_flow_solution,
+            RESTART_FILENAME=adjoint_flow_restart,
+            SOLUTION_ADJ_FILENAME=paths.adjoint_solution.name,
+            RESTART_ADJ_FILENAME=paths.adjoint_restart.name,
+            DV_KIND="SURFACE_FILE",
+            DV_MARKER=[args.marker],
+            DV_FILENAME=_relative_path(paths.surface_positions, paths.adjoint_dir),
+            SURFACE_ADJ_FILENAME=paths.surface_adjoint.stem,
+            VOLUME_ADJ_FILENAME=paths.volume_adjoint.name,
+            SURFACE_SENS_FILENAME=paths.surface_sens.stem,
+            VOLUME_SENS_FILENAME=paths.volume_sens.name,
+            OUTPUT_FILES=["SURFACE_CSV"],
+            TABULAR_FORMAT="CSV",
+            OUTPUT_PRECISION=15,
+        ),
+    )
 
 
 def _run_eval(
@@ -171,12 +198,15 @@ def _run_eval(
         mpi_prefix=args.mpi,
         python_executable=args.python_executable,
         sensitivity_weighting=sensitivity_weighting,
+        sensitivity_source=args.sensitivity_source,
     )
     if args.show_commands:
         for name in ("bspline_def", "def", "primal"):
             print("[BSPLINE_FD_CHECK] {}: {}".format(name, command_to_string(commands[name])))
         if run_adjoint:
             print("[BSPLINE_FD_CHECK] adjoint: {}".format(command_to_string(commands["adjoint"])))
+            if "dot_ad" in commands:
+                print("[BSPLINE_FD_CHECK] dot_ad: {}".format(command_to_string(commands["dot_ad"])))
             print("[BSPLINE_FD_CHECK] bspline_dot: {}".format(command_to_string(commands["bspline_dot"])))
 
     run_command(
@@ -215,6 +245,21 @@ def _run_eval(
             stream_output=args.stream_solver_output,
             stage="fd_check_su2_cfd_ad",
         )
+        if "dot_ad" in commands:
+            run_command(
+                commands["dot_ad"],
+                paths.adjoint_dir,
+                paths.su2_dot_ad_log,
+                show_command=False,
+                stream_output=args.stream_solver_output,
+                stage="fd_check_su2_dot_ad",
+            )
+            if not paths.surface_sens.exists():
+                raise BSplineSU2DriverError(
+                    "SU2_DOT_AD completed but did not write {}".format(
+                        paths.surface_sens
+                    )
+                )
         run_command(
             commands["bspline_dot"],
             paths.eval_dir,
@@ -348,6 +393,11 @@ def _build_arg_parser():
     parser.add_argument("--objective-column", default="CD")
     parser.add_argument("--objective-adjoint", default="drag")
     parser.add_argument("--eval-layout", default="DSN", choices=("DSN", "FLAT"))
+    parser.add_argument(
+        "--sensitivity-source",
+        default="DOT_AD_TRANSFER",
+        choices=ALLOWED_SENSITIVITY_SOURCES,
+    )
     parser.add_argument("--mode-id", action="append", default=None)
     parser.add_argument("--eps", action="append", type=float, default=None)
     parser.add_argument("--mpi", default="")

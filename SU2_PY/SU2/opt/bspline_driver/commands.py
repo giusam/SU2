@@ -23,6 +23,34 @@ from .errors import (
     _normalized_name,
 )
 
+ALLOWED_SENSITIVITY_SOURCES = ("DOT_AD_TRANSFER", "CFD_ADJOINT_SURFACE")
+
+
+def normalize_sensitivity_source(value):
+    value = str(value or "DOT_AD_TRANSFER").strip().upper()
+    aliases = {
+        "DOT": "DOT_AD_TRANSFER",
+        "DOT_AD": "DOT_AD_TRANSFER",
+        "DOTAD": "DOT_AD_TRANSFER",
+        "DOT_AD_TRANSFER": "DOT_AD_TRANSFER",
+        "SU2_DOT_AD": "DOT_AD_TRANSFER",
+        "CFD": "CFD_ADJOINT_SURFACE",
+        "CFD_AD": "CFD_ADJOINT_SURFACE",
+        "CFDAD": "CFD_ADJOINT_SURFACE",
+        "CFD_ADJOINT_SURFACE": "CFD_ADJOINT_SURFACE",
+        "SURFACE_ADJOINT": "CFD_ADJOINT_SURFACE",
+    }
+    try:
+        return aliases[value]
+    except KeyError:
+        raise BSplineSU2DriverError(
+            "BSPLINE_SENSITIVITY_SOURCE must be one of {}; got {!r}".format(
+                ALLOWED_SENSITIVITY_SOURCES,
+                value,
+            )
+        )
+
+
 @dataclass(frozen=True)
 class EvalPaths:
     eval_layout: str
@@ -37,6 +65,7 @@ class EvalPaths:
     def_cfg: Path
     primal_cfg: Path
     adjoint_cfg: Path
+    dot_ad_cfg: Path
     deformed_mesh: Path
     primal_mesh_out: Path
     adjoint_mesh_out: Path
@@ -48,6 +77,8 @@ class EvalPaths:
     adjoint_restart: Path
     volume_adjoint: Path
     surface_adjoint: Path
+    volume_sens: Path
+    surface_sens: Path
     gradients: Path
     summary: Path
     commands_log: Path
@@ -55,6 +86,7 @@ class EvalPaths:
     su2_def_log: Path
     su2_cfd_log: Path
     su2_cfd_ad_log: Path
+    su2_dot_ad_log: Path
     bspline_dot_log: Path
 
 def _normalize_eval_layout(eval_layout):
@@ -101,6 +133,7 @@ def build_eval_paths(eval_dir, eval_layout="DSN", objective_adjoint="drag"):
         def_cfg=deform_dir / "def.cfg",
         primal_cfg=direct_dir / "primal.cfg",
         adjoint_cfg=adjoint_dir / "adjoint.cfg",
+        dot_ad_cfg=adjoint_dir / "dot_ad.cfg",
         deformed_mesh=deform_dir / "deformed_mesh.su2",
         primal_mesh_out=direct_dir / "primal_mesh_out.su2",
         adjoint_mesh_out=adjoint_dir / "adjoint_mesh_out.su2",
@@ -112,6 +145,8 @@ def build_eval_paths(eval_dir, eval_layout="DSN", objective_adjoint="drag"):
         adjoint_restart=adjoint_dir / "solution_adj.dat",
         volume_adjoint=adjoint_dir / "volume_adjoint",
         surface_adjoint=adjoint_dir / "surface_adjoint.csv",
+        volume_sens=adjoint_dir / "volume_sens",
+        surface_sens=adjoint_dir / "surface_sens.csv",
         gradients=eval_dir / "bspline_gradients.csv",
         summary=eval_dir / "summary.json",
         commands_log=eval_dir / "commands.log",
@@ -119,6 +154,7 @@ def build_eval_paths(eval_dir, eval_layout="DSN", objective_adjoint="drag"):
         su2_def_log=deform_dir / "su2_def.log",
         su2_cfd_log=direct_dir / "su2_cfd.log",
         su2_cfd_ad_log=adjoint_dir / "su2_cfd_ad.log",
+        su2_dot_ad_log=adjoint_dir / "su2_dot_ad.log",
         bspline_dot_log=adjoint_dir / "bspline_dot.log",
     )
 
@@ -146,10 +182,12 @@ def build_eval_commands(
     le_safe_x0=None,
     le_safe_x1=None,
     le_safe_power=None,
+    sensitivity_source="DOT_AD_TRANSFER",
 ):
     """Build subprocess commands for one evaluation directory."""
 
     python_executable = python_executable or sys.executable or "python3"
+    sensitivity_source = normalize_sensitivity_source(sensitivity_source)
     try:
         sensitivity_weighting = normalize_sensitivity_weighting(sensitivity_weighting)
     except BSplineDotError as exc:
@@ -192,30 +230,40 @@ def build_eval_commands(
         if le_safe_power is not None:
             bspline_def.extend(["--le-safe-power", str(float(le_safe_power))])
 
-    return {
+    sensitivity_file = (
+        paths.surface_sens
+        if sensitivity_source == "DOT_AD_TRANSFER"
+        else paths.surface_adjoint
+    )
+
+    commands = {
         "bspline_def": bspline_def,
         "def": _with_mpi(["SU2_DEF", paths.def_cfg.name], mpi_prefix),
         "primal": _with_mpi(["SU2_CFD", paths.primal_cfg.name], mpi_prefix),
         "adjoint": _with_mpi(["SU2_CFD_AD", paths.adjoint_cfg.name], mpi_prefix),
-        "bspline_dot": [
-            python_executable,
-            "-m",
-            "SU2.opt.bspline_dot",
-            "--modes",
-            paths.modes_current.name,
-            "--metadata",
-            _relative_path(paths.metadata, paths.eval_dir),
-            "--sens",
-            _relative_path(paths.surface_adjoint, paths.eval_dir),
-            "--output",
-            paths.gradients.name,
-            "--summary",
-            paths.summary.name,
-            "--prefer-vector",
-            "--sensitivity-weighting",
-            sensitivity_weighting,
-        ],
     }
+    if sensitivity_source == "DOT_AD_TRANSFER":
+        commands["dot_ad"] = _with_mpi(["SU2_DOT_AD", paths.dot_ad_cfg.name], mpi_prefix)
+
+    commands["bspline_dot"] = [
+        python_executable,
+        "-m",
+        "SU2.opt.bspline_dot",
+        "--modes",
+        paths.modes_current.name,
+        "--metadata",
+        _relative_path(paths.metadata, paths.eval_dir),
+        "--sens",
+        _relative_path(sensitivity_file, paths.eval_dir),
+        "--output",
+        paths.gradients.name,
+        "--summary",
+        paths.summary.name,
+        "--prefer-vector",
+        "--sensitivity-weighting",
+        sensitivity_weighting,
+    ]
+    return commands
 
 def command_to_string(command):
     if isinstance(command, str):
@@ -322,6 +370,7 @@ def create_eval_aliases(paths):
     aliases = [
         (paths.metadata, paths.eval_dir / "bspline_surface_metadata.csv"),
         (paths.surface_adjoint, paths.eval_dir / "surface_adjoint.csv"),
+        (paths.surface_sens, paths.eval_dir / "surface_sens.csv"),
         (paths.primal_history, paths.eval_dir / "history_primal.csv"),
         (paths.adjoint_history, paths.eval_dir / "history_adjoint.csv"),
     ]

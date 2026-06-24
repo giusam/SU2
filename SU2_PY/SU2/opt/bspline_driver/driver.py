@@ -49,10 +49,12 @@ from .commands import (
     _normalize_eval_layout,
     _normalize_objective_adjoint,
     _relative_path,
+    _with_mpi,
     build_eval_commands,
     build_eval_paths,
     create_eval_aliases,
     ensure_adjoint_solution_input,
+    normalize_sensitivity_source,
     run_command,
 )
 from .config_apply import resolve_thickness_domain_mode
@@ -70,6 +72,7 @@ from .errors import (
     GradientGuardStop,
     TrustClipStop,
     _as_float,
+    _normalized_name,
 )
 from .geometry_bounds import (
     _bounds_are_uniform,
@@ -77,6 +80,10 @@ from .geometry_bounds import (
     _bounds_to_list,
     _vector_summary,
     compute_geometry_aware_bound_scaling,
+)
+from .geometry_constraints import (
+    is_geometry_constraint_name,
+    normalize_geometry_constraint_name,
 )
 from .guards import (
     ALLOWED_TRUST_CLIP_POLICIES,
@@ -103,7 +110,9 @@ from .reduction import (
     update_mode_coefficients,
     write_mode_spec,
 )
+from .native_constraints import normalize_native_constraints
 from .tables import (
+    history_column_for_function,
     read_gradient_vector,
     read_objective_from_history,
 )
@@ -168,11 +177,14 @@ class BSplineSU2Driver:
         trust_clip_stag_tol=1.0e-6,
         opt_line_search_bound=None,
         thickness_options=None,
+        native_constraints=None,
+        geometry_fd_eps=1.0e-6,
         eval_layout="DSN",
         objective_adjoint="drag",
         symmetry_coupling="NONE",
         surface_mode="BOTH",
         sensitivity_weighting="NODAL",
+        sensitivity_source="DOT_AD_TRANSFER",
         local_step_limit=False,
         local_step_limit_ratio=200.0,
         trigger_opts=None,
@@ -232,6 +244,7 @@ class BSplineSU2Driver:
             self.sensitivity_weighting = normalize_sensitivity_weighting(sensitivity_weighting)
         except BSplineDotError as exc:
             raise BSplineSU2DriverError(str(exc))
+        self.sensitivity_source = normalize_sensitivity_source(sensitivity_source)
         self.mpi_prefix = mpi_prefix or ""
         self.default_bounds = _validated_bounds(default_bounds, "default_bounds")
         self.cache_tol = cache_tol
@@ -366,6 +379,13 @@ class BSplineSU2Driver:
                 "OPT_BOUND_LOWER and OPT_BOUND_UPPER must be provided together"
             )
         self.thickness_options = dict(thickness_options or {})
+        self.native_constraints = normalize_native_constraints(native_constraints)
+        self.geometry_fd_eps = _as_float(
+            1.0e-6 if geometry_fd_eps is None else geometry_fd_eps,
+            "BSPLINE_GEOMETRY_FD_EPS",
+        )
+        if self.geometry_fd_eps <= 0.0:
+            raise BSplineSU2DriverError("BSPLINE_GEOMETRY_FD_EPS must be positive")
         self.thickness_constraint = None
         self._thickness_constraint_configured = False
         self._thickness_fallback_warned = False
@@ -436,6 +456,7 @@ class BSplineSU2Driver:
         self._line_search_anchor_physical = list(self.initial_coefficients)
         self._local_step_anchor_reduced = list(self.initial_reduced_coefficients)
         self._cache = {}
+        self._constraint_cache = {}
         self._last_eval_physical_key = None
         self._last_eval_result = None
         self._last_eval_info = None
@@ -836,6 +857,202 @@ class BSplineSU2Driver:
             return np.asarray(jac_p, dtype=float) * self.opt_relax_factor * beta
 
         return [{"type": "ineq", "fun": thickness_fun, "jac": thickness_jac}]
+
+    def _run_su2_geo_function_value(self, coefficients, function_name):
+        function_name = normalize_geometry_constraint_name(function_name)
+        eval_id, paths = self._next_paths(objective_adjoint=f"geo_{function_name}")
+        self._prepare_eval_files(coefficients, paths)
+
+        geo_dir = paths.eval_dir / "geometry"
+        geo_dir.mkdir(parents=True, exist_ok=True)
+        geo_cfg = geo_dir / "geo.cfg"
+        geo_log = geo_dir / "su2_geo.log"
+        geo_value = geo_dir / "of_func.csv"
+
+        patch_config_template(
+            self.primal_template,
+            geo_cfg,
+            {
+                "MESH_FILENAME": _relative_path(paths.deformed_mesh, geo_dir),
+                "GEO_PARAM": function_name,
+                "GEO_MODE": "FUNCTION",
+                "VALUE_OBJFUNC_FILENAME": "of_func",
+                "GRAD_OBJFUNC_FILENAME": "of_grad",
+                "TABULAR_FORMAT": "CSV",
+                "CONSOLE": "NONE",
+            },
+        )
+
+        commands = build_eval_commands(
+            paths,
+            self.base_mesh,
+            self.marker,
+            mpi_prefix=self.mpi_prefix,
+            python_executable=self.python_executable,
+            sensitivity_weighting=self.sensitivity_weighting,
+            surface_mode=self.surface_mode,
+            deformation_direction_mode=self.deformation_direction_mode,
+            le_safe_direction=self.le_safe_direction_options["le_safe_direction"],
+            le_safe_x0=self.le_safe_direction_options["le_safe_x0"],
+            le_safe_x1=self.le_safe_direction_options["le_safe_x1"],
+            le_safe_power=self.le_safe_direction_options["le_safe_power"],
+            sensitivity_source=self.sensitivity_source,
+        )
+        geo_command = _with_mpi(["SU2_GEO", geo_cfg.name], self.mpi_prefix)
+        for stage, cwd, command in (
+            ("geometry_bspline_def", paths.deform_dir, commands["bspline_def"]),
+            ("geometry_su2_def", paths.deform_dir, commands["def"]),
+            ("geometry_su2_geo", geo_dir, geo_command),
+        ):
+            _append_command_log(paths.commands_log, stage, cwd, command)
+            _append_command_log(self.workdir / "commands.log", stage, cwd, command)
+
+        run_command(
+            commands["bspline_def"],
+            paths.deform_dir,
+            paths.bspline_def_log,
+            show_command=False,
+            stream_output=self.stream_solver_output,
+            stage="geometry_bspline_def",
+        )
+        run_command(
+            commands["def"],
+            paths.deform_dir,
+            paths.su2_def_log,
+            show_command=False,
+            stream_output=self.stream_solver_output,
+            stage="geometry_su2_def",
+        )
+        run_command(
+            geo_command,
+            geo_dir,
+            geo_log,
+            show_command=False,
+            stream_output=self.stream_solver_output,
+            stage="geometry_su2_geo",
+        )
+        if not geo_value.exists():
+            raise BSplineSU2DriverError(
+                f"SU2_GEO completed but did not write {geo_value}"
+            )
+        value = read_objective_from_history(geo_value, function_name)
+        return {
+            "eval_id": eval_id,
+            "eval_dir": str(paths.eval_dir),
+            "geo_dir": str(geo_dir),
+            "value": value,
+        }
+
+    def evaluate_geometry_constraint_function(self, coefficients, function_name):
+        coefficients = [_as_float(value, "coefficient") for value in coefficients]
+        if len(coefficients) != len(self.mode_ids):
+            raise BSplineSU2DriverError(
+                f"expected {len(self.mode_ids)} coefficients, got {len(coefficients)}"
+            )
+        function_name = normalize_geometry_constraint_name(function_name)
+        key = (cache_key(coefficients, self.cache_tol), _normalized_name(function_name))
+        if key in self._constraint_cache:
+            return self._constraint_cache[key]
+
+        base = self._run_su2_geo_function_value(coefficients, function_name)
+        value = float(base["value"])
+        gradient = []
+        for index in range(len(coefficients)):
+            perturbed = list(coefficients)
+            perturbed[index] += float(self.geometry_fd_eps)
+            perturbed_value = float(
+                self._run_su2_geo_function_value(perturbed, function_name)["value"]
+            )
+            gradient.append((perturbed_value - value) / float(self.geometry_fd_eps))
+
+        result = {
+            "eval_id": base["eval_id"],
+            "eval_dir": base["eval_dir"],
+            "function": function_name,
+            "value": value,
+            "gradient": [float(item) for item in gradient],
+            "coefficients": coefficients,
+            "status": "ok",
+            "source": "SU2_GEO",
+            "geometry_fd_eps": float(self.geometry_fd_eps),
+        }
+        self._constraint_cache[key] = result
+        return result
+
+    def _native_constraint_result_for_variables(self, variables, spec):
+        reduced_trial = self.optimizer_to_physical(variables)
+        physical_trial = self.expand_reduced_physical(reduced_trial)
+        physical_eval, info = self._apply_line_search_bound(physical_trial)
+        if is_geometry_constraint_name(spec.name):
+            result = self.evaluate_geometry_constraint_function(physical_eval, spec.name)
+        else:
+            result = self.evaluate_constraint_function(physical_eval, spec.name)
+        return result, info
+
+    def _native_constraint_value(self, value, spec):
+        factor = float(spec.scale) * float(self.opt_gradient_factor)
+        delta = float(value) - float(spec.target)
+        if spec.sign == "=":
+            return delta * factor
+        if spec.sign == "<":
+            return -delta * factor
+        if spec.sign == ">":
+            return delta * factor
+        raise BSplineSU2DriverError(
+            f"unsupported OPT_CONSTRAINT sign {spec.sign!r} for {spec.name}"
+        )
+
+    def _native_constraint_gradient_factor(self, spec):
+        # Match SU2.eval.design: constraint values are multiplied by SCALE,
+        # while con_dceq/con_dcieq apply OPT_GRADIENT_FACTOR and sign but not
+        # the per-constraint SCALE.
+        factor = float(self.opt_gradient_factor)
+        if spec.sign == "=":
+            return factor
+        if spec.sign == "<":
+            return -factor
+        if spec.sign == ">":
+            return factor
+        raise BSplineSU2DriverError(
+            f"unsupported OPT_CONSTRAINT sign {spec.sign!r} for {spec.name}"
+        )
+
+    def _native_constraint_functions(self):
+        constraints = []
+        for spec in self.native_constraints:
+
+            def constraint_fun(variables, spec=spec):
+                result, _info = self._native_constraint_result_for_variables(
+                    variables,
+                    spec,
+                )
+                return self._native_constraint_value(result["value"], spec)
+
+            def constraint_jac(variables, spec=spec):
+                result, info = self._native_constraint_result_for_variables(
+                    variables,
+                    spec,
+                )
+                beta = float(info.get("line_search_beta", 1.0))
+                reduced_gradient = self.collapse_gradient_to_reduced(result["gradient"])
+                factor = (
+                    self._native_constraint_gradient_factor(spec)
+                    * float(self.opt_relax_factor)
+                    * beta
+                )
+                return np.asarray(
+                    [float(value) * factor for value in reduced_gradient],
+                    dtype=float,
+                )
+
+            constraints.append(
+                {
+                    "type": "eq" if spec.sign == "=" else "ineq",
+                    "fun": constraint_fun,
+                    "jac": constraint_jac,
+                }
+            )
+        return constraints
 
     def _thickness_jacobian_fd_optimizer(self, variables, thickness_fun):
         variables = np.asarray(variables, dtype=float)
@@ -1257,19 +1474,24 @@ class BSplineSU2Driver:
     def optimized_modes_filename(self):
         return self.workdir / "optimized_modes.json"
 
-    def _next_paths(self):
+    def _next_paths(self, objective_adjoint=None):
+        objective_adjoint = (
+            self.objective_adjoint
+            if objective_adjoint is None
+            else _normalize_objective_adjoint(objective_adjoint)
+        )
         while True:
             eval_id = self._next_eval_id
             self._next_eval_id += 1
             paths = build_eval_paths(
                 self.workdir / f"eval_{eval_id:04d}",
                 eval_layout=self.eval_layout,
-                objective_adjoint=self.objective_adjoint,
+                objective_adjoint=objective_adjoint,
             )
             if not paths.eval_dir.exists():
                 return eval_id, paths
 
-    def _prepare_eval_files(self, coefficients, paths):
+    def _prepare_eval_files(self, coefficients, paths, objective_function=None):
         paths.eval_dir.mkdir(parents=True, exist_ok=False)
         for directory in {paths.deform_dir, paths.direct_dir, paths.adjoint_dir}:
             directory.mkdir(parents=True, exist_ok=True)
@@ -1302,6 +1524,9 @@ class BSplineSU2Driver:
             "VOLUME_ADJ_FILENAME": paths.volume_adjoint.name,
             "TABULAR_FORMAT": "CSV",
         }
+        objective_updates = {}
+        if objective_function:
+            objective_updates["OBJECTIVE_FUNCTION"] = str(objective_function).strip().upper()
         patch_config_template(
             self.primal_template,
             paths.primal_cfg,
@@ -1319,6 +1544,7 @@ class BSplineSU2Driver:
             paths.adjoint_cfg,
             dict(
                 shared_primal_updates,
+                **objective_updates,
                 MESH_FILENAME=adjoint_mesh_filename,
                 SOLUTION_FILENAME=adjoint_flow_solution,
                 RESTART_FILENAME=adjoint_flow_restart,
@@ -1328,8 +1554,39 @@ class BSplineSU2Driver:
                 CONV_FILENAME=paths.adjoint_history.stem,
             ),
         )
+        patch_config_template(
+            self.adjoint_template,
+            paths.dot_ad_cfg,
+            dict(
+                shared_primal_updates,
+                **objective_updates,
+                MATH_PROBLEM="DISCRETE_ADJOINT",
+                MESH_FILENAME=adjoint_mesh_filename,
+                SOLUTION_FILENAME=adjoint_flow_solution,
+                RESTART_FILENAME=adjoint_flow_restart,
+                SOLUTION_ADJ_FILENAME=paths.adjoint_solution.name,
+                RESTART_ADJ_FILENAME=paths.adjoint_restart.name,
+                DV_KIND="SURFACE_FILE",
+                DV_MARKER=[self.marker],
+                DV_FILENAME=_relative_path(paths.surface_positions, paths.adjoint_dir),
+                SURFACE_ADJ_FILENAME=paths.surface_adjoint.stem,
+                VOLUME_ADJ_FILENAME=paths.volume_adjoint.name,
+                SURFACE_SENS_FILENAME=paths.surface_sens.stem,
+                VOLUME_SENS_FILENAME=paths.volume_sens.name,
+                OUTPUT_FILES=["SURFACE_CSV"],
+                TABULAR_FORMAT="CSV",
+                OUTPUT_PRECISION=15,
+                MESH_OUT_FILENAME=paths.adjoint_mesh_out.name,
+                CONV_FILENAME=paths.adjoint_history.stem,
+            ),
+        )
 
-    def _write_eval_summary_metadata(self, paths, line_search_info=None):
+    def _write_eval_summary_metadata(
+        self,
+        paths,
+        line_search_info=None,
+        objective_function=None,
+    ):
         data = {}
         if paths.summary.exists():
             try:
@@ -1348,9 +1605,20 @@ class BSplineSU2Driver:
                 "direct_dir": str(paths.direct_dir),
                 "adjoint_dir": str(paths.adjoint_dir),
                 "objective_adjoint": paths.objective_adjoint,
+                "objective_function": (
+                    str(objective_function).strip().upper()
+                    if objective_function
+                    else ""
+                ),
                 "symmetry_coupling": self.symmetry_coupling,
                 "surface_mode": self.surface_mode,
                 "sensitivity_weighting": self.sensitivity_weighting,
+                "sensitivity_source": self.sensitivity_source,
+                "gradient_sensitivity_file": str(
+                    paths.surface_sens
+                    if self.sensitivity_source == "DOT_AD_TRANSFER"
+                    else paths.surface_adjoint
+                ),
                 "n_active_modes": len(self.mode_ids),
                 "n_design_variables": len(self.reduced_variable_ids),
                 "local_step_limit_enabled": bool(self.local_step_limit),
@@ -1579,6 +1847,138 @@ class BSplineSU2Driver:
                     }
                 )
 
+    def evaluate_constraint_function(self, coefficients, function_name):
+        coefficients = [_as_float(value, "coefficient") for value in coefficients]
+        if len(coefficients) != len(self.mode_ids):
+            raise BSplineSU2DriverError(
+                f"expected {len(self.mode_ids)} coefficients, got {len(coefficients)}"
+            )
+        function_name = str(function_name or "").strip().upper()
+        if not function_name:
+            raise BSplineSU2DriverError("constraint function name must be non-empty")
+        if is_geometry_constraint_name(function_name):
+            return self.evaluate_geometry_constraint_function(coefficients, function_name)
+
+        key = (cache_key(coefficients, self.cache_tol), _normalized_name(function_name))
+        if key in self._constraint_cache:
+            return self._constraint_cache[key]
+
+        eval_id, paths = self._next_paths(objective_adjoint=function_name)
+        try:
+            self._prepare_eval_files(
+                coefficients,
+                paths,
+                objective_function=function_name,
+            )
+            commands = build_eval_commands(
+                paths,
+                self.base_mesh,
+                self.marker,
+                mpi_prefix=self.mpi_prefix,
+                python_executable=self.python_executable,
+                sensitivity_weighting=self.sensitivity_weighting,
+                surface_mode=self.surface_mode,
+                deformation_direction_mode=self.deformation_direction_mode,
+                le_safe_direction=self.le_safe_direction_options["le_safe_direction"],
+                le_safe_x0=self.le_safe_direction_options["le_safe_x0"],
+                le_safe_x1=self.le_safe_direction_options["le_safe_x1"],
+                le_safe_power=self.le_safe_direction_options["le_safe_power"],
+                sensitivity_source=self.sensitivity_source,
+            )
+            for stage, command in commands.items():
+                _append_command_log(paths.commands_log, stage, paths.eval_dir, command)
+                _append_command_log(self.workdir / "commands.log", stage, paths.eval_dir, command)
+
+            run_command(
+                commands["bspline_def"],
+                paths.deform_dir,
+                paths.bspline_def_log,
+                show_command=False,
+                stream_output=self.stream_solver_output,
+                stage="bspline_def",
+            )
+            run_command(
+                commands["def"],
+                paths.deform_dir,
+                paths.su2_def_log,
+                show_command=False,
+                stream_output=self.stream_solver_output,
+                stage="su2_def",
+            )
+            run_command(
+                commands["primal"],
+                paths.direct_dir,
+                paths.su2_cfd_log,
+                show_command=False,
+                stream_output=self.stream_solver_output,
+                stage="su2_cfd",
+            )
+            ensure_adjoint_solution_input(paths.primal_restart, paths.primal_solution)
+            value = read_objective_from_history(
+                paths.primal_history,
+                history_column_for_function(function_name),
+            )
+            run_command(
+                commands["adjoint"],
+                paths.adjoint_dir,
+                paths.su2_cfd_ad_log,
+                show_command=False,
+                stream_output=self.stream_solver_output,
+                stage="su2_cfd_ad",
+            )
+            if "dot_ad" in commands:
+                run_command(
+                    commands["dot_ad"],
+                    paths.adjoint_dir,
+                    paths.su2_dot_ad_log,
+                    show_command=False,
+                    stream_output=self.stream_solver_output,
+                    stage="su2_dot_ad",
+                )
+                if not paths.surface_sens.exists():
+                    raise BSplineSU2DriverError(
+                        "SU2_DOT_AD completed but did not write {}; check "
+                        "SURFACE_SENS_FILENAME and OUTPUT_FILES in {}".format(
+                            paths.surface_sens,
+                            paths.dot_ad_cfg,
+                        )
+                    )
+            run_command(
+                commands["bspline_dot"],
+                paths.eval_dir,
+                paths.bspline_dot_log,
+                show_command=False,
+                stream_output=self.stream_solver_output,
+                stage="bspline_dot",
+            )
+            create_eval_aliases(paths)
+            self._write_eval_summary_metadata(
+                paths,
+                objective_function=function_name,
+            )
+            gradient = read_gradient_vector(paths.gradients, self.mode_ids)
+            result = {
+                "eval_id": eval_id,
+                "eval_dir": str(paths.eval_dir),
+                "function": function_name,
+                "value": value,
+                "gradient": gradient,
+                "coefficients": coefficients,
+                "status": "ok",
+            }
+            self._constraint_cache[key] = result
+            return result
+        except Exception as exc:
+            if isinstance(exc, BSplineSU2DriverError):
+                raise
+            raise BSplineSU2DriverError(
+                "constraint evaluation {} failed in {}: {}".format(
+                    function_name,
+                    paths.eval_dir,
+                    exc,
+                )
+            ) from exc
+
     def evaluate(self, coefficients, line_search_info=None):
         coefficients = [_as_float(value, "coefficient") for value in coefficients]
         if len(coefficients) != len(self.mode_ids):
@@ -1610,6 +2010,7 @@ class BSplineSU2Driver:
                 le_safe_x0=self.le_safe_direction_options["le_safe_x0"],
                 le_safe_x1=self.le_safe_direction_options["le_safe_x1"],
                 le_safe_power=self.le_safe_direction_options["le_safe_power"],
+                sensitivity_source=self.sensitivity_source,
             )
             for stage, command in commands.items():
                 _append_command_log(paths.commands_log, stage, paths.eval_dir, command)
@@ -1659,6 +2060,23 @@ class BSplineSU2Driver:
                 stream_output=self.stream_solver_output,
                 stage="su2_cfd_ad",
             )
+            if "dot_ad" in commands:
+                run_command(
+                    commands["dot_ad"],
+                    paths.adjoint_dir,
+                    paths.su2_dot_ad_log,
+                    show_command=False,
+                    stream_output=self.stream_solver_output,
+                    stage="su2_dot_ad",
+                )
+                if not paths.surface_sens.exists():
+                    raise BSplineSU2DriverError(
+                        "SU2_DOT_AD completed but did not write {}; check "
+                        "SURFACE_SENS_FILENAME and OUTPUT_FILES in {}".format(
+                            paths.surface_sens,
+                            paths.dot_ad_cfg,
+                        )
+                    )
             run_command(
                 commands["bspline_dot"],
                 paths.eval_dir,
@@ -1868,6 +2286,7 @@ class BSplineSU2Driver:
         )
         print(f"Eval layout: {self.eval_layout}")
         print(f"Sensitivity weighting: {self.sensitivity_weighting}")
+        print(f"Sensitivity source: {self.sensitivity_source}")
         print(
             "Raw-gradient guard: {} factor={} window={} min_history={} floor={}".format(
                 "ON" if self.gradient_guard_enabled else "OFF",
@@ -1892,6 +2311,23 @@ class BSplineSU2Driver:
                 float(self.opt_gradient_factor)
             )
         )
+        if self.native_constraints:
+            formatted = [
+                "{}{}{} * {}".format(
+                    spec.name,
+                    spec.sign,
+                    "{:.15g}".format(float(spec.target)),
+                    "{:.15g}".format(float(spec.scale)),
+                )
+                for spec in self.native_constraints
+            ]
+            print("Native SU2 constraints: " + "; ".join(formatted))
+            if any(is_geometry_constraint_name(spec.name) for spec in self.native_constraints):
+                print(
+                    "Geometric constraint backend: SU2_GEO finite differences, eps={:.15g}".format(
+                        float(self.geometry_fd_eps)
+                    )
+                )
         print(
             "Variable scaling: physical coefficient = optimizer variable * {:.15g}".format(
                 float(self.opt_relax_factor)
@@ -2107,9 +2543,9 @@ class BSplineSU2Driver:
         try:
             from scipy.optimize import minimize
         except Exception:
-            if self.thickness_constraint is not None:
+            if self.thickness_constraint is not None or self.native_constraints:
                 raise BSplineSU2DriverError(
-                    "SciPy is required when PROGRESSIVE_THICKNESS_CONSTRAINT=YES"
+                    "SciPy is required when optimization constraints are active"
                 )
             try:
                 return self._attach_trigger_state(self._optimize_projected_gradient_descent(
@@ -2125,7 +2561,10 @@ class BSplineSU2Driver:
 
         x0 = self.physical_to_optimizer(self.initial_reduced_coefficients)
         bounds_u = self.optimizer_bounds()
-        constraints = self._thickness_constraint_functions()
+        constraints = (
+            self._thickness_constraint_functions()
+            + self._native_constraint_functions()
+        )
         self._print_slsqp_parameters(maxiter, optimizer_bounds=bounds_u)
 
         def fun(x):
@@ -2347,11 +2786,14 @@ def run_bspline_su2_optimization(
     trust_clip_stag_tol=1.0e-6,
     opt_line_search_bound=None,
     thickness_options=None,
+    native_constraints=None,
+    geometry_fd_eps=1.0e-6,
     eval_layout="DSN",
     objective_adjoint="drag",
     symmetry_coupling="NONE",
     surface_mode="BOTH",
     sensitivity_weighting="NODAL",
+    sensitivity_source="DOT_AD_TRANSFER",
     local_step_limit=False,
     local_step_limit_ratio=200.0,
     trigger_opts=None,
@@ -2407,11 +2849,14 @@ def run_bspline_su2_optimization(
         trust_clip_stag_tol=trust_clip_stag_tol,
         opt_line_search_bound=opt_line_search_bound,
         thickness_options=thickness_options,
+        native_constraints=native_constraints,
+        geometry_fd_eps=geometry_fd_eps,
         eval_layout=eval_layout,
         objective_adjoint=objective_adjoint,
         symmetry_coupling=symmetry_coupling,
         surface_mode=surface_mode,
         sensitivity_weighting=sensitivity_weighting,
+        sensitivity_source=sensitivity_source,
         local_step_limit=local_step_limit,
         local_step_limit_ratio=local_step_limit_ratio,
         trigger_opts=trigger_opts,

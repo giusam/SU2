@@ -250,6 +250,7 @@ from SU2.opt.bspline_driver.tables import (
 
 from SU2.opt.bspline_driver.thickness import BSplineThicknessConstraint
 from SU2.opt.bspline_driver.driver import (
+    ALLOWED_GEOMETRY_CONSTRAINT_GRADIENT_MODES,
     BSplineSU2Driver,
     _project_to_bounds,
     run_bspline_su2_optimization,
@@ -453,6 +454,12 @@ def _build_arg_parser():
         help="Forward finite-difference step for SU2_GEO constraints with B-spline coefficients",
     )
     parser.add_argument(
+        "--geometry-constraint-gradient",
+        default="AUTO",
+        choices=ALLOWED_GEOMETRY_CONSTRAINT_GRADIENT_MODES,
+        help="Backend for geometric constraint gradients",
+    )
+    parser.add_argument(
         "--deformation-direction",
         dest="deformation_direction_mode",
         default=None,
@@ -539,6 +546,11 @@ def main(argv=None):
             thickness_options=getattr(args, "thickness_options", None),
             native_constraints=getattr(args, "native_constraints", None),
             geometry_fd_eps=getattr(args, "geometry_fd_eps", 1.0e-6),
+            geometry_constraint_gradient=getattr(
+                args,
+                "geometry_constraint_gradient",
+                "AUTO",
+            ),
             eval_layout=args.eval_layout,
             objective_adjoint=getattr(args, "objective_adjoint", "drag"),
             symmetry_coupling=args.symmetry_coupling,

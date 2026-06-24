@@ -321,6 +321,10 @@ def progressive_bspline_su2_shape_optimization(settings):
             "thickness_options": settings.get("thickness_options"),
             "native_constraints": settings.get("native_constraints"),
             "geometry_fd_eps": settings.get("geometry_fd_eps", 1.0e-6),
+            "geometry_constraint_gradient": settings.get(
+                "geometry_constraint_gradient",
+                "AUTO",
+            ),
             "eval_layout": settings.get("eval_layout", "DSN"),
             "objective_adjoint": settings.get("objective_adjoint", "drag"),
             "symmetry_coupling": settings.get("symmetry_coupling", "NONE"),

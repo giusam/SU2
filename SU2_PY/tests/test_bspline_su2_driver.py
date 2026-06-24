@@ -1591,6 +1591,125 @@ def test_airfoil_area_metric_value_and_gradient_for_vertical_bspline_mode():
     assert gradient.tolist() == pytest.approx([1.0])
 
 
+def _area_probe():
+    metadata = [
+        {
+            "x": 0.0,
+            "y": 0.0,
+            "normal_x": 0.0,
+            "normal_y": 1.0,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": 1.0,
+        },
+        {
+            "x": 1.0,
+            "y": 0.0,
+            "normal_x": 0.0,
+            "normal_y": 1.0,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": 1.0,
+        },
+        {
+            "x": 1.0,
+            "y": 1.0,
+            "normal_x": 0.0,
+            "normal_y": 1.0,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": 1.0,
+        },
+        {
+            "x": 0.0,
+            "y": 1.0,
+            "normal_x": 0.0,
+            "normal_y": 1.0,
+            "deform_dir_x": 0.0,
+            "deform_dir_y": 1.0,
+        },
+    ]
+    basis = np.asarray([[0.0], [0.0], [1.0], [1.0]], dtype=float)
+    return metadata, basis
+
+
+def test_geometry_constraint_gradient_config_is_parsed():
+    options = fixed_driver_options_from_config(
+        {"BSPLINE_GEOMETRY_CONSTRAINT_GRADIENT": "SU2_GEO"}
+    )
+
+    assert options["geometry_constraint_gradient"] == "SU2_GEO"
+
+
+def test_invalid_geometry_constraint_gradient_mode_fails(tmp_path):
+    with pytest.raises(
+        BSplineSU2DriverError,
+        match="BSPLINE_GEOMETRY_CONSTRAINT_GRADIENT",
+    ):
+        _make_driver(tmp_path, geometry_constraint_gradient="BAD")
+
+
+def test_airfoil_area_constraint_requires_both_surface_mode(tmp_path):
+    spec = _single_mode_spec()
+    spec["modes"][0]["side"] = "upper"
+
+    with pytest.raises(
+        BSplineSU2DriverError,
+        match="AIRFOIL_AREA requires BSPLINE_SURFACE_MODE=BOTH",
+    ):
+        _make_driver(
+            tmp_path,
+            spec=spec,
+            surface_mode="UPPER",
+            native_constraints="(AIRFOIL_AREA>0.1)*1.0",
+        )
+
+
+def test_geometry_metric_builder_caches_area_and_ignores_unsupported(tmp_path, monkeypatch):
+    driver = _make_driver(tmp_path, spec=_single_mode_spec())
+    monkeypatch.setattr(driver, "_probe_geometry_aware_bounds", _area_probe)
+    monkeypatch.setattr(driver, "_marker_closed", lambda marker: True)
+
+    metric = driver._geometry_metric_for("AIRFOIL_AREA")
+    cached = driver._geometry_metric_for("AIRFOIL_AREA")
+    value, gradient = metric.value_and_gradient([0.2])
+
+    assert metric is cached
+    assert value == pytest.approx(1.2)
+    assert gradient.tolist() == pytest.approx([1.0])
+    assert driver._geometry_metric_for("AIRFOIL_CHORD") is None
+
+
+def test_airfoil_area_auto_vertical_both_uses_analytic_backend(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        deformation_direction_mode="VERTICAL",
+    )
+    monkeypatch.setattr(driver, "_probe_geometry_aware_bounds", _area_probe)
+    monkeypatch.setattr(driver, "_marker_closed", lambda marker: True)
+    monkeypatch.setattr(
+        bspline_driver_module,
+        "run_command",
+        lambda *args, **kwargs: calls.append(kwargs.get("stage")),
+    )
+
+    result = driver.evaluate_geometry_constraint_function([0.2], "AIRFOIL_AREA")
+
+    assert result["source"] == "ANALYTIC"
+    assert result["eval_id"] is None
+    assert result["eval_dir"] is None
+    assert result["value"] == pytest.approx(1.2)
+    assert result["gradient"] == pytest.approx([1.0])
+    assert "geometry_su2_geo" not in calls
+    with open(driver.geometry_constraint_history_filename, "r", newline="") as fp:
+        rows = list(csv.DictReader(fp))
+    assert rows[-1]["function"] == "AIRFOIL_AREA"
+    assert rows[-1]["source"] == "ANALYTIC"
+    assert float(rows[-1]["value"]) == pytest.approx(1.2)
+
+
 def test_geometry_constraint_uses_su2_geo_fd_backend(tmp_path, monkeypatch):
     calls = []
 
@@ -1618,6 +1737,7 @@ def test_geometry_constraint_uses_su2_geo_fd_backend(tmp_path, monkeypatch):
         tmp_path,
         spec=_single_mode_spec(coefficient=0.25),
         geometry_fd_eps=1.0e-5,
+        geometry_constraint_gradient="SU2_GEO",
     )
 
     result = driver.evaluate_geometry_constraint_function([0.25], "AIRFOIL_AREA")
@@ -1630,6 +1750,143 @@ def test_geometry_constraint_uses_su2_geo_fd_backend(tmp_path, monkeypatch):
     assert geo_cfgs
     assert "GEO_PARAM= AIRFOIL_AREA" in geo_cfgs[0].read_text()
     assert "GEO_MODE= FUNCTION" in geo_cfgs[0].read_text()
+    # SU2_GEO solves no adjoint: the geometry eval must not spawn a stray adjoint dir.
+    assert not list(Path(result["eval_dir"]).glob("adjoint_*"))
+
+
+def test_airfoil_area_auto_nonvertical_falls_back_to_su2_geo(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_command(command, cwd, log_file, show_command=False, stream_output=False, stage=None):
+        cwd = Path(cwd)
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(log_file).write_text("$ fake\n")
+        calls.append(stage)
+        eval_dir = cwd
+        while eval_dir.name and not eval_dir.name.startswith("eval_"):
+            eval_dir = eval_dir.parent
+        if stage == "geometry_su2_def":
+            (eval_dir / "deform" / "deformed_mesh.su2").write_text("mesh")
+        if stage == "geometry_su2_geo":
+            (cwd / "of_func.csv").write_text('"AIRFOIL_AREA"\n1.0\n')
+
+    monkeypatch.setattr(bspline_driver_module, "run_command", fake_run_command)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        deformation_direction_mode="NORMAL",
+    )
+
+    result = driver.evaluate_geometry_constraint_function([0.0], "AIRFOIL_AREA")
+
+    assert result["source"] == "SU2_GEO"
+    assert calls.count("geometry_su2_geo") == 2
+
+
+def test_unsupported_geometry_constraint_uses_su2_geo(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_command(command, cwd, log_file, show_command=False, stream_output=False, stage=None):
+        cwd = Path(cwd)
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(log_file).write_text("$ fake\n")
+        calls.append(stage)
+        eval_dir = cwd
+        while eval_dir.name and not eval_dir.name.startswith("eval_"):
+            eval_dir = eval_dir.parent
+        if stage == "geometry_su2_def":
+            (eval_dir / "deform" / "deformed_mesh.su2").write_text("mesh")
+        if stage == "geometry_su2_geo":
+            (cwd / "of_func.csv").write_text('"AIRFOIL_CHORD"\n1.0\n')
+
+    monkeypatch.setattr(bspline_driver_module, "run_command", fake_run_command)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        deformation_direction_mode="VERTICAL",
+    )
+
+    result = driver.evaluate_geometry_constraint_function([0.0], "AIRFOIL_CHORD")
+
+    assert result["source"] == "SU2_GEO"
+    assert calls.count("geometry_su2_geo") == 2
+
+
+def test_su2_geo_forced_overrides_available_analytic_backend(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_command(command, cwd, log_file, show_command=False, stream_output=False, stage=None):
+        cwd = Path(cwd)
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(log_file).write_text("$ fake\n")
+        calls.append(stage)
+        eval_dir = cwd
+        while eval_dir.name and not eval_dir.name.startswith("eval_"):
+            eval_dir = eval_dir.parent
+        if stage == "geometry_su2_def":
+            (eval_dir / "deform" / "deformed_mesh.su2").write_text("mesh")
+        if stage == "geometry_su2_geo":
+            (cwd / "of_func.csv").write_text('"AIRFOIL_AREA"\n1.0\n')
+
+    monkeypatch.setattr(bspline_driver_module, "run_command", fake_run_command)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        deformation_direction_mode="VERTICAL",
+        geometry_constraint_gradient="SU2_GEO",
+    )
+
+    result = driver.evaluate_geometry_constraint_function([0.0], "AIRFOIL_AREA")
+
+    assert result["source"] == "SU2_GEO"
+    assert calls.count("geometry_su2_geo") == 2
+
+
+def test_forced_analytic_rejects_unsupported_geometry_constraint(tmp_path):
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        geometry_constraint_gradient="ANALYTIC",
+    )
+
+    with pytest.raises(
+        BSplineSU2DriverError,
+        match="unsupported for AIRFOIL_CHORD",
+    ):
+        driver.evaluate_geometry_constraint_function([0.0], "AIRFOIL_CHORD")
+
+
+def test_forced_analytic_area_rejects_nonvertical_direction(tmp_path):
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        deformation_direction_mode="NORMAL",
+        geometry_constraint_gradient="ANALYTIC",
+    )
+
+    with pytest.raises(
+        BSplineSU2DriverError,
+        match="BSPLINE_DEFORMATION_DIRECTION=VERTICAL",
+    ):
+        driver.evaluate_geometry_constraint_function([0.0], "AIRFOIL_AREA")
+
+
+def test_forced_analytic_thickness_rejects_half_domain(tmp_path):
+    spec = _single_mode_spec()
+    spec["modes"][0]["side"] = "upper"
+    driver = _make_driver(
+        tmp_path,
+        spec=spec,
+        surface_mode="UPPER",
+        deformation_direction_mode="VERTICAL",
+        geometry_constraint_gradient="ANALYTIC",
+    )
+
+    with pytest.raises(
+        BSplineSU2DriverError,
+        match="analytic AIRFOIL_THICKNESS requires BSPLINE_SURFACE_MODE=BOTH",
+    ):
+        driver.evaluate_geometry_constraint_function([0.0], "AIRFOIL_THICKNESS")
 
 
 def test_native_su2_constraints_use_slsqp_sign_convention(tmp_path, monkeypatch):
@@ -2311,6 +2568,209 @@ def test_dsn_eval_aliases_symlink_or_copy_root_compatibility_files(tmp_path):
     assert (paths.eval_dir / "surface_sens.csv").read_text() == "sens"
     assert (paths.eval_dir / "history_primal.csv").read_text() == "primal"
     assert (paths.eval_dir / "history_adjoint.csv").read_text() == "adjoint history"
+
+
+def _install_fake_aero_run(monkeypatch, default_gradient=1.0):
+    calls = []
+
+    def fake_run_command(command, cwd, log_file, show_command=False, stream_output=False, stage=None):
+        cwd = Path(cwd)
+        log_file = Path(log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text("$ fake\n")
+        calls.append((stage, cwd, list(command)))
+        eval_dir = cwd
+        while eval_dir.name and not eval_dir.name.startswith("eval_"):
+            eval_dir = eval_dir.parent
+
+        if stage == "bspline_def":
+            (eval_dir / "deform").mkdir(parents=True, exist_ok=True)
+            (eval_dir / "deform" / "surface_positions.dat").write_text("surface")
+            (eval_dir / "deform" / "bspline_surface_metadata.csv").write_text(
+                "node_id,x,y,normal_x,normal_y\n"
+            )
+        elif stage == "su2_def":
+            (eval_dir / "deform" / "deformed_mesh.su2").write_text("mesh")
+        elif stage == "su2_cfd":
+            (eval_dir / "direct").mkdir(parents=True, exist_ok=True)
+            (eval_dir / "direct" / "restart_flow.dat").write_text("restart")
+            (eval_dir / "direct" / "history_primal.csv").write_text(
+                '"CD","CL","CMz"\n0.11,0.22,0.33\n'
+            )
+        elif stage == "su2_cfd_ad":
+            cwd.mkdir(parents=True, exist_ok=True)
+            (cwd / "surface_adjoint.csv").write_text("adjoint")
+            (cwd / "history_adjoint.csv").write_text('"RMS_ADJ"\n0.0\n')
+        elif stage == "su2_dot_ad":
+            cwd.mkdir(parents=True, exist_ok=True)
+            # Tag the sensitivity with the adjoint dir name so root aliases can be
+            # traced back to the function that produced them.
+            (cwd / "surface_sens.csv").write_text(cwd.name)
+        elif stage == "bspline_dot":
+            command_text = " ".join(str(part) for part in command)
+            if "adjoint_lift" in command_text:
+                gradient = 2.0
+            elif "adjoint_momentz" in command_text:
+                gradient = 3.0
+            else:
+                gradient = default_gradient
+            (eval_dir / "bspline_gradients.csv").write_text(
+                "mode_id,gradient\nlower_b,{:.1f}\n".format(gradient)
+            )
+
+    monkeypatch.setattr(bspline_driver_module, "run_command", fake_run_command)
+    return calls
+
+
+def test_aero_constraints_and_objective_share_primal_with_lazy_adjoints(tmp_path, monkeypatch):
+    calls = _install_fake_aero_run(monkeypatch)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        objective_adjoint="DRAG",
+        gradient_guard=False,
+    )
+
+    lift = driver.evaluate_constraint_function([0.0], "LIFT")
+    moment = driver.evaluate_constraint_function([0.0], "MOMENT_Z")
+    objective = driver.evaluate([0.0])
+
+    assert lift["eval_id"] == moment["eval_id"] == objective["eval_id"] == 0
+    assert lift["eval_dir"] == moment["eval_dir"] == objective["eval_dir"]
+    eval_dir = Path(objective["eval_dir"])
+    assert (eval_dir / "direct").is_dir()
+    assert (eval_dir / "adjoint_lift").is_dir()
+    assert (eval_dir / "adjoint_momentz").is_dir()
+    assert (eval_dir / "adjoint_drag").is_dir()
+    assert [call[0] for call in calls].count("su2_cfd") == 1
+    assert [call[0] for call in calls].count("su2_cfd_ad") == 3
+    assert lift["value"] == pytest.approx(0.22)
+    assert moment["value"] == pytest.approx(0.33)
+    assert objective["objective"] == pytest.approx(0.11)
+    assert lift["gradient"] == pytest.approx([2.0])
+    assert moment["gradient"] == pytest.approx([3.0])
+    assert objective["gradient"] == pytest.approx([1.0])
+    assert "OBJECTIVE_FUNCTION= LIFT" in (eval_dir / "adjoint_lift" / "adjoint.cfg").read_text()
+    assert "OBJECTIVE_FUNCTION= MOMENT_Z" in (
+        eval_dir / "adjoint_momentz" / "adjoint.cfg"
+    ).read_text()
+    assert "OBJECTIVE_FUNCTION= DRAG" in (eval_dir / "adjoint_drag" / "adjoint.cfg").read_text()
+
+
+def test_objective_without_constraints_keeps_single_drag_adjoint(tmp_path, monkeypatch):
+    calls = _install_fake_aero_run(monkeypatch)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        objective_adjoint="DRAG",
+        gradient_guard=False,
+    )
+
+    result = driver.evaluate([0.0])
+
+    eval_dir = Path(result["eval_dir"])
+    assert sorted(path.name for path in eval_dir.glob("adjoint_*")) == ["adjoint_drag"]
+    assert [call[0] for call in calls].count("su2_cfd") == 1
+    assert [call[0] for call in calls].count("su2_cfd_ad") == 1
+
+
+def test_objective_guard_stop_does_not_invalidate_shared_constraint_results(
+    tmp_path, monkeypatch
+):
+    # Pathological objective gradient (drag) so the guard fires; constraints fine.
+    calls = _install_fake_aero_run(monkeypatch, default_gradient=500.0)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        objective_adjoint="DRAG",
+        gradient_guard=True,
+        gradient_guard_factor=100.0,
+        gradient_guard_min_history=3,
+    )
+    driver.recent_safe_raw_gnorms.extend([1.0, 1.0, 1.0])
+
+    lift = driver.evaluate_constraint_function([0.0], "LIFT")
+    moment = driver.evaluate_constraint_function([0.0], "MOMENT_Z")
+
+    with pytest.raises(GradientGuardStop):
+        driver.evaluate([0.0])
+
+    # One shared primal even though the objective then tripped the guard,
+    # and all three adjoints had run before the guard fired in _finalize_objective.
+    assert [call[0] for call in calls].count("su2_cfd") == 1
+    assert [call[0] for call in calls].count("su2_cfd_ad") == 3
+
+    # The constraint results cached in the shared eval survive the objective rollback:
+    # re-reading them does not trigger any new adjoint solve.
+    assert lift["gradient"] == pytest.approx([2.0])
+    assert moment["gradient"] == pytest.approx([3.0])
+    assert driver.evaluate_constraint_function([0.0], "LIFT")["gradient"] == pytest.approx(
+        [2.0]
+    )
+    assert driver.evaluate_constraint_function([0.0], "MOMENT_Z")[
+        "gradient"
+    ] == pytest.approx([3.0])
+    assert [call[0] for call in calls].count("su2_cfd_ad") == 3
+
+
+def test_trust_clip_reclassifies_same_design_point_without_resolving(tmp_path, monkeypatch):
+    calls = _install_fake_aero_run(monkeypatch)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        objective_adjoint="DRAG",
+        gradient_guard=False,
+        trust_clip_policy="ACCEPT_RESTART",
+    )
+
+    driver.evaluate([0.0])
+    driver.evaluate([0.0])
+
+    # Same coefficients => same design point reused: primal/adjoint solved once,
+    # but trust-clip re-classifies on every objective request.
+    assert [call[0] for call in calls].count("su2_cfd") == 1
+    assert [call[0] for call in calls].count("su2_cfd_ad") == 1
+    assert len(driver.recent_level_clip_events) == 2
+
+
+def test_shared_eval_promotes_objective_once_despite_constraints(tmp_path, monkeypatch):
+    _install_fake_aero_run(monkeypatch)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        objective_adjoint="DRAG",
+        gradient_guard=True,
+        gradient_guard_min_history=3,
+    )
+
+    driver.evaluate_constraint_function([0.0], "LIFT")
+    driver.evaluate_constraint_function([0.0], "MOMENT_Z")
+    # Constraints never touch the safe-gradient history.
+    assert list(driver.recent_safe_raw_gnorms) == []
+
+    driver.evaluate([0.0])
+    # The objective is promoted exactly once for the shared design point.
+    assert list(driver.recent_safe_raw_gnorms) == [pytest.approx(1.0)]
+
+
+def test_shared_eval_root_sensitivity_alias_tracks_objective_not_last_func(
+    tmp_path, monkeypatch
+):
+    _install_fake_aero_run(monkeypatch)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        objective_adjoint="DRAG",
+        gradient_guard=False,
+    )
+
+    # Objective first, constraint last: the eval-root surface_sens alias consumed by
+    # adaptive scoring must stay the objective's, independent of evaluation order.
+    objective = driver.evaluate([0.0])
+    driver.evaluate_constraint_function([0.0], "LIFT")
+
+    eval_dir = Path(objective["eval_dir"])
+    assert (eval_dir / "surface_sens.csv").read_text() == "adjoint_drag"
 
 
 def test_cli_default_hides_commands_unless_show_commands_is_used():

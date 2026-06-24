@@ -468,6 +468,11 @@ def _build_arg_parser():
         choices=ALLOWED_SENSITIVITY_SOURCES,
     )
     parser.add_argument("--geometry-fd-eps", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--geometry-constraint-gradient",
+        default="AUTO",
+        choices=("AUTO", "ANALYTIC", "SU2_GEO"),
+    )
     parser.add_argument("--symmetry-coupling", default="NONE", choices=ALLOWED_SYMMETRY_COUPLINGS)
     parser.add_argument("--surface-mode", default="BOTH", choices=ALLOWED_SURFACE_MODES)
     parser.add_argument(

@@ -67,6 +67,7 @@ def fixed_driver_options_from_config(config_values):
         "BSPLINE_EVAL_LAYOUT": "eval_layout",
         "BSPLINE_SENSITIVITY_SOURCE": "sensitivity_source",
         "BSPLINE_GEOMETRY_FD_EPS": "geometry_fd_eps",
+        "BSPLINE_GEOMETRY_CONSTRAINT_GRADIENT": "geometry_constraint_gradient",
         "BSPLINE_SYMMETRY_COUPLING": "symmetry_coupling",
         "BSPLINE_SURFACE_MODE": "surface_mode",
         "BSPLINE_DEFORMATION_DIRECTION": "deformation_direction_mode",

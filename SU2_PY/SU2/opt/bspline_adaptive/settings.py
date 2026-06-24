@@ -502,6 +502,13 @@ def validate_adaptive_options(opts):
     )
     if opts["geometry_fd_eps"] <= 0.0:
         raise BSplineAdaptiveError("BSPLINE_GEOMETRY_FD_EPS must be positive")
+    opts["geometry_constraint_gradient"] = str(
+        opts.get("geometry_constraint_gradient", "AUTO")
+    ).strip().upper()
+    if opts["geometry_constraint_gradient"] not in ("AUTO", "ANALYTIC", "SU2_GEO"):
+        raise BSplineAdaptiveError(
+            "BSPLINE_GEOMETRY_CONSTRAINT_GRADIENT must be AUTO, ANALYTIC, or SU2_GEO"
+        )
     opts["thickness_options"] = dict(opts.get("thickness_options") or {})
     if _as_bool(
         opts["thickness_options"].get("PROGRESSIVE_THICKNESS_CONSTRAINT", False),
@@ -1183,6 +1190,11 @@ def _settings_from_args(args):
         "sensitivity_weighting": getattr(args, "sensitivity_weighting", "NODAL"),
         "sensitivity_source": getattr(args, "sensitivity_source", "DOT_AD_TRANSFER"),
         "geometry_fd_eps": getattr(args, "geometry_fd_eps", 1.0e-6),
+        "geometry_constraint_gradient": getattr(
+            args,
+            "geometry_constraint_gradient",
+            "AUTO",
+        ),
         "eval_layout": args.eval_layout,
         "objective_adjoint": args.objective_adjoint,
         "symmetry_coupling": args.symmetry_coupling,

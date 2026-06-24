@@ -82,6 +82,9 @@ from .geometry_bounds import (
     compute_geometry_aware_bound_scaling,
 )
 from .geometry_constraints import (
+    BSplineAirfoilAreaMetric,
+    BSplineAirfoilMaxThicknessMetric,
+    SUPPORTED_BSPLINE_GEOMETRY_CONSTRAINTS,
     is_geometry_constraint_name,
     normalize_geometry_constraint_name,
 )
@@ -112,11 +115,24 @@ from .reduction import (
 )
 from .native_constraints import normalize_native_constraints
 from .tables import (
+    FUNCTION_HISTORY_COLUMNS,
     history_column_for_function,
     read_gradient_vector,
     read_objective_from_history,
 )
 from .thickness import BSplineThicknessConstraint
+
+ALLOWED_GEOMETRY_CONSTRAINT_GRADIENT_MODES = ("AUTO", "ANALYTIC", "SU2_GEO")
+
+
+def normalize_geometry_constraint_gradient_mode(value):
+    mode = str(value or "AUTO").strip().upper()
+    if mode not in ALLOWED_GEOMETRY_CONSTRAINT_GRADIENT_MODES:
+        raise BSplineSU2DriverError(
+            "BSPLINE_GEOMETRY_CONSTRAINT_GRADIENT must be AUTO, ANALYTIC, "
+            f"or SU2_GEO; got {mode!r}"
+        )
+    return mode
 
 
 def _project_to_bounds(coefficients, bounds):
@@ -179,6 +195,7 @@ class BSplineSU2Driver:
         thickness_options=None,
         native_constraints=None,
         geometry_fd_eps=1.0e-6,
+        geometry_constraint_gradient="AUTO",
         eval_layout="DSN",
         objective_adjoint="drag",
         symmetry_coupling="NONE",
@@ -386,6 +403,16 @@ class BSplineSU2Driver:
         )
         if self.geometry_fd_eps <= 0.0:
             raise BSplineSU2DriverError("BSPLINE_GEOMETRY_FD_EPS must be positive")
+        self.geometry_constraint_gradient_mode = (
+            normalize_geometry_constraint_gradient_mode(geometry_constraint_gradient)
+        )
+        if any(
+            normalize_geometry_constraint_name(spec.name) == "AIRFOIL_AREA"
+            for spec in self.native_constraints
+        ) and self.surface_mode != "BOTH":
+            raise BSplineSU2DriverError(
+                "AIRFOIL_AREA requires BSPLINE_SURFACE_MODE=BOTH"
+            )
         self.thickness_constraint = None
         self._thickness_constraint_configured = False
         self._thickness_fallback_warned = False
@@ -451,12 +478,14 @@ class BSplineSU2Driver:
         self.geometry_bounds_scaling = None
         self._geometry_bounds_configured = False
         self._geometry_probe = None
+        self._geometry_metric_cache = {}
         self._line_search_basis_matrix = None
         self._line_search_bound_configured = False
         self._line_search_anchor_physical = list(self.initial_coefficients)
         self._local_step_anchor_reduced = list(self.initial_reduced_coefficients)
         self._cache = {}
         self._constraint_cache = {}
+        self._design_points = {}
         self._last_eval_physical_key = None
         self._last_eval_result = None
         self._last_eval_info = None
@@ -861,7 +890,9 @@ class BSplineSU2Driver:
     def _run_su2_geo_function_value(self, coefficients, function_name):
         function_name = normalize_geometry_constraint_name(function_name)
         eval_id, paths = self._next_paths(objective_adjoint=f"geo_{function_name}")
-        self._prepare_eval_files(coefficients, paths)
+        # SU2_GEO only needs the deformed mesh; no adjoint is solved here, so prepare
+        # only the shared deform/direct files (avoids a stray, unused adjoint dir).
+        self._prepare_shared_files(coefficients, paths)
 
         geo_dir = paths.eval_dir / "geometry"
         geo_dir.mkdir(parents=True, exist_ok=True)
@@ -943,6 +974,97 @@ class BSplineSU2Driver:
             "value": value,
         }
 
+    def _geometry_backend_for(self, function_name):
+        function_name = normalize_geometry_constraint_name(function_name)
+        mode = self.geometry_constraint_gradient_mode
+        supported = function_name in SUPPORTED_BSPLINE_GEOMETRY_CONSTRAINTS
+        if function_name == "AIRFOIL_AREA" and self.surface_mode != "BOTH":
+            raise BSplineSU2DriverError(
+                "AIRFOIL_AREA requires BSPLINE_SURFACE_MODE=BOTH"
+            )
+        if mode == "SU2_GEO":
+            return "SU2_GEO"
+        if not supported:
+            if mode == "ANALYTIC":
+                raise BSplineSU2DriverError(
+                    f"analytic geometry constraint gradient is unsupported for {function_name}"
+                )
+            return "SU2_GEO"
+        if mode == "ANALYTIC":
+            if self.deformation_direction_mode != "VERTICAL":
+                raise BSplineSU2DriverError(
+                    "analytic geometry constraint gradient requires "
+                    "BSPLINE_DEFORMATION_DIRECTION=VERTICAL"
+                )
+            if function_name == "AIRFOIL_AREA":
+                return "ANALYTIC"
+            if function_name == "AIRFOIL_THICKNESS":
+                if self.surface_mode != "BOTH":
+                    raise BSplineSU2DriverError(
+                        "analytic AIRFOIL_THICKNESS requires BSPLINE_SURFACE_MODE=BOTH"
+                    )
+                if not self._marker_closed(self.marker):
+                    raise BSplineSU2DriverError(
+                        "analytic AIRFOIL_THICKNESS requires a closed B-spline marker"
+                    )
+                return "ANALYTIC"
+        if mode == "AUTO":
+            if self.deformation_direction_mode != "VERTICAL":
+                return "SU2_GEO"
+            if function_name == "AIRFOIL_AREA":
+                return "ANALYTIC"
+            if (
+                function_name == "AIRFOIL_THICKNESS"
+                and self.surface_mode == "BOTH"
+                and self._marker_closed(self.marker)
+            ):
+                return "ANALYTIC"
+        return "SU2_GEO"
+
+    def _geometry_metric_for(self, function_name):
+        function_name = normalize_geometry_constraint_name(function_name)
+        if function_name not in SUPPORTED_BSPLINE_GEOMETRY_CONSTRAINTS:
+            return None
+        metric = self._geometry_metric_cache.get(function_name)
+        if metric is not None:
+            return metric
+        metadata, basis_matrix = self._probe_geometry_aware_bounds()
+        marker = self.marker
+        closed = self._marker_closed(marker)
+        if function_name == "AIRFOIL_AREA":
+            if self.surface_mode != "BOTH":
+                raise BSplineSU2DriverError(
+                    "AIRFOIL_AREA requires BSPLINE_SURFACE_MODE=BOTH"
+                )
+            metric = BSplineAirfoilAreaMetric(
+                metadata,
+                basis_matrix,
+                self.mode_ids,
+                closed=closed,
+            )
+        elif function_name == "AIRFOIL_THICKNESS":
+            x_stations_value = (self.thickness_options or {}).get(
+                "PROGRESSIVE_THICKNESS_X_STATIONS"
+            )
+            if not _x_stations_value_is_empty(x_stations_value):
+                x_stations = _parse_x_stations(x_stations_value)
+            else:
+                x_stations = np.linspace(0.001, 0.999, 101)
+            metric = BSplineAirfoilMaxThicknessMetric(
+                metadata,
+                basis_matrix,
+                self.mode_ids,
+                x_stations=x_stations,
+                fd_eps=self.geometry_fd_eps,
+                gradient_mode="ANALYTIC",
+                closed=closed,
+                marker=marker,
+            )
+        else:
+            metric = None
+        self._geometry_metric_cache[function_name] = metric
+        return metric
+
     def evaluate_geometry_constraint_function(self, coefficients, function_name):
         coefficients = [_as_float(value, "coefficient") for value in coefficients]
         if len(coefficients) != len(self.mode_ids):
@@ -953,6 +1075,28 @@ class BSplineSU2Driver:
         key = (cache_key(coefficients, self.cache_tol), _normalized_name(function_name))
         if key in self._constraint_cache:
             return self._constraint_cache[key]
+
+        backend = self._geometry_backend_for(function_name)
+        if backend == "ANALYTIC":
+            metric = self._geometry_metric_for(function_name)
+            if metric is None:
+                raise BSplineSU2DriverError(
+                    f"analytic geometry constraint gradient is unsupported for {function_name}"
+                )
+            value, gradient = metric.value_and_gradient(coefficients)
+            result = {
+                "eval_id": None,
+                "eval_dir": None,
+                "function": function_name,
+                "value": float(value),
+                "gradient": [float(item) for item in gradient],
+                "coefficients": coefficients,
+                "status": "ok",
+                "source": "ANALYTIC",
+            }
+            self._append_geometry_constraint_record(result)
+            self._constraint_cache[key] = result
+            return result
 
         base = self._run_su2_geo_function_value(coefficients, function_name)
         value = float(base["value"])
@@ -976,6 +1120,7 @@ class BSplineSU2Driver:
             "source": "SU2_GEO",
             "geometry_fd_eps": float(self.geometry_fd_eps),
         }
+        self._append_geometry_constraint_record(result)
         self._constraint_cache[key] = result
         return result
 
@@ -1474,6 +1619,46 @@ class BSplineSU2Driver:
     def optimized_modes_filename(self):
         return self.workdir / "optimized_modes.json"
 
+    @property
+    def geometry_constraint_history_filename(self):
+        return self.workdir / "geometry_constraints.csv"
+
+    def _append_geometry_constraint_record(self, result):
+        fieldnames = [
+            "function",
+            "source",
+            "value",
+            "gradient",
+            "coefficients",
+            "eval_id",
+            "eval_dir",
+            "geometry_fd_eps",
+        ]
+        filename = self.geometry_constraint_history_filename
+        write_header = not filename.exists()
+        with open(filename, "a", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(
+                {
+                    "function": result.get("function", ""),
+                    "source": result.get("source", ""),
+                    "value": _format_config_atom(result.get("value", "")),
+                    "gradient": json.dumps(result.get("gradient", [])),
+                    "coefficients": json.dumps(result.get("coefficients", [])),
+                    "eval_id": ""
+                    if result.get("eval_id") is None
+                    else result.get("eval_id"),
+                    "eval_dir": ""
+                    if result.get("eval_dir") is None
+                    else result.get("eval_dir"),
+                    "geometry_fd_eps": _format_config_atom(
+                        result.get("geometry_fd_eps", "")
+                    ),
+                }
+            )
+
     def _next_paths(self, objective_adjoint=None):
         objective_adjoint = (
             self.objective_adjoint
@@ -1491,9 +1676,20 @@ class BSplineSU2Driver:
             if not paths.eval_dir.exists():
                 return eval_id, paths
 
-    def _prepare_eval_files(self, coefficients, paths, objective_function=None):
-        paths.eval_dir.mkdir(parents=True, exist_ok=False)
-        for directory in {paths.deform_dir, paths.direct_dir, paths.adjoint_dir}:
+    def _shared_primal_updates(self, paths):
+        return {
+            "SOLUTION_FILENAME": paths.primal_solution.name,
+            "RESTART_FILENAME": paths.primal_restart.name,
+            "SOLUTION_ADJ_FILENAME": paths.adjoint_solution.name,
+            "RESTART_ADJ_FILENAME": paths.adjoint_restart.name,
+            "SURFACE_ADJ_FILENAME": paths.surface_adjoint.stem,
+            "VOLUME_ADJ_FILENAME": paths.volume_adjoint.name,
+            "TABULAR_FORMAT": "CSV",
+        }
+
+    def _prepare_shared_files(self, coefficients, paths):
+        paths.eval_dir.mkdir(parents=True, exist_ok=True)
+        for directory in {paths.deform_dir, paths.direct_dir}:
             directory.mkdir(parents=True, exist_ok=True)
         current_spec = update_mode_coefficients(self.mode_spec, coefficients)
         write_mode_spec(current_spec, paths.modes_current)
@@ -1511,27 +1707,11 @@ class BSplineSU2Driver:
         )
 
         primal_mesh_filename = _relative_path(paths.deformed_mesh, paths.direct_dir)
-        adjoint_mesh_filename = _relative_path(paths.deformed_mesh, paths.adjoint_dir)
-        adjoint_flow_solution = _relative_path(paths.primal_solution, paths.adjoint_dir)
-        adjoint_flow_restart = _relative_path(paths.primal_restart, paths.adjoint_dir)
-
-        shared_primal_updates = {
-            "SOLUTION_FILENAME": paths.primal_solution.name,
-            "RESTART_FILENAME": paths.primal_restart.name,
-            "SOLUTION_ADJ_FILENAME": paths.adjoint_solution.name,
-            "RESTART_ADJ_FILENAME": paths.adjoint_restart.name,
-            "SURFACE_ADJ_FILENAME": paths.surface_adjoint.stem,
-            "VOLUME_ADJ_FILENAME": paths.volume_adjoint.name,
-            "TABULAR_FORMAT": "CSV",
-        }
-        objective_updates = {}
-        if objective_function:
-            objective_updates["OBJECTIVE_FUNCTION"] = str(objective_function).strip().upper()
         patch_config_template(
             self.primal_template,
             paths.primal_cfg,
             dict(
-                shared_primal_updates,
+                self._shared_primal_updates(paths),
                 MESH_FILENAME=primal_mesh_filename,
                 MESH_OUT_FILENAME=paths.primal_mesh_out.name,
                 CONV_FILENAME=paths.primal_history.stem,
@@ -1539,11 +1719,22 @@ class BSplineSU2Driver:
                 SCREEN_OUTPUT=["INNER_ITER", "RMS_RES", "LIFT", "DRAG"],
             ),
         )
+
+    def _prepare_func_adjoint_files(self, paths, objective_function=None):
+        paths.eval_dir.mkdir(parents=True, exist_ok=True)
+        paths.adjoint_dir.mkdir(parents=True, exist_ok=True)
+        adjoint_mesh_filename = _relative_path(paths.deformed_mesh, paths.adjoint_dir)
+        adjoint_flow_solution = _relative_path(paths.primal_solution, paths.adjoint_dir)
+        adjoint_flow_restart = _relative_path(paths.primal_restart, paths.adjoint_dir)
+
+        objective_updates = {}
+        if objective_function:
+            objective_updates["OBJECTIVE_FUNCTION"] = str(objective_function).strip().upper()
         patch_config_template(
             self.adjoint_template,
             paths.adjoint_cfg,
             dict(
-                shared_primal_updates,
+                self._shared_primal_updates(paths),
                 **objective_updates,
                 MESH_FILENAME=adjoint_mesh_filename,
                 SOLUTION_FILENAME=adjoint_flow_solution,
@@ -1558,7 +1749,7 @@ class BSplineSU2Driver:
             self.adjoint_template,
             paths.dot_ad_cfg,
             dict(
-                shared_primal_updates,
+                self._shared_primal_updates(paths),
                 **objective_updates,
                 MATH_PROBLEM="DISCRETE_ADJOINT",
                 MESH_FILENAME=adjoint_mesh_filename,
@@ -1580,6 +1771,227 @@ class BSplineSU2Driver:
                 CONV_FILENAME=paths.adjoint_history.stem,
             ),
         )
+
+    def _prepare_eval_files(self, coefficients, paths, objective_function=None):
+        self._prepare_shared_files(coefficients, paths)
+        self._prepare_func_adjoint_files(paths, objective_function=objective_function)
+
+    def _build_commands(self, paths):
+        return build_eval_commands(
+            paths,
+            self.base_mesh,
+            self.marker,
+            mpi_prefix=self.mpi_prefix,
+            python_executable=self.python_executable,
+            sensitivity_weighting=self.sensitivity_weighting,
+            surface_mode=self.surface_mode,
+            deformation_direction_mode=self.deformation_direction_mode,
+            le_safe_direction=self.le_safe_direction_options["le_safe_direction"],
+            le_safe_x0=self.le_safe_direction_options["le_safe_x0"],
+            le_safe_x1=self.le_safe_direction_options["le_safe_x1"],
+            le_safe_power=self.le_safe_direction_options["le_safe_power"],
+            sensitivity_source=self.sensitivity_source,
+        )
+
+    def _log_eval_commands(self, paths, commands, stages):
+        stage_cwds = {
+            "bspline_def": paths.deform_dir,
+            "def": paths.deform_dir,
+            "primal": paths.direct_dir,
+            "adjoint": paths.adjoint_dir,
+            "dot_ad": paths.adjoint_dir,
+            "bspline_dot": paths.eval_dir,
+        }
+        for stage in stages:
+            if stage not in commands:
+                continue
+            cwd = stage_cwds[stage]
+            _append_command_log(paths.commands_log, stage, cwd, commands[stage])
+            _append_command_log(self.workdir / "commands.log", stage, cwd, commands[stage])
+
+    def _maybe_print_commands_log_path(self):
+        if self.show_commands and not self._printed_commands_log_path:
+            print(
+                "[BSPLINE_SU2_DRIVER] Commands are logged in {}".format(
+                    self.workdir / "commands.log"
+                )
+            )
+            self._printed_commands_log_path = True
+
+    def _function_record_key(self, function_name):
+        return _normalized_name(function_name).upper()
+
+    def _history_column_record_key(self, column_name):
+        return "COLUMN:" + _normalized_name(column_name).upper()
+
+    def _read_primal_values(self, paths):
+        values = {}
+        for function_name, column_name in FUNCTION_HISTORY_COLUMNS.items():
+            try:
+                value = read_objective_from_history(paths.primal_history, column_name)
+            except BSplineSU2DriverError:
+                continue
+            values[self._function_record_key(function_name)] = value
+            values[self._history_column_record_key(column_name)] = value
+        try:
+            values[self._history_column_record_key(self.objective_column)] = (
+                read_objective_from_history(paths.primal_history, self.objective_column)
+            )
+        except BSplineSU2DriverError:
+            pass
+        return values
+
+    def _primal_value_for_function(self, primal_values, function_name):
+        function_key = self._function_record_key(function_name)
+        if function_key in primal_values:
+            return primal_values[function_key]
+        column_key = self._history_column_record_key(
+            history_column_for_function(function_name)
+        )
+        if column_key in primal_values:
+            return primal_values[column_key]
+        raise BSplineSU2DriverError(
+            "primal history has no value for function {}".format(function_name)
+        )
+
+    def _objective_value_from_primal_values(self, primal_values):
+        column_key = self._history_column_record_key(self.objective_column)
+        if column_key in primal_values:
+            return primal_values[column_key]
+        return self._primal_value_for_function(primal_values, self.objective_adjoint)
+
+    def _design_point(self, coefficients, objective_adjoint=None):
+        key = cache_key(coefficients, self.cache_tol)
+        record = self._design_points.get(key)
+        if record is not None:
+            return key, record
+        eval_id, paths = self._next_paths(objective_adjoint=objective_adjoint)
+        record = {
+            "eval_id": eval_id,
+            "eval_dir": paths.eval_dir,
+            "coefficients": list(coefficients),
+            "core_done": False,
+            "primal_values": {},
+            "func_paths": {},
+            "func_adjoints": {},
+        }
+        self._design_points[key] = record
+        return key, record
+
+    def _record_paths_for_function(self, record, function_name):
+        function_key = self._function_record_key(function_name)
+        paths = record["func_paths"].get(function_key)
+        if paths is None:
+            paths = build_eval_paths(
+                record["eval_dir"],
+                eval_layout=self.eval_layout,
+                objective_adjoint=function_name,
+            )
+            record["func_paths"][function_key] = paths
+        return paths
+
+    def _run_shared_core(self, coefficients, paths, record=None):
+        if record is not None and record.get("core_done"):
+            return record["primal_values"]
+
+        self._prepare_shared_files(coefficients, paths)
+        commands = self._build_commands(paths)
+        self._log_eval_commands(paths, commands, ("bspline_def", "def", "primal"))
+        self._maybe_print_commands_log_path()
+
+        run_command(
+            commands["bspline_def"],
+            paths.deform_dir,
+            paths.bspline_def_log,
+            show_command=False,
+            stream_output=self.stream_solver_output,
+            stage="bspline_def",
+        )
+        run_command(
+            commands["def"],
+            paths.deform_dir,
+            paths.su2_def_log,
+            show_command=False,
+            stream_output=self.stream_solver_output,
+            stage="su2_def",
+        )
+        run_command(
+            commands["primal"],
+            paths.direct_dir,
+            paths.su2_cfd_log,
+            show_command=False,
+            stream_output=self.stream_solver_output,
+            stage="su2_cfd",
+        )
+        ensure_adjoint_solution_input(paths.primal_restart, paths.primal_solution)
+        primal_values = self._read_primal_values(paths)
+        if record is not None:
+            record["core_done"] = True
+            record["primal_values"] = primal_values
+        return primal_values
+
+    def _run_function_adjoint(
+        self,
+        paths,
+        function_name,
+        record=None,
+        allow_nonfinite=False,
+    ):
+        function_key = self._function_record_key(function_name)
+        if record is not None and function_key in record["func_adjoints"]:
+            return record["func_adjoints"][function_key]["gradient"]
+
+        self._prepare_func_adjoint_files(paths, objective_function=function_name)
+        commands = self._build_commands(paths)
+        self._log_eval_commands(paths, commands, ("adjoint", "dot_ad", "bspline_dot"))
+
+        run_command(
+            commands["adjoint"],
+            paths.adjoint_dir,
+            paths.su2_cfd_ad_log,
+            show_command=False,
+            stream_output=self.stream_solver_output,
+            stage="su2_cfd_ad",
+        )
+        if "dot_ad" in commands:
+            run_command(
+                commands["dot_ad"],
+                paths.adjoint_dir,
+                paths.su2_dot_ad_log,
+                show_command=False,
+                stream_output=self.stream_solver_output,
+                stage="su2_dot_ad",
+            )
+            if not paths.surface_sens.exists():
+                raise BSplineSU2DriverError(
+                    "SU2_DOT_AD completed but did not write {}; check "
+                    "SURFACE_SENS_FILENAME and OUTPUT_FILES in {}".format(
+                        paths.surface_sens,
+                        paths.dot_ad_cfg,
+                    )
+                )
+        run_command(
+            commands["bspline_dot"],
+            paths.eval_dir,
+            paths.bspline_dot_log,
+            show_command=False,
+            stream_output=self.stream_solver_output,
+            stage="bspline_dot",
+        )
+        # Root-level aliases (surface_sens.csv, ...) are created once for the
+        # objective in evaluate(), so they deterministically reflect the objective
+        # rather than whichever function ran last in the shared evaluation.
+        gradient = read_gradient_vector(
+            paths.gradients,
+            self.mode_ids,
+            allow_nonfinite=allow_nonfinite,
+        )
+        if record is not None:
+            record["func_adjoints"][function_key] = {
+                "gradient": gradient,
+                "surface_sens": paths.surface_sens,
+            }
+        return gradient
 
     def _write_eval_summary_metadata(
         self,
@@ -1863,102 +2275,25 @@ class BSplineSU2Driver:
         if key in self._constraint_cache:
             return self._constraint_cache[key]
 
-        eval_id, paths = self._next_paths(objective_adjoint=function_name)
+        _design_key, record = self._design_point(
+            coefficients,
+            objective_adjoint=function_name,
+        )
+        paths = self._record_paths_for_function(record, function_name)
         try:
-            self._prepare_eval_files(
-                coefficients,
+            primal_values = self._run_shared_core(coefficients, paths, record=record)
+            value = self._primal_value_for_function(primal_values, function_name)
+            gradient = self._run_function_adjoint(
                 paths,
-                objective_function=function_name,
+                function_name,
+                record=record,
             )
-            commands = build_eval_commands(
-                paths,
-                self.base_mesh,
-                self.marker,
-                mpi_prefix=self.mpi_prefix,
-                python_executable=self.python_executable,
-                sensitivity_weighting=self.sensitivity_weighting,
-                surface_mode=self.surface_mode,
-                deformation_direction_mode=self.deformation_direction_mode,
-                le_safe_direction=self.le_safe_direction_options["le_safe_direction"],
-                le_safe_x0=self.le_safe_direction_options["le_safe_x0"],
-                le_safe_x1=self.le_safe_direction_options["le_safe_x1"],
-                le_safe_power=self.le_safe_direction_options["le_safe_power"],
-                sensitivity_source=self.sensitivity_source,
-            )
-            for stage, command in commands.items():
-                _append_command_log(paths.commands_log, stage, paths.eval_dir, command)
-                _append_command_log(self.workdir / "commands.log", stage, paths.eval_dir, command)
-
-            run_command(
-                commands["bspline_def"],
-                paths.deform_dir,
-                paths.bspline_def_log,
-                show_command=False,
-                stream_output=self.stream_solver_output,
-                stage="bspline_def",
-            )
-            run_command(
-                commands["def"],
-                paths.deform_dir,
-                paths.su2_def_log,
-                show_command=False,
-                stream_output=self.stream_solver_output,
-                stage="su2_def",
-            )
-            run_command(
-                commands["primal"],
-                paths.direct_dir,
-                paths.su2_cfd_log,
-                show_command=False,
-                stream_output=self.stream_solver_output,
-                stage="su2_cfd",
-            )
-            ensure_adjoint_solution_input(paths.primal_restart, paths.primal_solution)
-            value = read_objective_from_history(
-                paths.primal_history,
-                history_column_for_function(function_name),
-            )
-            run_command(
-                commands["adjoint"],
-                paths.adjoint_dir,
-                paths.su2_cfd_ad_log,
-                show_command=False,
-                stream_output=self.stream_solver_output,
-                stage="su2_cfd_ad",
-            )
-            if "dot_ad" in commands:
-                run_command(
-                    commands["dot_ad"],
-                    paths.adjoint_dir,
-                    paths.su2_dot_ad_log,
-                    show_command=False,
-                    stream_output=self.stream_solver_output,
-                    stage="su2_dot_ad",
-                )
-                if not paths.surface_sens.exists():
-                    raise BSplineSU2DriverError(
-                        "SU2_DOT_AD completed but did not write {}; check "
-                        "SURFACE_SENS_FILENAME and OUTPUT_FILES in {}".format(
-                            paths.surface_sens,
-                            paths.dot_ad_cfg,
-                        )
-                    )
-            run_command(
-                commands["bspline_dot"],
-                paths.eval_dir,
-                paths.bspline_dot_log,
-                show_command=False,
-                stream_output=self.stream_solver_output,
-                stage="bspline_dot",
-            )
-            create_eval_aliases(paths)
             self._write_eval_summary_metadata(
                 paths,
                 objective_function=function_name,
             )
-            gradient = read_gradient_vector(paths.gradients, self.mode_ids)
             result = {
-                "eval_id": eval_id,
+                "eval_id": record["eval_id"],
                 "eval_dir": str(paths.eval_dir),
                 "function": function_name,
                 "value": value,
@@ -1979,6 +2314,154 @@ class BSplineSU2Driver:
                 )
             ) from exc
 
+    def _finalize_objective(
+        self,
+        result,
+        paths,
+        line_search_info,
+        eval_id,
+        eval_index,
+        coefficients,
+        objective,
+        gradient,
+        key,
+    ):
+        gradient_entry = self._gradient_entry(
+            result,
+            paths,
+            line_search_info=line_search_info,
+        )
+        try:
+            guard_info = self.register_gradient_entry(
+                gradient_entry,
+                promote=not self._trust_clip_enabled(),
+            )
+        except GradientGuardStop as stop:
+            result.update(
+                {
+                    "status": "rejected_gradient_guard",
+                    "gnorm_raw": gradient_entry["gnorm_raw"],
+                    "gnorm_opt": gradient_entry["gnorm_opt"],
+                    "gradient_guard_info": stop.guard_info,
+                }
+            )
+            self._write_gradient_guard_summary(
+                paths,
+                gradient_entry,
+                stop.guard_info,
+                "rejected",
+            )
+            self._append_history_record(
+                eval_id,
+                objective,
+                coefficients,
+                gradient,
+                "rejected_gradient_guard",
+                line_search_info=line_search_info,
+                eval_dir=paths.eval_dir,
+                eval_index=eval_index,
+                gradient_guard_info=stop.guard_info,
+                gradient_entry=gradient_entry,
+            )
+            raise
+
+        trust_clip_classification = ""
+        trust_clip_diagnostics = {}
+        trust_clip_action = ""
+        status = "ok"
+        cache_as_safe = True
+        if self._trust_clip_enabled():
+            (
+                trust_clip_classification,
+                trust_clip_diagnostics,
+            ) = self._classify_trust_clip_entry(gradient_entry)
+            status = self._trust_clip_status(trust_clip_classification)
+            trust_clip_action = {
+                "not_clipped": "continue",
+                "benign_clipped_legacy": "legacy_continue",
+                "weak_clipped_progress": "weak_continue",
+                "accepted_clipped_restart": "defer_restart_to_callback",
+                "rejected_toxic_clip": "defer_rollback_to_callback",
+            }[trust_clip_classification]
+            finite_safe_candidate = bool(
+                np.isfinite(float(gradient_entry["objective"]))
+                and np.isfinite(float(gradient_entry["gnorm_raw"]))
+            )
+            if trust_clip_classification in (
+                "not_clipped",
+                "benign_clipped_legacy",
+                "weak_clipped_progress",
+            ) and finite_safe_candidate:
+                self._promote_safe_entry(
+                    gradient_entry,
+                    update_recent_raw_gnorm=(
+                        trust_clip_classification != "weak_clipped_progress"
+                    ),
+                )
+            cache_as_safe = (
+                finite_safe_candidate
+                and trust_clip_classification
+                in (
+                    "not_clipped",
+                    "benign_clipped_legacy",
+                    "weak_clipped_progress",
+                )
+            )
+            requested_optimizer_x = (line_search_info or {}).get(
+                "requested_optimizer_x"
+            )
+            if requested_optimizer_x is not None:
+                request_key = self._pending_trust_clip_key(requested_optimizer_x)
+                self._trust_clip_by_requested_key[request_key] = {
+                    "classification": trust_clip_classification,
+                    "diagnostics": trust_clip_diagnostics,
+                    "entry": gradient_entry,
+                    "result": result,
+                }
+            self._write_trust_clip_summary(
+                paths,
+                trust_clip_classification,
+                trust_clip_diagnostics,
+                trust_clip_action,
+            )
+
+        result.update(
+            {
+                "status": status,
+                "gnorm_raw": gradient_entry["gnorm_raw"],
+                "gnorm_opt": gradient_entry["gnorm_opt"],
+                "gradient_guard_info": guard_info,
+                "trust_clip_class": trust_clip_classification,
+                "trust_clip_diagnostics": trust_clip_diagnostics,
+                "trust_clip_action": trust_clip_action,
+            }
+        )
+        self._write_gradient_guard_summary(
+            paths,
+            gradient_entry,
+            guard_info,
+            "safe",
+        )
+        if cache_as_safe:
+            self._cache[key] = result
+        self._print_iteration_row(result, line_search_info=line_search_info)
+        self._append_history_record(
+            eval_id,
+            objective,
+            coefficients,
+            gradient,
+            status,
+            line_search_info=line_search_info,
+            eval_dir=paths.eval_dir,
+            eval_index=eval_index,
+            gradient_guard_info=guard_info,
+            gradient_entry=gradient_entry,
+            trust_clip_classification=trust_clip_classification,
+            trust_clip_diagnostics=trust_clip_diagnostics,
+            trust_clip_action=trust_clip_action,
+        )
+        return result
+
     def evaluate(self, coefficients, line_search_info=None):
         coefficients = [_as_float(value, "coefficient") for value in coefficients]
         if len(coefficients) != len(self.mode_ids):
@@ -1990,260 +2473,57 @@ class BSplineSU2Driver:
         if key in self._cache and not self._trust_clip_enabled():
             return self._cache[key]
 
-        eval_id, paths = self._next_paths()
+        _design_key, record = self._design_point(
+            coefficients,
+            objective_adjoint=self.objective_adjoint,
+        )
+        paths = self._record_paths_for_function(record, self.objective_adjoint)
         self._run_eval_count += 1
         eval_index = self._run_eval_count
         objective = None
         gradient = None
         try:
-            self._prepare_eval_files(coefficients, paths)
-            commands = build_eval_commands(
+            primal_values = self._run_shared_core(coefficients, paths, record=record)
+            objective = self._objective_value_from_primal_values(primal_values)
+            gradient = self._run_function_adjoint(
                 paths,
-                self.base_mesh,
-                self.marker,
-                mpi_prefix=self.mpi_prefix,
-                python_executable=self.python_executable,
-                sensitivity_weighting=self.sensitivity_weighting,
-                surface_mode=self.surface_mode,
-                deformation_direction_mode=self.deformation_direction_mode,
-                le_safe_direction=self.le_safe_direction_options["le_safe_direction"],
-                le_safe_x0=self.le_safe_direction_options["le_safe_x0"],
-                le_safe_x1=self.le_safe_direction_options["le_safe_x1"],
-                le_safe_power=self.le_safe_direction_options["le_safe_power"],
-                sensitivity_source=self.sensitivity_source,
-            )
-            for stage, command in commands.items():
-                _append_command_log(paths.commands_log, stage, paths.eval_dir, command)
-                _append_command_log(self.workdir / "commands.log", stage, paths.eval_dir, command)
-            if self.show_commands and not self._printed_commands_log_path:
-                print(
-                    "[BSPLINE_SU2_DRIVER] Commands are logged in {}".format(
-                        self.workdir / "commands.log"
-                    )
-                )
-                self._printed_commands_log_path = True
-
-            run_command(
-                commands["bspline_def"],
-                paths.deform_dir,
-                paths.bspline_def_log,
-                show_command=False,
-                stream_output=self.stream_solver_output,
-                stage="bspline_def",
-            )
-            run_command(
-                commands["def"],
-                paths.deform_dir,
-                paths.su2_def_log,
-                show_command=False,
-                stream_output=self.stream_solver_output,
-                stage="su2_def",
-            )
-            run_command(
-                commands["primal"],
-                paths.direct_dir,
-                paths.su2_cfd_log,
-                show_command=False,
-                stream_output=self.stream_solver_output,
-                stage="su2_cfd",
-            )
-            ensure_adjoint_solution_input(paths.primal_restart, paths.primal_solution)
-            objective = read_objective_from_history(
-                paths.primal_history,
-                self.objective_column,
-            )
-            run_command(
-                commands["adjoint"],
-                paths.adjoint_dir,
-                paths.su2_cfd_ad_log,
-                show_command=False,
-                stream_output=self.stream_solver_output,
-                stage="su2_cfd_ad",
-            )
-            if "dot_ad" in commands:
-                run_command(
-                    commands["dot_ad"],
-                    paths.adjoint_dir,
-                    paths.su2_dot_ad_log,
-                    show_command=False,
-                    stream_output=self.stream_solver_output,
-                    stage="su2_dot_ad",
-                )
-                if not paths.surface_sens.exists():
-                    raise BSplineSU2DriverError(
-                        "SU2_DOT_AD completed but did not write {}; check "
-                        "SURFACE_SENS_FILENAME and OUTPUT_FILES in {}".format(
-                            paths.surface_sens,
-                            paths.dot_ad_cfg,
-                        )
-                    )
-            run_command(
-                commands["bspline_dot"],
-                paths.eval_dir,
-                paths.bspline_dot_log,
-                show_command=False,
-                stream_output=self.stream_solver_output,
-                stage="bspline_dot",
-            )
-            create_eval_aliases(paths)
-            self._write_eval_summary_metadata(paths, line_search_info=line_search_info)
-            gradient = read_gradient_vector(
-                paths.gradients,
-                self.mode_ids,
+                self.objective_adjoint,
+                record=record,
                 allow_nonfinite=(
                     self.gradient_guard_enabled or self._trust_clip_enabled()
                 ),
             )
+            # Point the eval-root aliases at the objective's adjoint artifacts so the
+            # adaptive scoring (which reads <eval>/surface_sens.csv) always uses the
+            # objective sensitivity, independent of constraint evaluation order.
+            create_eval_aliases(paths)
+            self._write_eval_summary_metadata(paths, line_search_info=line_search_info)
 
             result = {
                 "eval_index": eval_index,
-                "eval_id": eval_id,
+                "eval_id": record["eval_id"],
                 "eval_dir": str(paths.eval_dir),
                 "objective": objective,
                 "gradient": gradient,
                 "coefficients": coefficients,
                 "status": "ok",
             }
-            gradient_entry = self._gradient_entry(
+            return self._finalize_objective(
                 result,
                 paths,
                 line_search_info=line_search_info,
-            )
-            try:
-                guard_info = self.register_gradient_entry(
-                    gradient_entry,
-                    promote=not self._trust_clip_enabled(),
-                )
-            except GradientGuardStop as stop:
-                result.update(
-                    {
-                        "status": "rejected_gradient_guard",
-                        "gnorm_raw": gradient_entry["gnorm_raw"],
-                        "gnorm_opt": gradient_entry["gnorm_opt"],
-                        "gradient_guard_info": stop.guard_info,
-                    }
-                )
-                self._write_gradient_guard_summary(
-                    paths,
-                    gradient_entry,
-                    stop.guard_info,
-                    "rejected",
-                )
-                self._append_history_record(
-                    eval_id,
-                    objective,
-                    coefficients,
-                    gradient,
-                    "rejected_gradient_guard",
-                    line_search_info=line_search_info,
-                    eval_dir=paths.eval_dir,
-                    eval_index=eval_index,
-                    gradient_guard_info=stop.guard_info,
-                    gradient_entry=gradient_entry,
-                )
-                raise
-
-            trust_clip_classification = ""
-            trust_clip_diagnostics = {}
-            trust_clip_action = ""
-            status = "ok"
-            cache_as_safe = True
-            if self._trust_clip_enabled():
-                (
-                    trust_clip_classification,
-                    trust_clip_diagnostics,
-                ) = self._classify_trust_clip_entry(gradient_entry)
-                status = self._trust_clip_status(trust_clip_classification)
-                trust_clip_action = {
-                    "not_clipped": "continue",
-                    "benign_clipped_legacy": "legacy_continue",
-                    "weak_clipped_progress": "weak_continue",
-                    "accepted_clipped_restart": "defer_restart_to_callback",
-                    "rejected_toxic_clip": "defer_rollback_to_callback",
-                }[trust_clip_classification]
-                finite_safe_candidate = bool(
-                    np.isfinite(float(gradient_entry["objective"]))
-                    and np.isfinite(float(gradient_entry["gnorm_raw"]))
-                )
-                if trust_clip_classification in (
-                    "not_clipped",
-                    "benign_clipped_legacy",
-                    "weak_clipped_progress",
-                ) and finite_safe_candidate:
-                    self._promote_safe_entry(
-                        gradient_entry,
-                        update_recent_raw_gnorm=(
-                            trust_clip_classification != "weak_clipped_progress"
-                        ),
-                    )
-                cache_as_safe = (
-                    finite_safe_candidate
-                    and trust_clip_classification
-                    in (
-                        "not_clipped",
-                        "benign_clipped_legacy",
-                        "weak_clipped_progress",
-                    )
-                )
-                requested_optimizer_x = (line_search_info or {}).get(
-                    "requested_optimizer_x"
-                )
-                if requested_optimizer_x is not None:
-                    request_key = self._pending_trust_clip_key(requested_optimizer_x)
-                    self._trust_clip_by_requested_key[request_key] = {
-                        "classification": trust_clip_classification,
-                        "diagnostics": trust_clip_diagnostics,
-                        "entry": gradient_entry,
-                        "result": result,
-                    }
-                self._write_trust_clip_summary(
-                    paths,
-                    trust_clip_classification,
-                    trust_clip_diagnostics,
-                    trust_clip_action,
-                )
-
-            result.update(
-                {
-                    "status": status,
-                    "gnorm_raw": gradient_entry["gnorm_raw"],
-                    "gnorm_opt": gradient_entry["gnorm_opt"],
-                    "gradient_guard_info": guard_info,
-                    "trust_clip_class": trust_clip_classification,
-                    "trust_clip_diagnostics": trust_clip_diagnostics,
-                    "trust_clip_action": trust_clip_action,
-                }
-            )
-            self._write_gradient_guard_summary(
-                paths,
-                gradient_entry,
-                guard_info,
-                "safe",
-            )
-            if cache_as_safe:
-                self._cache[key] = result
-            self._print_iteration_row(result, line_search_info=line_search_info)
-            self._append_history_record(
-                eval_id,
-                objective,
-                coefficients,
-                gradient,
-                status,
-                line_search_info=line_search_info,
-                eval_dir=paths.eval_dir,
+                eval_id=record["eval_id"],
                 eval_index=eval_index,
-                gradient_guard_info=guard_info,
-                gradient_entry=gradient_entry,
-                trust_clip_classification=trust_clip_classification,
-                trust_clip_diagnostics=trust_clip_diagnostics,
-                trust_clip_action=trust_clip_action,
+                coefficients=coefficients,
+                objective=objective,
+                gradient=gradient,
+                key=key,
             )
-            return result
         except GradientGuardStop:
             raise
         except Exception as exc:
             self._append_history_record(
-                eval_id,
+                record["eval_id"],
                 objective,
                 coefficients,
                 gradient,
@@ -2255,7 +2535,7 @@ class BSplineSU2Driver:
             if isinstance(exc, BSplineSU2DriverError):
                 raise
             raise BSplineSU2DriverError(
-                f"evaluation {eval_id} failed in {paths.eval_dir}: {exc}"
+                f"evaluation {record['eval_id']} failed in {paths.eval_dir}: {exc}"
             ) from exc
 
     def write_optimized_modes(self, coefficients):
@@ -2323,11 +2603,19 @@ class BSplineSU2Driver:
             ]
             print("Native SU2 constraints: " + "; ".join(formatted))
             if any(is_geometry_constraint_name(spec.name) for spec in self.native_constraints):
-                print(
-                    "Geometric constraint backend: SU2_GEO finite differences, eps={:.15g}".format(
-                        float(self.geometry_fd_eps)
+                if self.geometry_constraint_gradient_mode == "SU2_GEO":
+                    print(
+                        "Geometric constraint backend: SU2_GEO finite differences, eps={:.15g}".format(
+                            float(self.geometry_fd_eps)
+                        )
                     )
-                )
+                else:
+                    print(
+                        "Geometric constraint gradient: {} (SU2_GEO fallback eps={:.15g})".format(
+                            self.geometry_constraint_gradient_mode,
+                            float(self.geometry_fd_eps),
+                        )
+                    )
         print(
             "Variable scaling: physical coefficient = optimizer variable * {:.15g}".format(
                 float(self.opt_relax_factor)
@@ -2788,6 +3076,7 @@ def run_bspline_su2_optimization(
     thickness_options=None,
     native_constraints=None,
     geometry_fd_eps=1.0e-6,
+    geometry_constraint_gradient="AUTO",
     eval_layout="DSN",
     objective_adjoint="drag",
     symmetry_coupling="NONE",
@@ -2851,6 +3140,7 @@ def run_bspline_su2_optimization(
         thickness_options=thickness_options,
         native_constraints=native_constraints,
         geometry_fd_eps=geometry_fd_eps,
+        geometry_constraint_gradient=geometry_constraint_gradient,
         eval_layout=eval_layout,
         objective_adjoint=objective_adjoint,
         symmetry_coupling=symmetry_coupling,

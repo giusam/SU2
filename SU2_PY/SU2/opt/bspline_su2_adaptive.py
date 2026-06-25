@@ -476,6 +476,11 @@ def _build_arg_parser():
     parser.add_argument("--symmetry-coupling", default="NONE", choices=ALLOWED_SYMMETRY_COUPLINGS)
     parser.add_argument("--surface-mode", default="BOTH", choices=ALLOWED_SURFACE_MODES)
     parser.add_argument(
+        "--refine-side-coupling",
+        default="COUPLED",
+        choices=("COUPLED", "INDEPENDENT"),
+    )
+    parser.add_argument(
         "--deformation-direction",
         dest="deformation_direction_mode",
         default=None,

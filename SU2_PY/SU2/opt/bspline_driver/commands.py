@@ -81,6 +81,8 @@ class EvalPaths:
     surface_sens: Path
     gradients: Path
     summary: Path
+    adjoint_gradients: Path
+    adjoint_summary: Path
     commands_log: Path
     bspline_def_log: Path
     su2_def_log: Path
@@ -149,6 +151,8 @@ def build_eval_paths(eval_dir, eval_layout="DSN", objective_adjoint="drag"):
         surface_sens=adjoint_dir / "surface_sens.csv",
         gradients=eval_dir / "bspline_gradients.csv",
         summary=eval_dir / "summary.json",
+        adjoint_gradients=adjoint_dir / "bspline_gradients.csv",
+        adjoint_summary=adjoint_dir / "bspline_dot_summary.json",
         commands_log=eval_dir / "commands.log",
         bspline_def_log=deform_dir / "bspline_def.log",
         su2_def_log=deform_dir / "su2_def.log",

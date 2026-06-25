@@ -49,6 +49,8 @@ ALLOWED_REFINE_MODES = ("KNOT_INSERTION",)
 
 ALLOWED_KNOT_SCORE_MODES = ("VIRTUAL_INSERTION", "RESIDUAL_ENERGY")
 
+ALLOWED_REFINE_SIDE_COUPLINGS = ("COUPLED", "INDEPENDENT")
+
 REMOVED_CANDIDATE_CONFIG_KEYS = (
     "BSPLINE_SCORE_MODE",
     "BSPLINE_CANDIDATE_SOURCE",
@@ -342,6 +344,23 @@ def validate_adaptive_options(opts):
         raise BSplineAdaptiveError(
             "BSPLINE_SYMMETRY_COUPLING is only valid with BSPLINE_SURFACE_MODE=BOTH"
         )
+    opts["refine_side_coupling"] = str(opts.get("refine_side_coupling", "COUPLED")).upper()
+    if opts["refine_side_coupling"] not in ALLOWED_REFINE_SIDE_COUPLINGS:
+        raise BSplineAdaptiveError(
+            f"unsupported refine side coupling {opts['refine_side_coupling']!r}; "
+            f"allowed values are {ALLOWED_REFINE_SIDE_COUPLINGS}"
+        )
+    if opts["refine_side_coupling"] == "INDEPENDENT":
+        if opts["surface_mode"] != "BOTH":
+            raise BSplineAdaptiveError(
+                "BSPLINE_REFINE_SIDE_COUPLING=INDEPENDENT requires "
+                "BSPLINE_SURFACE_MODE=BOTH"
+            )
+        if opts["symmetry_coupling"] != "NONE":
+            raise BSplineAdaptiveError(
+                "BSPLINE_REFINE_SIDE_COUPLING=INDEPENDENT requires "
+                "BSPLINE_SYMMETRY_COUPLING=NONE"
+            )
     opts["objective_adjoint"] = str(opts.get("objective_adjoint", "drag")).strip() or "drag"
 
     opts["auto_scale_bounds_to_geometry"] = bool(opts.get("auto_scale_bounds_to_geometry", False))
@@ -664,6 +683,7 @@ def adaptive_options_from_config(config_values):
         "BSPLINE_STAGNATION_REL_TOL": "stag_tol",
         "BSPLINE_STAGNATION_BAND": "stag_band",
         "BSPLINE_STAGNATION_PATIENCE": "stag_patience",
+        "BSPLINE_REFINE_SIDE_COUPLING": "refine_side_coupling",
         "BSPLINE_NADD_MODE": "nadd_mode",
         "BSPLINE_FIXED_NADD": "fixed_nadd",
         "BSPLINE_GROWTH_RATIO": "growth_ratio",
@@ -1107,6 +1127,10 @@ def print_startup_summary(settings):
     except Exception:
         ndv = ""
     print(f"[PROGRESSIVE_BSPLINE][SURFACE] mode = {surface_mode}")
+    print(
+        "[PROGRESSIVE_BSPLINE][SURFACE] refine side coupling = "
+        f"{settings.get('refine_side_coupling', 'COUPLED')}"
+    )
     print(f"[PROGRESSIVE_BSPLINE][SURFACE] active sides = {active_sides}")
     print(f"[PROGRESSIVE_BSPLINE][SURFACE] ndv = {ndv}")
     print(
@@ -1199,6 +1223,7 @@ def _settings_from_args(args):
         "objective_adjoint": args.objective_adjoint,
         "symmetry_coupling": args.symmetry_coupling,
         "surface_mode": getattr(args, "surface_mode", "BOTH"),
+        "refine_side_coupling": getattr(args, "refine_side_coupling", "COUPLED"),
         "deformation_direction_mode": getattr(
             args,
             "deformation_direction_mode",

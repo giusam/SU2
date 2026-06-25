@@ -2650,6 +2650,22 @@ def test_aero_constraints_and_objective_share_primal_with_lazy_adjoints(tmp_path
     assert lift["gradient"] == pytest.approx([2.0])
     assert moment["gradient"] == pytest.approx([3.0])
     assert objective["gradient"] == pytest.approx([1.0])
+    assert read_gradient_vector(
+        eval_dir / "adjoint_lift" / "bspline_gradients.csv",
+        ["lower_b"],
+    ) == pytest.approx([2.0])
+    assert read_gradient_vector(
+        eval_dir / "adjoint_momentz" / "bspline_gradients.csv",
+        ["lower_b"],
+    ) == pytest.approx([3.0])
+    assert read_gradient_vector(
+        eval_dir / "adjoint_drag" / "bspline_gradients.csv",
+        ["lower_b"],
+    ) == pytest.approx([1.0])
+    assert read_gradient_vector(
+        eval_dir / "bspline_gradients.csv",
+        ["lower_b"],
+    ) == pytest.approx([1.0])
     assert "OBJECTIVE_FUNCTION= LIFT" in (eval_dir / "adjoint_lift" / "adjoint.cfg").read_text()
     assert "OBJECTIVE_FUNCTION= MOMENT_Z" in (
         eval_dir / "adjoint_momentz" / "adjoint.cfg"

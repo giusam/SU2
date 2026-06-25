@@ -296,26 +296,69 @@ def physical_ndv_for_knot_space(space, knot_vector=None):
     knot_vector = space.knot_vector if knot_vector is None else knot_vector
     return int(clamped_basis_count(space.degree, knot_vector)) * len(space.sides)
 
+def _independent_side_specs(mode_spec):
+    """Split a mode spec into one self-consistent sub-spec per active side.
+
+    Each side keeps its own knot vector, so the per-side specs remain valid for
+    ``extract_clamped_knot_space`` even after upper and lower have diverged.
+    """
+    spec = validate_mode_spec(mode_spec)
+    by_side = {}
+    for mode in _active_modes(spec):
+        side = str(mode.get("side", "")).strip().lower()
+        by_side.setdefault(side, []).append(dict(mode))
+    return {
+        side: validate_mode_spec(_copy_global_metadata(spec, modes))
+        for side, modes in by_side.items()
+    }
+
+def extract_independent_side_spaces(mode_spec, settings):
+    """Per-side clamped knot spaces for INDEPENDENT refinement (coupling=NONE)."""
+    side_settings = dict(settings or {})
+    side_settings["symmetry_coupling"] = "NONE"
+    return {
+        side: extract_clamped_knot_space(side_spec, side_settings)
+        for side, side_spec in _independent_side_specs(mode_spec).items()
+    }
+
 def refinement_limit_ndv(mode_spec, settings):
+    if str((settings or {}).get("refine_side_coupling", "COUPLED")).upper() == "INDEPENDENT":
+        spaces = extract_independent_side_spaces(mode_spec, settings)
+        return sum(reduced_ndv_for_knot_space(space) for space in spaces.values())
     return reduced_ndv_for_knot_space(extract_clamped_knot_space(mode_spec, settings))
 
 def _requested_knot_insertions(space, settings, available_spans):
+    reduced_per_insertion = (
+        1 if space.coupling in ("NORMAL_EQUAL", "NORMAL_OPPOSITE") else len(space.sides)
+    )
+    return _insertion_budget(
+        reduced_ndv_for_knot_space(space),
+        available_spans,
+        reduced_per_insertion,
+        settings,
+    )
+
+def _insertion_budget(current_reduced, available_spans, reduced_per_insertion, settings):
+    """Resolve how many midpoint knot insertions to request for one refinement.
+
+    Pure arithmetic shared by the coupled path (one ``space``) and the
+    independent path (combined upper+lower budget with one knot per side and
+    ``reduced_per_insertion == 1``).
+    """
     available_spans = max(0, int(available_spans))
+    reduced_per_insertion = max(1, int(reduced_per_insertion))
+    current_reduced = int(current_reduced)
     if available_spans <= 0:
         return 0, {
             "mode": str(settings.get("nadd_mode", "GROWTH_RATIO")).upper(),
-            "current_reduced_ndv": reduced_ndv_for_knot_space(space),
-            "target_reduced_ndv": reduced_ndv_for_knot_space(space),
-            "reduced_ndv_per_insertion": 1 if space.coupling in ("NORMAL_EQUAL", "NORMAL_OPPOSITE") else len(space.sides),
+            "current_reduced_ndv": current_reduced,
+            "target_reduced_ndv": current_reduced,
+            "reduced_ndv_per_insertion": reduced_per_insertion,
             "requested_insertions": 0,
             "clamped": True,
             "clamp_reason": "no_valid_spans",
         }
 
-    current_reduced = reduced_ndv_for_knot_space(space)
-    reduced_per_insertion = (
-        1 if space.coupling in ("NORMAL_EQUAL", "NORMAL_OPPOSITE") else len(space.sides)
-    )
     mode = str(settings.get("nadd_mode", "GROWTH_RATIO")).upper()
     explicit = settings.get("knot_insertions_per_refine", 1)
     auto = str(explicit).strip().upper() == "AUTO"

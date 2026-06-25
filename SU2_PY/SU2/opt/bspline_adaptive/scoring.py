@@ -126,8 +126,28 @@ def _score_virtual_insertion(active_matrix, new_matrix, signal, regularization):
         score = 0.0
     return score, score, int(np.linalg.matrix_rank(z_matrix)), int(z_matrix.shape[1]), condition
 
+# Leading/trailing-edge closure nodes (x/c == 0 and == 1) are geometrically
+# pinned and carry a degenerate surface normal. Their sensitivity — typically a
+# trailing-edge adjoint singularity — cannot be reduced by knot insertion, so it
+# must never drive refinement. These two endpoints are always dropped from the
+# scoring point set (the geometry-transfer check still uses the full metadata).
+SCORING_CLOSURE_NODE_EPS = 1.0e-6
+
+def _drop_closure_nodes(metadata, signal, eps=SCORING_CLOSURE_NODE_EPS):
+    signal = np.asarray(signal, dtype=float)
+    kept_metadata = []
+    kept_signal = []
+    for row, value in zip(metadata, signal):
+        x_over_c = float(row["x_over_c"])
+        if x_over_c <= float(eps) or x_over_c >= 1.0 - float(eps):
+            continue
+        kept_metadata.append(row)
+        kept_signal.append(float(value))
+    return kept_metadata, np.asarray(kept_signal, dtype=float)
+
 def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
     knot_score_mode = str(settings.get("knot_score_mode", "VIRTUAL_INSERTION")).upper()
+    metadata, signal = _drop_closure_nodes(metadata, signal)
     spans = knot_insertion_spans(
         space.knot_vector,
         min_width=settings.get("knot_min_span_width", 1.0e-8),

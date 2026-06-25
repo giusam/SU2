@@ -1891,3 +1891,254 @@ def test_adaptive_settings_json_records_resolved_paths(tmp_path):
     assert recorded["sensitivity_source"] == "DOT_AD_TRANSFER"
     assert recorded["refine_mode"] == "KNOT_INSERTION"
     assert recorded["refine_state"] == "INITIAL_MESH_KEEP_DV"
+
+
+def _knot_vectors_by_side(spec):
+    out = {}
+    for mode in spec["modes"]:
+        if mode.get("active", True) is False:
+            continue
+        side = str(mode["side"]).strip().lower()
+        out[side] = tuple(
+            round(float(value), 12)
+            for value in mode.get("knot_vector", mode.get("knots"))
+        )
+    return out
+
+
+def test_independent_refines_upper_and_lower_in_different_zones(tmp_path):
+    modes = tmp_path / "modes.json"
+    spec = generate_initial_bspline_modes(
+        modes,
+        "AIRFOIL",
+        nper_side=6,
+        surface_mode="BOTH",
+        class_shape="none",
+    )
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            symmetry_coupling="NONE",
+            surface_mode="BOTH",
+            refine_side_coupling="INDEPENDENT",
+            nadd_mode="FIXED",
+            fixed_nadd=2,
+            batch_size_max=2,
+            nfinal=40,
+            knot_score_mode="RESIDUAL_ENERGY",
+        )
+    )
+
+    # Smooth half-sine humps in disjoint initial spans (front for upper, back
+    # for lower). One midpoint knot resolves each hump well, so after upper's
+    # front span is refined the global-best span moves to lower's back span.
+    metadata = []
+    signal = []
+    for x in np.linspace(0.0, 0.333, 12):
+        metadata.append({"x_over_c": float(x), "side": "upper"})
+        signal.append(math.sin(math.pi * float(x) / 0.333))
+    for x in np.linspace(0.667, 1.0, 12):
+        metadata.append({"x_over_c": float(x), "side": "lower"})
+        signal.append(math.sin(math.pi * (float(x) - 0.667) / 0.333))
+    for side in ("upper", "lower"):
+        metadata.append({"x_over_c": 0.5, "side": side})
+        signal.append(0.0)
+
+    next_modes, rows, selected = build_next_knot_inserted_modes(
+        spec, metadata, signal, settings
+    )
+
+    assert next_modes is not None
+    assert rows
+    sides_used = {ins["side"] for ins in selected["selected_insertions"]}
+    assert sides_used == {"UPPER", "LOWER"}
+    assert selected["reduced_ndv_after"] == selected["reduced_ndv_before"] + 2
+
+    knot_vectors = _knot_vectors_by_side(next_modes)
+    assert knot_vectors["upper"] != knot_vectors["lower"]
+    # Each side gained exactly one knot relative to the shared initial vector.
+    initial = _knot_vectors_by_side(spec)["upper"]
+    assert len(knot_vectors["upper"]) == len(initial) + 1
+    assert len(knot_vectors["lower"]) == len(initial) + 1
+    assert set(next_modes["knot_span_depths"]) == {"upper", "lower"}
+
+
+def test_independent_knot_span_depths_persist_per_side(tmp_path):
+    modes = tmp_path / "modes.json"
+    spec = generate_initial_bspline_modes(
+        modes,
+        "AIRFOIL",
+        nper_side=7,
+        surface_mode="BOTH",
+        class_shape="none",
+    )
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            symmetry_coupling="NONE",
+            surface_mode="BOTH",
+            refine_side_coupling="INDEPENDENT",
+            nfinal=40,
+            nadd_mode="FIXED",
+            fixed_nadd=1,
+            knot_insertions_per_refine=1,
+            knot_score_mode="RESIDUAL_ENERGY",
+            knot_depth_penalty=True,
+            knot_depth_penalty_mode="POWER",
+            knot_depth_power_gamma=0.5,
+        )
+    )
+
+    upper_meta = [
+        {"x_over_c": float(x), "side": "upper"}
+        for x in np.linspace(0.01, 0.24, 24)
+    ]
+    lower_meta = [
+        {"x_over_c": float(x), "side": "lower"}
+        for x in np.linspace(0.01, 0.99, 24)
+    ]
+    metadata = upper_meta + lower_meta
+    signal = (
+        [math.sin(37.0 * math.pi * row["x_over_c"]) for row in upper_meta]
+        + [0.0 for _ in lower_meta]
+    )
+
+    next_modes, _rows, selected = build_next_knot_inserted_modes(
+        spec, metadata, signal, settings
+    )
+
+    assert next_modes is not None
+    assert selected["side"] == "UPPER"
+    assert selected["parent_depth"] == 1
+    assert selected["child_depth"] == 2
+    depths = next_modes["knot_span_depths"]
+    assert set(depths) == {"upper", "lower"}
+    left = float(selected["span_left"])
+    mid = float(selected["inserted_knot"])
+    right = float(selected["span_right"])
+    assert depths["upper"][_span_key(left, mid)] == 2
+    assert depths["upper"][_span_key(mid, right)] == 2
+    # The untouched lower side keeps its initial depths.
+    assert set(depths["lower"].values()) == {1}
+
+    child_upper = [
+        {"x_over_c": float(x), "side": "upper"}
+        for x in np.linspace(left + 0.05 * (mid - left), mid - 0.05 * (mid - left), 24)
+    ]
+    child_meta = child_upper + lower_meta
+    child_signal = (
+        [math.sin(53.0 * math.pi * row["x_over_c"]) for row in child_upper]
+        + [0.0 for _ in lower_meta]
+    )
+
+    refined_modes, _rows2, child_selected = build_next_knot_inserted_modes(
+        next_modes, child_meta, child_signal, settings
+    )
+
+    assert refined_modes is not None
+    assert child_selected["side"] == "UPPER"
+    assert child_selected["parent_depth"] == 2
+    assert child_selected["child_depth"] == 3
+    assert refined_modes["knot_span_depths"]["upper"][
+        _span_key(child_selected["span_left"], child_selected["inserted_knot"])
+    ] == 3
+
+
+def test_independent_requires_both_surface_and_no_symmetry():
+    with pytest.raises(BSplineAdaptiveError):
+        validate_adaptive_options(
+            _minimal_settings(
+                refine_side_coupling="INDEPENDENT",
+                symmetry_coupling="NONE",
+                surface_mode="UPPER",
+            )
+        )
+    with pytest.raises(BSplineAdaptiveError):
+        validate_adaptive_options(
+            _minimal_settings(
+                refine_side_coupling="INDEPENDENT",
+                symmetry_coupling="NORMAL_EQUAL",
+                surface_mode="BOTH",
+            )
+        )
+    with pytest.raises(BSplineAdaptiveError):
+        validate_adaptive_options(
+            _minimal_settings(
+                refine_side_coupling="BOGUS",
+                symmetry_coupling="NONE",
+                surface_mode="BOTH",
+            )
+        )
+
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            refine_side_coupling="INDEPENDENT",
+            symmetry_coupling="NONE",
+            surface_mode="BOTH",
+        )
+    )
+    assert settings["refine_side_coupling"] == "INDEPENDENT"
+    default = validate_adaptive_options(_minimal_settings(symmetry_coupling="NORMAL_EQUAL"))
+    assert default["refine_side_coupling"] == "COUPLED"
+
+
+def test_refine_side_coupling_cli_and_config_mapping():
+    parser = _build_arg_parser()
+    assert parser.parse_args([]).refine_side_coupling == "COUPLED"
+    assert (
+        parser.parse_args(["--refine-side-coupling", "INDEPENDENT"]).refine_side_coupling
+        == "INDEPENDENT"
+    )
+    options = adaptive_options_from_config({"BSPLINE_REFINE_SIDE_COUPLING": "INDEPENDENT"})
+    assert options["refine_side_coupling"] == "INDEPENDENT"
+
+
+def test_scoring_excludes_le_te_closure_nodes(tmp_path):
+    # A huge spike at the trailing-edge closure node (x/c=1, bucketed lower) and
+    # the leading-edge node (x/c=0, bucketed upper) must NOT drive refinement:
+    # both are geometrically pinned and dropped from the scoring point set.
+    modes = tmp_path / "modes.json"
+    spec = generate_initial_bspline_modes(
+        modes,
+        "AIRFOIL",
+        nper_side=6,
+        surface_mode="BOTH",
+        class_shape="none",
+    )
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            symmetry_coupling="NONE",
+            surface_mode="BOTH",
+            refine_side_coupling="INDEPENDENT",
+            nadd_mode="FIXED",
+            fixed_nadd=1,
+            batch_size_max=1,
+            nfinal=40,
+            knot_score_mode="RESIDUAL_ENERGY",
+        )
+    )
+
+    metadata = []
+    signal = []
+    # Genuine upper feature aft of the leading edge.
+    for x in np.linspace(0.05, 0.45, 10):
+        metadata.append({"x_over_c": float(x), "side": "upper"})
+        signal.append(math.sin(math.pi * (float(x) - 0.05) / 0.4))
+    # Lower side flat everywhere...
+    for x in np.linspace(0.05, 0.95, 10):
+        metadata.append({"x_over_c": float(x), "side": "lower"})
+        signal.append(0.0)
+    # ...except a giant spike exactly at the TE/LE closure nodes.
+    metadata.append({"x_over_c": 1.0, "side": "lower"})
+    signal.append(1.0e3)
+    metadata.append({"x_over_c": 0.0, "side": "upper"})
+    signal.append(1.0e3)
+
+    next_modes, rows, selected = build_next_knot_inserted_modes(
+        spec, metadata, signal, settings
+    )
+
+    assert next_modes is not None
+    # The insertion lands on the real upper feature, not on the pinned endpoints.
+    assert selected["side"] == "UPPER"
+    # No scored span is dominated by the 1e3 closure-node spike.
+    assert rows
+    assert all(float(row["score_raw"]) < 1.0e2 for row in rows)

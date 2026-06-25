@@ -1978,6 +1978,10 @@ class BSplineSU2Driver:
             stream_output=self.stream_solver_output,
             stage="bspline_dot",
         )
+        if paths.gradients.exists():
+            shutil.copy2(paths.gradients, paths.adjoint_gradients)
+        if paths.summary.exists():
+            shutil.copy2(paths.summary, paths.adjoint_summary)
         # Root-level aliases (surface_sens.csv, ...) are created once for the
         # objective in evaluate(), so they deterministically reflect the objective
         # rather than whichever function ran last in the shared evaluation.

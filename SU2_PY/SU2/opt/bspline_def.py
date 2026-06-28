@@ -277,55 +277,218 @@ def _normalized_x(x, x_le, chord):
     return value
 
 
-def classify_sides(node_ids, x_over_c, y_values, side_overrides=None, nbins=None):
-    if nbins is None:
-        nbins = max(4, min(80, int(math.sqrt(max(len(x_over_c), 1))) * 2))
+def _cyclic_arc_indices(start, stop, n):
+    indices = [start]
+    index = start
+    while index != stop:
+        index = (index + 1) % n
+        indices.append(index)
+    return indices
 
-    bins = [[] for _ in range(nbins)]
-    for x, y in zip(x_over_c, y_values):
-        x_clamped = max(0.0, min(1.0, float(x)))
-        index = min(nbins - 1, int(math.floor(x_clamped * nbins)))
-        bins[index].append(float(y))
 
-    camber_by_bin = []
-    for values in bins:
-        if values:
-            camber_by_bin.append(0.5 * (min(values) + max(values)))
+def _mean_y(indices, y_values, split_indices):
+    usable = [index for index in indices if index not in split_indices]
+    if not usable:
+        usable = list(indices)
+    if not usable:
+        raise BSplineDefError("Unable to classify marker sides: empty side arc")
+    return sum(float(y_values[index]) for index in usable) / len(usable)
+
+
+def _assign_split_node_sides(sides, split_indices, closed):
+    n = len(sides)
+    for index in sorted(split_indices):
+        candidates = []
+        if closed:
+            candidates.extend(((index + 1) % n, (index - 1) % n))
         else:
-            camber_by_bin.append(None)
+            if index + 1 < n:
+                candidates.append(index + 1)
+            if index - 1 >= 0:
+                candidates.append(index - 1)
 
-    known = [i for i, value in enumerate(camber_by_bin) if value is not None]
-    if not known:
-        raise BSplineDefError("Unable to estimate marker camber")
+        for candidate in candidates:
+            if candidate != index and sides[candidate] in ("upper", "lower"):
+                sides[index] = sides[candidate]
+                break
 
-    for i, value in enumerate(camber_by_bin):
-        if value is not None:
+        if sides[index] not in ("upper", "lower"):
+            sides[index] = "upper"
+
+
+def _classify_from_arcs(n, arc_a, arc_b, y_values, split_indices, closed):
+    mean_a = _mean_y(arc_a, y_values, split_indices)
+    mean_b = _mean_y(arc_b, y_values, split_indices)
+    side_a, side_b = ("upper", "lower") if mean_a >= mean_b else ("lower", "upper")
+
+    sides = [None] * n
+    for index in arc_a:
+        if index not in split_indices:
+            sides[index] = side_a
+    for index in arc_b:
+        if index not in split_indices:
+            sides[index] = side_b
+
+    _assign_split_node_sides(sides, split_indices, closed)
+    return sides
+
+
+def _smooth_isolated_side_flips(sides, split_indices, closed):
+    sides = list(sides)
+    n = len(sides)
+    if n < 3:
+        return sides
+
+    for _ in range(n):
+        changed = False
+        indices = range(n) if closed else range(1, n - 1)
+        for index in indices:
+            if index in split_indices:
+                continue
+            previous = (index - 1) % n
+            next_index = (index + 1) % n
+            if sides[previous] == sides[next_index] and sides[index] != sides[previous]:
+                sides[index] = sides[previous]
+                changed = True
+        if not changed:
+            break
+    return sides
+
+
+def _fallback_y_based_sides(y_values, split_indices, closed):
+    if not y_values:
+        return []
+    y_min = min(float(value) for value in y_values)
+    y_max = max(float(value) for value in y_values)
+    threshold = 0.5 * (y_min + y_max)
+    sides = [
+        "upper" if float(value) >= threshold - 1.0e-12 else "lower"
+        for value in y_values
+    ]
+    return _smooth_isolated_side_flips(sides, split_indices, closed)
+
+
+def _classify_open_sides(n, i_le, i_te, y_values):
+    split_indices = {i_le, i_te}
+    if i_le == i_te or not ({i_le, i_te} & {0, n - 1}):
+        return None, split_indices
+
+    lo = min(i_le, i_te)
+    hi = max(i_le, i_te)
+    arc_a = list(range(lo, hi + 1))
+    arc_b = list(range(0, lo + 1)) + list(range(hi, n))
+    usable_a = [index for index in arc_a if index not in split_indices]
+    usable_b = [index for index in arc_b if index not in split_indices]
+    if not usable_a or not usable_b:
+        return None, split_indices
+
+    return (
+        _classify_from_arcs(n, arc_a, arc_b, y_values, split_indices, closed=False),
+        split_indices,
+    )
+
+
+def _raise_on_isolated_side_islands(
+    node_ids,
+    x_over_c,
+    y_values,
+    sides,
+    split_indices,
+    closed,
+):
+    n = len(sides)
+    if n < 3:
+        return
+
+    indices = range(n) if closed else range(1, n - 1)
+    for index in indices:
+        if index in split_indices:
             continue
-        nearest = min(known, key=lambda idx: abs(idx - i))
-        camber_by_bin[i] = camber_by_bin[nearest]
+        previous = (index - 1) % n
+        next_index = (index + 1) % n
+        if sides[previous] == sides[next_index] and sides[index] != sides[previous]:
+            raise BSplineDefError(
+                "Isolated side classification island at node "
+                f"{node_ids[index]}: x_over_c={float(x_over_c[index]):.16g}, "
+                f"y={float(y_values[index]):.16g}, "
+                f"previous side={sides[previous]!r}, "
+                f"current side={sides[index]!r}, "
+                f"next side={sides[next_index]!r}"
+            )
 
+
+def _apply_side_overrides(node_ids, sides, side_overrides):
     overrides = side_overrides or {}
-    sides = []
-    for node_id, x, y in zip(node_ids, x_over_c, y_values):
-        x_clamped = max(0.0, min(1.0, float(x)))
-        index = min(nbins - 1, int(math.floor(x_clamped * nbins)))
-        side = "upper" if float(y) >= camber_by_bin[index] - 1.0e-12 else "lower"
+    if not overrides:
+        return list(sides)
 
+    result = list(sides)
+    for index, node_id in enumerate(node_ids):
         override = None
         if node_id in overrides:
             override = overrides[node_id]
         elif str(node_id) in overrides:
             override = overrides[str(node_id)]
-        if override is not None:
-            override = str(override).strip().lower()
-            if override not in ("upper", "lower"):
-                raise BSplineDefError(
-                    f"Invalid side override for node {node_id}: {override!r}"
-                )
-            side = override
-        sides.append(side)
+        if override is None:
+            continue
 
-    return sides
+        override = str(override).strip().lower()
+        if override not in ("upper", "lower"):
+            raise BSplineDefError(
+                f"Invalid side override for node {node_id}: {override!r}"
+            )
+        result[index] = override
+    return result
+
+
+def classify_sides(
+    node_ids,
+    x_over_c,
+    y_values,
+    side_overrides=None,
+    nbins=None,
+    *,
+    closed=True,
+):
+    del nbins
+
+    n = len(node_ids)
+    if len(x_over_c) != n or len(y_values) != n:
+        raise BSplineDefError(
+            "node_ids, x_over_c, and y_values must have the same length"
+        )
+    if n == 0:
+        return []
+
+    i_le = min(range(n), key=lambda index: float(x_over_c[index]))
+    i_te = max(range(n), key=lambda index: float(x_over_c[index]))
+    split_indices = {i_le, i_te}
+
+    if closed and i_le != i_te:
+        arc_a = _cyclic_arc_indices(i_le, i_te, n)
+        arc_b = _cyclic_arc_indices(i_te, i_le, n)
+        sides = _classify_from_arcs(
+            n,
+            arc_a,
+            arc_b,
+            y_values,
+            split_indices,
+            closed=True,
+        )
+    else:
+        sides, split_indices = _classify_open_sides(n, i_le, i_te, y_values)
+        if sides is None:
+            sides = _fallback_y_based_sides(y_values, split_indices, closed=False)
+
+    _raise_on_isolated_side_islands(
+        node_ids,
+        x_over_c,
+        y_values,
+        sides,
+        split_indices,
+        closed,
+    )
+    return _apply_side_overrides(node_ids, sides, side_overrides)
 
 
 def _signed_polygon_area(points, node_ids, closed):
@@ -466,6 +629,7 @@ def compute_deformed_surface(
             x_over_c,
             y_values,
             side_overrides=side_overrides,
+            closed=closed,
         )
     else:
         sides = [surface_mode.lower()] * len(node_ids)

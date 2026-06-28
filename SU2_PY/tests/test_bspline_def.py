@@ -3,7 +3,13 @@ import math
 import numpy as np
 import pytest
 
-from SU2.opt.bspline_def import compute_deformed_surface, read_su2_mesh
+import SU2.opt.bspline_def as bspline_def
+from SU2.opt.bspline_def import (
+    BSplineDefError,
+    classify_sides,
+    compute_deformed_surface,
+    read_su2_mesh,
+)
 from SU2.opt.bspline_modes import (
     BSplineModeError,
     LE_SAFE_DEFAULT_POWER,
@@ -76,6 +82,21 @@ def _write_synthetic_airfoil_mesh(path):
     lines.extend(["NMARK= 1\n", "MARKER_TAG= airfoil\n", "MARKER_ELEMS= 8\n"])
     for i in range(len(points)):
         lines.append(f"3 {i} {(i + 1) % len(points)}\n")
+
+    path.write_text("".join(lines))
+    return path
+
+
+def _write_airfoil_mesh(path, points, closed=True):
+    lines = ["NDIME= 2\n", f"NPOIN= {len(points)}\n"]
+    for i, (x, y) in enumerate(points):
+        lines.append(f"{x:.16g} {y:.16g} {i}\n")
+
+    nelems = len(points) if closed else len(points) - 1
+    lines.extend(["NMARK= 1\n", "MARKER_TAG= airfoil\n", f"MARKER_ELEMS= {nelems}\n"])
+    for i in range(nelems):
+        j = (i + 1) % len(points)
+        lines.append(f"3 {i} {j}\n")
 
     path.write_text("".join(lines))
     return path
@@ -197,6 +218,155 @@ def test_half_domain_forces_every_marker_node_to_active_side(
     assert {record["surface_mode"] for record in result["records"]} == {surface_mode}
     assert all(record["deform_dir_x"] == pytest.approx(0.0) for record in result["records"])
     assert all(record["deform_dir_y"] == pytest.approx(vertical_sign) for record in result["records"])
+
+
+@pytest.mark.parametrize(
+    "surface_mode,side",
+    [("UPPER", "upper"), ("LOWER", "lower")],
+)
+def test_half_mode_unchanged_does_not_call_side_classifier(
+    tmp_path,
+    monkeypatch,
+    surface_mode,
+    side,
+):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("classify_sides must not be called in half mode")
+
+    monkeypatch.setattr(bspline_def, "classify_sides", fail_if_called)
+    mesh_file = _write_synthetic_airfoil_mesh(tmp_path / "airfoil.su2")
+    spec = _base_spec(coefficient=0.01)
+    spec["modes"] = [mode for mode in spec["modes"] if mode["side"] == side]
+    spec["surface_mode"] = surface_mode
+
+    result = compute_deformed_surface(
+        str(mesh_file),
+        spec,
+        surface_mode=surface_mode,
+    )
+
+    assert {record["side"] for record in result["records"]} == {side}
+
+
+def test_cambered_both_closed_loop_has_no_aft_sawtooth(tmp_path):
+    points = [
+        (1.0, 0.006),
+        (0.985, 0.008),
+        (0.965, 0.014),
+        (0.90, 0.026),
+        (0.65, 0.060),
+        (0.35, 0.065),
+        (0.10, 0.035),
+        (0.0, 0.0),
+        (0.10, -0.025),
+        (0.35, -0.012),
+        (0.65, 0.002),
+        (0.90, 0.010),
+        (0.965, 0.011),
+        (0.985, 0.006),
+        (1.0, 0.002),
+    ]
+    mesh_file = _write_airfoil_mesh(tmp_path / "rae_like.su2", points)
+
+    result = compute_deformed_surface(
+        str(mesh_file),
+        _base_spec(coefficient=0.005),
+        deformation_direction_mode="VERTICAL",
+        surface_mode="BOTH",
+    )
+    records = result["records"]
+    x_over_c = [record["x_over_c"] for record in records]
+    sides = [record["side"] for record in records]
+    i_le = min(range(len(records)), key=lambda index: x_over_c[index])
+    i_te = max(range(len(records)), key=lambda index: x_over_c[index])
+
+    for index, side in enumerate(sides):
+        if index in (i_le, i_te):
+            continue
+        previous = sides[(index - 1) % len(sides)]
+        next_side = sides[(index + 1) % len(sides)]
+        assert not (previous == next_side and side != previous)
+
+    aft_indices = [
+        index
+        for index, record in enumerate(records)
+        if 0.95 <= record["x_over_c"] <= 0.99
+    ]
+    assert aft_indices
+    for index in aft_indices:
+        if index in (i_le, i_te):
+            continue
+        previous = sides[(index - 1) % len(sides)]
+        next_side = sides[(index + 1) % len(sides)]
+        if previous == next_side:
+            assert sides[index] == previous
+
+
+def test_symmetric_both_classifies_by_surface_branch(tmp_path):
+    mesh_file = _write_synthetic_airfoil_mesh(tmp_path / "airfoil.su2")
+    result = compute_deformed_surface(
+        str(mesh_file),
+        _base_spec(),
+        surface_mode="BOTH",
+    )
+
+    for record in result["records"]:
+        if record["y"] > 0.0:
+            assert record["side"] == "upper"
+        elif record["y"] < 0.0:
+            assert record["side"] == "lower"
+
+
+def test_side_overrides_are_applied_after_topological_classification():
+    node_ids = list(range(8))
+    x_over_c = [1.0, 0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 0.75]
+    y_values = [0.0, 0.06, 0.08, 0.05, 0.0, -0.05, -0.08, -0.06]
+
+    baseline = classify_sides(node_ids, x_over_c, y_values, closed=True)
+    overridden = classify_sides(
+        node_ids,
+        x_over_c,
+        y_values,
+        side_overrides={1: "lower"},
+        closed=True,
+    )
+
+    assert baseline[1] == "upper"
+    assert overridden[1] == "lower"
+    assert [
+        index
+        for index, (before, after) in enumerate(zip(baseline, overridden))
+        if before != after
+    ] == [1]
+
+    with pytest.raises(BSplineDefError, match="Invalid side override"):
+        classify_sides(
+            node_ids,
+            x_over_c,
+            y_values,
+            side_overrides={"1": "middle"},
+            closed=True,
+        )
+
+
+def test_no_isolated_flip_guard_reports_node_context():
+    with pytest.raises(BSplineDefError) as exc_info:
+        bspline_def._raise_on_isolated_side_islands(
+            [10, 11, 12, 13, 14],
+            [0.1, 0.25, 0.5, 0.75, 0.9],
+            [0.02, 0.04, -0.01, 0.03, 0.02],
+            ["upper", "upper", "lower", "upper", "upper"],
+            set(),
+            closed=False,
+        )
+
+    message = str(exc_info.value)
+    assert "node 12" in message
+    assert "x_over_c=0.5" in message
+    assert "y=-0.01" in message
+    assert "previous side='upper'" in message
+    assert "current side='lower'" in message
+    assert "next side='upper'" in message
 
 
 def test_zero_coefficients_produce_unchanged_surface_positions(tmp_path):

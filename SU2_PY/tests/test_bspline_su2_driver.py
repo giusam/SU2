@@ -11,6 +11,7 @@ import pytest
 
 import SU2.opt.bspline_driver.driver as bspline_driver_module
 import SU2.opt.bspline_su2_driver as bspline_su2_driver
+from SU2.opt.bspline_modes import evaluate_normal_displacement
 from SU2.opt.bspline_driver.geometry_constraints import BSplineAirfoilAreaMetric
 from SU2.opt.bspline_su2_driver import (
     BSplineThicknessConstraint,
@@ -1025,6 +1026,95 @@ def test_active_coefficient_vector_extraction_skips_inactive_modes():
 
     assert active_mode_ids(spec) == ["upper_a", "lower_b"]
     assert active_coefficient_vector(spec) == [0.001, -0.002]
+
+
+def test_frozen_modes_contribute_to_geometry_but_not_design_vectors():
+    spec = _base_spec()
+    spec["modes"][1]["frozen"] = True
+
+    assert active_mode_ids(spec) == ["upper_a"]
+    assert active_coefficient_vector(spec) == [0.001]
+    assert active_bounds(spec, default_bounds=(-0.01, 0.01)) == [(-0.02, 0.03)]
+
+    displacement, values_by_id = evaluate_normal_displacement(
+        spec,
+        [0.5],
+        ["lower"],
+    )
+    assert "lower_b" in values_by_id
+    assert displacement[0] == pytest.approx(-0.002 * values_by_id["lower_b"][0])
+
+    updated = update_mode_coefficients(spec, [0.011])
+    assert updated["modes"][0]["coefficient"] == 0.011
+    assert updated["modes"][1]["coefficient"] == -0.002
+    assert updated["modes"][1]["frozen"] is True
+    assert updated["modes"][2]["coefficient"] == 0.5
+
+
+def test_geometry_probe_uses_design_modes_when_frozen_modes_exist(tmp_path, monkeypatch):
+    spec = _base_spec()
+    spec["modes"][1]["frozen"] = True
+
+    def fake_run_command(command, cwd, log_file, show_command=False, stream_output=False, stage=None):
+        del command, log_file, show_command, stream_output, stage
+        cwd = Path(cwd)
+        cwd.mkdir(parents=True, exist_ok=True)
+        with (cwd / "bspline_surface_metadata.csv").open("w", newline="") as fp:
+            writer = csv.DictWriter(
+                fp,
+                fieldnames=[
+                    "node_id",
+                    "x",
+                    "y",
+                    "x_over_c",
+                    "side",
+                    "normal_x",
+                    "normal_y",
+                    "weight",
+                    "deformed_x",
+                    "deformed_y",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "node_id": 0,
+                    "x": 0.5,
+                    "y": 0.1,
+                    "x_over_c": 0.5,
+                    "side": "upper",
+                    "normal_x": 0.0,
+                    "normal_y": 1.0,
+                    "weight": 1.0,
+                    "deformed_x": 0.5,
+                    "deformed_y": 0.1,
+                }
+            )
+            writer.writerow(
+                {
+                    "node_id": 1,
+                    "x": 0.5,
+                    "y": -0.1,
+                    "x_over_c": 0.5,
+                    "side": "lower",
+                    "normal_x": 0.0,
+                    "normal_y": -1.0,
+                    "weight": 1.0,
+                    "deformed_x": 0.5,
+                    "deformed_y": -0.1,
+                }
+            )
+
+    monkeypatch.setattr(bspline_driver_module, "run_command", fake_run_command)
+    driver = _make_driver(tmp_path, spec=spec, opt_line_search_bound=0.1)
+
+    metadata, basis_matrix = driver._probe_geometry_aware_bounds()
+    driver._configure_line_search_bound()
+
+    assert len(metadata) == 2
+    assert basis_matrix.shape == (2, 1)
+    assert driver._line_search_basis_matrix.shape == (2, 1)
+    assert driver.mode_ids == ["upper_a"]
 
 
 def test_bounds_extraction_uses_mode_bounds_and_default():

@@ -322,10 +322,13 @@ def extract_independent_side_spaces(mode_spec, settings):
     }
 
 def refinement_limit_ndv(mode_spec, settings):
-    if str((settings or {}).get("refine_side_coupling", "COUPLED")).upper() == "INDEPENDENT":
-        spaces = extract_independent_side_spaces(mode_spec, settings)
-        return sum(reduced_ndv_for_knot_space(space) for space in spaces.values())
-    return reduced_ndv_for_knot_space(extract_clamped_knot_space(mode_spec, settings))
+    from SU2.opt.bspline_driver.reduction import build_reduced_variables
+
+    reduced_variables, _warnings = build_reduced_variables(
+        mode_spec,
+        coupling=(settings or {}).get("symmetry_coupling", "NONE"),
+    )
+    return len(reduced_variables)
 
 def _requested_knot_insertions(space, settings, available_spans):
     reduced_per_insertion = (

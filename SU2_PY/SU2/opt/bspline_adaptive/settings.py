@@ -45,6 +45,10 @@ ALLOWED_TRIGGERS = (
 
 ALLOWED_NADD_MODES = ("GROWTH_RATIO", "FIXED")
 
+ALLOWED_REALLOCATION_COUNT_MODES = ("LAST_ADDED",)
+
+ALLOWED_REALLOCATION_FREEZE_METRICS = ("COEFF_DELTA",)
+
 ALLOWED_REFINE_MODES = ("KNOT_INSERTION",)
 
 ALLOWED_KNOT_SCORE_MODES = ("VIRTUAL_INSERTION", "RESIDUAL_ENERGY")
@@ -282,6 +286,38 @@ def validate_adaptive_options(opts):
         raise BSplineAdaptiveError(
             f"unsupported nadd mode {opts['nadd_mode']!r}; allowed values are {ALLOWED_NADD_MODES}"
         )
+    opts["active_budget_reallocation"] = _as_bool(
+        opts.get("active_budget_reallocation", False),
+        default=False,
+    )
+    opts["reallocation_improvement_rel_tol"] = _as_float(
+        opts.get("reallocation_improvement_rel_tol", 0.10),
+        "BSPLINE_REALLOCATION_IMPROVEMENT_REL_TOL",
+    )
+    if opts["reallocation_improvement_rel_tol"] < 0.0:
+        raise BSplineAdaptiveError(
+            "BSPLINE_REALLOCATION_IMPROVEMENT_REL_TOL must be non-negative"
+        )
+    opts["reallocation_count_mode"] = str(
+        opts.get("reallocation_count_mode", "LAST_ADDED")
+    ).strip().upper()
+    if opts["reallocation_count_mode"] not in ALLOWED_REALLOCATION_COUNT_MODES:
+        raise BSplineAdaptiveError(
+            "unsupported BSPLINE_REALLOCATION_COUNT_MODE {!r}; allowed values are {}".format(
+                opts["reallocation_count_mode"],
+                ALLOWED_REALLOCATION_COUNT_MODES,
+            )
+        )
+    opts["reallocation_freeze_metric"] = str(
+        opts.get("reallocation_freeze_metric", "COEFF_DELTA")
+    ).strip().upper()
+    if opts["reallocation_freeze_metric"] not in ALLOWED_REALLOCATION_FREEZE_METRICS:
+        raise BSplineAdaptiveError(
+            "unsupported BSPLINE_REALLOCATION_FREEZE_METRIC {!r}; allowed values are {}".format(
+                opts["reallocation_freeze_metric"],
+                ALLOWED_REALLOCATION_FREEZE_METRICS,
+            )
+        )
 
     removed_runtime = []
     for key in (
@@ -343,6 +379,11 @@ def validate_adaptive_options(opts):
     if opts["surface_mode"] != "BOTH" and opts["symmetry_coupling"] != "NONE":
         raise BSplineAdaptiveError(
             "BSPLINE_SYMMETRY_COUPLING is only valid with BSPLINE_SURFACE_MODE=BOTH"
+        )
+    if opts["active_budget_reallocation"] and opts["symmetry_coupling"] != "NONE":
+        raise BSplineAdaptiveError(
+            "BSPLINE_ACTIVE_BUDGET_REALLOCATION=YES is not supported with "
+            "BSPLINE_SYMMETRY_COUPLING != NONE in v1"
         )
     opts["refine_side_coupling"] = str(opts.get("refine_side_coupling", "COUPLED")).upper()
     if opts["refine_side_coupling"] not in ALLOWED_REFINE_SIDE_COUPLINGS:
@@ -689,6 +730,10 @@ def adaptive_options_from_config(config_values):
         "BSPLINE_GROWTH_RATIO": "growth_ratio",
         "BSPLINE_BATCH_SIZE_MAX": "batch_size_max",
         "BSPLINE_LOG_ACTIVE_MODES": "log_active_modes",
+        "BSPLINE_ACTIVE_BUDGET_REALLOCATION": "active_budget_reallocation",
+        "BSPLINE_REALLOCATION_IMPROVEMENT_REL_TOL": "reallocation_improvement_rel_tol",
+        "BSPLINE_REALLOCATION_COUNT_MODE": "reallocation_count_mode",
+        "BSPLINE_REALLOCATION_FREEZE_METRIC": "reallocation_freeze_metric",
     }
     for key, dest in mapping.items():
         if key in config_values:
@@ -1117,6 +1162,14 @@ def print_startup_summary(settings):
     )
     print("[PROGRESSIVE_BSPLINE] refinement state: INITIAL_MESH_KEEP_DV")
     print(
+        "[PROGRESSIVE_BSPLINE] active-budget reallocation: {} tol={} count_mode={} freeze_metric={}".format(
+            "YES" if settings.get("active_budget_reallocation", False) else "NO",
+            settings.get("reallocation_improvement_rel_tol", 0.10),
+            settings.get("reallocation_count_mode", "LAST_ADDED"),
+            settings.get("reallocation_freeze_metric", "COEFF_DELTA"),
+        )
+    )
+    print(
         "[PROGRESSIVE_BSPLINE] deformation direction: "
         f"{settings.get('deformation_direction_mode', 'NORMAL')}"
     )
@@ -1211,6 +1264,26 @@ def _settings_from_args(args):
         "batch_size_max": args.batch_size_max,
         "growth_ratio": args.growth_ratio,
         "fixed_nadd": args.fixed_nadd,
+        "active_budget_reallocation": getattr(
+            args,
+            "active_budget_reallocation",
+            False,
+        ),
+        "reallocation_improvement_rel_tol": getattr(
+            args,
+            "reallocation_improvement_rel_tol",
+            0.10,
+        ),
+        "reallocation_count_mode": getattr(
+            args,
+            "reallocation_count_mode",
+            "LAST_ADDED",
+        ),
+        "reallocation_freeze_metric": getattr(
+            args,
+            "reallocation_freeze_metric",
+            "COEFF_DELTA",
+        ),
         "sensitivity_weighting": getattr(args, "sensitivity_weighting", "NODAL"),
         "sensitivity_source": getattr(args, "sensitivity_source", "DOT_AD_TRANSFER"),
         "geometry_fd_eps": getattr(args, "geometry_fd_eps", 1.0e-6),

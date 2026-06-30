@@ -37,7 +37,10 @@ from .mode_utils import (
     write_level_start,
 )
 from .models import TriggerDecision
-from .refinement import build_next_knot_inserted_modes
+from .refinement import (
+    build_next_knot_inserted_modes,
+    compute_freeze_eligible_count,
+)
 from .scoring import load_adjoint_signal
 from .settings import (
     _print_level_start,
@@ -72,6 +75,13 @@ def _trigger_resume_state_from_result(result):
         "trigger_state": result.get("trigger_state", None),
         "refinement_triggered": bool(result.get("refinement_triggered", False)),
     }
+
+def _relative_level_improvement(safe_opt_rows, eps):
+    if not safe_opt_rows:
+        return None
+    start = float(safe_opt_rows[0]["_objective"])
+    best = min(float(row["_objective"]) for row in safe_opt_rows)
+    return (start - best) / (abs(start) + float(eps))
 
 
 
@@ -214,8 +224,9 @@ def progressive_bspline_su2_shape_optimization(settings):
             workdir,
             settings["modes"],
         )
-        kept = len(active_mode_ids(current_modes)) - len(settings.get("_last_added_ids", []))
-        added = len(settings.get("_last_added_ids", []))
+        last_added_ids = settings.get("_last_added_ids", [])
+        added = len(last_added_ids) if last_added_ids else int(settings.get("_last_added_design_count", 0))
+        kept = max(0, len(active_mode_ids(current_modes)) - int(added))
         write_level_start(level)
         _print_level_start(
             level,
@@ -446,11 +457,73 @@ def progressive_bspline_su2_shape_optimization(settings):
                 sensitivity_filename,
                 adjoint_eval_dir / "bspline_surface_metadata.csv",
             )
+            refinement_settings = settings
+            rel_improvement = None
+            if settings.get("active_budget_reallocation", False):
+                rel_improvement = _relative_level_improvement(
+                    safe_opt_rows,
+                    settings.get("eps", 1.0e-300),
+                )
+                tol = float(settings.get("reallocation_improvement_rel_tol", 0.10))
+                if rel_improvement is None:
+                    print(
+                        "[PROGRESSIVE_BSPLINE] ACTIVE_BUDGET_REALLOCATION normal refinement | "
+                        "no safe objective history available"
+                    )
+                elif rel_improvement >= tol:
+                    print(
+                        "[PROGRESSIVE_BSPLINE] ACTIVE_BUDGET_REALLOCATION normal refinement | "
+                        "rel_improvement={:.6e} tol={:.6e}".format(
+                            float(rel_improvement),
+                            tol,
+                        )
+                    )
+                else:
+                    last_added = int(settings.get("_last_added_design_count", 0))
+                    if last_added <= 0:
+                        print(
+                            "[PROGRESSIVE_BSPLINE] ACTIVE_BUDGET_REALLOCATION normal refinement | "
+                            "last_added_design_count <= 0"
+                        )
+                    else:
+                        eligible_count = compute_freeze_eligible_count(optimized_modes)
+                        if eligible_count == 0:
+                            print(
+                                "[PROGRESSIVE_BSPLINE] ACTIVE_BUDGET_REALLOCATION normal refinement | "
+                                "no freeze-eligible design modes available"
+                            )
+                        else:
+                            k_eff = min(last_added, int(eligible_count))
+                            if k_eff < last_added:
+                                print(
+                                    "[PROGRESSIVE_BSPLINE] ACTIVE_BUDGET_REALLOCATION warning | "
+                                    "eligible_count={} < requested_k={}; using k_eff={}".format(
+                                        int(eligible_count),
+                                        int(last_added),
+                                        int(k_eff),
+                                    )
+                                )
+                            refinement_settings = dict(settings)
+                            refinement_settings["_active_budget_reallocation_current"] = True
+                            refinement_settings["_reallocation_forced_design_add_count"] = int(k_eff)
+                            refinement_settings["_reallocation_freeze_count"] = int(k_eff)
+                            refinement_settings["_reallocation_rel_improvement"] = float(rel_improvement)
+                            print(
+                                "[PROGRESSIVE_BSPLINE] ACTIVE_BUDGET_REALLOCATION selected | "
+                                "rel_improvement={:.6e} tol={:.6e} k={} k_eff={} eligible={}".format(
+                                    float(rel_improvement),
+                                    tol,
+                                    int(last_added),
+                                    int(k_eff),
+                                    int(eligible_count),
+                                )
+                            )
             next_modes, knot_score_rows, knot_selected_data = build_next_knot_inserted_modes(
                 optimized_modes,
                 metadata,
                 signal,
-                settings,
+                refinement_settings,
+                level_start_modes=level.active_modes,
             )
             knot_score_file = level.workdir / f"knot_span_scores_level_{level_id:03d}.csv"
             knot_selected_file = level.workdir / f"selected_knot_refinement_level_{level_id:03d}.json"
@@ -462,10 +535,29 @@ def progressive_bspline_su2_shape_optimization(settings):
                 knot_selected_file,
             )
             if next_modes is not None:
+                if knot_selected_data.get("active_budget_reallocation", False):
+                    n_design_before = int(knot_selected_data["n_design_before"])
+                    n_design_after = int(knot_selected_data["n_design_after"])
+                    if n_design_after != n_design_before:
+                        raise BSplineAdaptiveError(
+                            "active-budget reallocation invariant failed: "
+                            f"n_design_before={n_design_before} n_design_after={n_design_after}"
+                        )
                 next_file = level.workdir / "active_modes_next.json"
                 write_mode_spec(next_modes, next_file)
                 knot_refine_used = True
                 current_modes = next_modes
+                n_added_design = int(
+                    knot_selected_data.get(
+                        "n_added_design",
+                        max(
+                            0,
+                            int(knot_selected_data.get("n_design_after", 0))
+                            - int(knot_selected_data.get("n_design_before", 0)),
+                        ),
+                    )
+                )
+                settings["_last_added_design_count"] = n_added_design
                 settings["_last_added_ids"] = [
                     mode_id
                     for mode_id in active_mode_ids(next_modes)
@@ -478,7 +570,7 @@ def progressive_bspline_su2_shape_optimization(settings):
                         float(knot_selected_data["span_left"]),
                         float(knot_selected_data["span_right"]),
                         float(knot_selected_data["inserted_knot"]),
-                        int(knot_selected_data["ndv_after"]) - int(knot_selected_data["ndv_before"]),
+                        int(n_added_design),
                     )
                 )
                 print(
@@ -500,11 +592,29 @@ def progressive_bspline_su2_shape_optimization(settings):
                 )
                 print(
                     "[PROGRESSIVE_BSPLINE] Coefficients transferred from previous level: kept={} added={} transfer_max={:.6e}".format(
-                        int(knot_selected_data["ndv_before"]),
-                        int(knot_selected_data["ndv_after"]) - int(knot_selected_data["ndv_before"]),
+                        int(knot_selected_data.get("n_design_before", knot_selected_data["ndv_before"])),
+                        int(n_added_design),
                         float(knot_selected_data["transfer_max_error"]),
                     )
                 )
+                if knot_selected_data.get("active_budget_reallocation", False):
+                    frozen_mode_ids = knot_selected_data.get("reallocated_frozen_mode_ids", [])
+                    print(
+                        "[PROGRESSIVE_BSPLINE] ACTIVE_BUDGET_REALLOCATION applied | "
+                        "n_design={} n_frozen={} n_geometric_total={} froze={}".format(
+                            int(knot_selected_data["n_design_after"]),
+                            int(knot_selected_data["n_frozen"]),
+                            int(knot_selected_data["n_geometric_total"]),
+                            int(knot_selected_data["reallocated_freeze_count"]),
+                        )
+                    )
+                    print(
+                        "[PROGRESSIVE_BSPLINE] ACTIVE_BUDGET_REALLOCATION frozen modes: {}".format(
+                            ", ".join(str(mode_id) for mode_id in frozen_mode_ids)
+                            if frozen_mode_ids
+                            else "NONE"
+                        )
+                    )
             else:
                 print("[PROGRESSIVE_BSPLINE] KNOT_INSERTION refine | no positive knot span selected")
                 refine_now = False
@@ -521,8 +631,11 @@ def progressive_bspline_su2_shape_optimization(settings):
             "ok",
         )
         if knot_refine_used and knot_selected_data:
-            level_summary["n_added"] = int(knot_selected_data["ndv_after"]) - int(
-                knot_selected_data["ndv_before"]
+            level_summary["n_added"] = int(
+                knot_selected_data.get(
+                    "n_added_design",
+                    int(knot_selected_data["ndv_after"]) - int(knot_selected_data["ndv_before"]),
+                )
             )
             level_summary["selected_ids"] = "knot@{:.12g}".format(
                 float(knot_selected_data["inserted_knot"])

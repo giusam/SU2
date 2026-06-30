@@ -97,7 +97,7 @@ from .guards import (
     gradient_guard_triggered,
 )
 from .reduction import (
-    _active_modes,
+    _design_modes,
     _validated_bounds,
     active_bounds,
     active_coefficient_vector,
@@ -576,7 +576,7 @@ class BSplineSU2Driver:
         x_over_c = [float(row["x_over_c"]) for row in metadata]
         sides = [str(row["side"]).strip().lower() for row in metadata]
         values_by_id = evaluate_all_modes(self.mode_spec, x_over_c, sides=sides)
-        active_modes = _active_modes(self.mode_spec)
+        active_modes = _design_modes(self.mode_spec)
         columns = [
             np.asarray(values_by_id[str(mode["id"])], dtype=float)
             for mode in active_modes

@@ -7,23 +7,23 @@ from SU2.opt.bspline_driver.reduction import active_mode_ids
 
 from .boehm import (
     _check_transferred_coefficients_within_bounds,
+    _find_knot_span_for_insertion,
     transfer_shape_to_inserted_space,
 )
 from .errors import BSplineAdaptiveError
 from .knot_space import (
     _insertion_budget,
-    _requested_knot_insertions,
     extract_clamped_knot_space,
     extract_independent_side_spaces,
     insert_knot_midpoint,
     knot_insertion_spans,
-    reduced_ndv_for_knot_space,
     refinement_limit_ndv,
     regenerate_clamped_modes,
 )
 from .mode_utils import (
     _active_modes,
     _copy_global_metadata,
+    _mode_support,
     mode_sort_key,
 )
 from .penalties import (
@@ -34,6 +34,263 @@ from .penalties import (
 from .scoring import score_knot_spans
 
 INDEPENDENT_SIDES = ("upper", "lower")
+
+def _mode_side(mode):
+    return str(mode.get("side", "")).strip().lower()
+
+def _mode_basis_index(mode):
+    return int(mode.get("basis_index", 0))
+
+def _modes_by_side_and_basis(mode_spec):
+    by_side = {}
+    for mode in _active_modes(mode_spec):
+        by_side.setdefault(_mode_side(mode), []).append(mode)
+    for side in by_side:
+        by_side[side].sort(key=_mode_basis_index)
+    return by_side
+
+def _count_frozen_modes(mode_spec):
+    return sum(
+        1
+        for mode in _active_modes(mode_spec)
+        if mode.get("frozen", False) is True
+    )
+
+def compute_freeze_eligible_count(mode_spec):
+    return sum(
+        1
+        for mode in _active_modes(mode_spec)
+        if mode.get("frozen", False) is not True
+    )
+
+def _initial_reallocation_masks(mode_spec):
+    masks = {}
+    for side, modes in _modes_by_side_and_basis(mode_spec).items():
+        masks[side] = [
+            {
+                "freeze_eligible": mode.get("frozen", False) is not True,
+                "frozen": mode.get("frozen", False) is True,
+                "newly_inserted_this_refinement": False,
+            }
+            for mode in modes
+        ]
+    return masks
+
+def _new_reallocation_slot():
+    return {
+        "freeze_eligible": False,
+        "frozen": False,
+        "newly_inserted_this_refinement": True,
+    }
+
+def _target_insert_slot(knots, degree, coeff_count, inserted_knot):
+    span = _find_knot_span_for_insertion(
+        knots,
+        degree,
+        coeff_count,
+        inserted_knot,
+    )
+    return max(0, min(int(coeff_count), int(span) - int(degree) + 1))
+
+def _insert_mask_slot(masks, sides, old_knots, degree, inserted_knot):
+    for side in sides:
+        labels = masks.setdefault(side, [])
+        slot = _target_insert_slot(
+            old_knots,
+            degree,
+            len(labels),
+            inserted_knot,
+        )
+        labels.insert(slot, _new_reallocation_slot())
+
+def _forced_insertion_budget(current_reduced, available_spans, reduced_per_insertion, settings):
+    forced = int(settings.get("_reallocation_forced_design_add_count", 0))
+    reduced_per_insertion = max(1, int(reduced_per_insertion))
+    current_reduced = int(current_reduced)
+    if forced <= 0:
+        return 0, {
+            "mode": "ACTIVE_BUDGET_REALLOCATION",
+            "current_reduced_ndv": current_reduced,
+            "target_reduced_ndv": current_reduced,
+            "reduced_ndv_per_insertion": reduced_per_insertion,
+            "requested_insertions": 0,
+            "available_spans": max(0, int(available_spans)),
+            "insertions": 0,
+            "clamped": True,
+            "clamp_reason": "zero_forced_design_add_count",
+        }
+    if forced % reduced_per_insertion != 0:
+        raise BSplineAdaptiveError(
+            "active-budget reallocation cannot add exactly "
+            f"{forced} design DOF with {reduced_per_insertion} design DOF per knot insertion"
+        )
+    requested = forced // reduced_per_insertion
+    available_spans = max(0, int(available_spans))
+    if requested > available_spans:
+        raise BSplineAdaptiveError(
+            "active-budget reallocation requested exactly "
+            f"{requested} knot insertion(s), but only {available_spans} valid span(s) are available"
+        )
+    return requested, {
+        "mode": "ACTIVE_BUDGET_REALLOCATION",
+        "current_reduced_ndv": current_reduced,
+        "target_reduced_ndv": current_reduced + forced,
+        "reduced_ndv_per_insertion": reduced_per_insertion,
+        "requested_insertions": int(requested),
+        "available_spans": available_spans,
+        "insertions": int(requested),
+        "clamped": False,
+        "clamp_reason": "",
+    }
+
+def _reallocation_requested(settings):
+    return bool(settings.get("_active_budget_reallocation_current", False))
+
+def _target_modes_with_masks(next_modes, masks):
+    mapped = []
+    for side, modes in _modes_by_side_and_basis(next_modes).items():
+        labels = masks.get(side, [])
+        if len(labels) != len(modes):
+            raise BSplineAdaptiveError(
+                "active-budget reallocation mask mismatch for side "
+                f"{side}: mask={len(labels)} target_modes={len(modes)}"
+            )
+        mapped.extend((mode, labels[index]) for index, mode in enumerate(modes))
+    return mapped
+
+def _side_coefficients_from_spec(mode_spec):
+    return {
+        side: [float(mode.get("coefficient", 0.0)) for mode in modes]
+        for side, modes in _modes_by_side_and_basis(mode_spec).items()
+    }
+
+def _transfer_start_coefficients_to_target(
+    level_start_modes,
+    metadata,
+    new_knots,
+    settings,
+):
+    if level_start_modes is None:
+        raise BSplineAdaptiveError(
+            "active-budget reallocation requires the level-start mode spec "
+            "to compute COEFF_DELTA"
+        )
+    start_space = extract_clamped_knot_space(level_start_modes, settings)
+    coefficients_by_side, _diagnostics = transfer_shape_to_inserted_space(
+        start_space,
+        metadata,
+        new_knots,
+        settings=settings,
+    )
+    return {
+        side: [float(value) for value in coefficients]
+        for side, coefficients in coefficients_by_side.items()
+    }
+
+def _transfer_independent_start_coefficients_to_target(
+    level_start_modes,
+    meta_side,
+    cur_knots,
+    settings,
+):
+    if level_start_modes is None:
+        raise BSplineAdaptiveError(
+            "active-budget reallocation requires the level-start mode spec "
+            "to compute COEFF_DELTA"
+        )
+    side_settings = dict(settings or {})
+    side_settings["symmetry_coupling"] = "NONE"
+    start_spaces = extract_independent_side_spaces(level_start_modes, side_settings)
+    coefficients_by_side = {}
+    for side, start_space in start_spaces.items():
+        target_knots = cur_knots.get(side, tuple(start_space.knot_vector))
+        if tuple(target_knots) == tuple(start_space.knot_vector):
+            coefficients_by_side[side] = [
+                float(value)
+                for value in start_space.groups[side].coefficients
+            ]
+            continue
+        transferred, _diagnostics = transfer_shape_to_inserted_space(
+            start_space,
+            meta_side.get(side, []),
+            target_knots,
+            settings=side_settings,
+        )
+        coefficients_by_side[side] = [
+            float(value)
+            for value in transferred.get(side, [])
+        ]
+    return coefficients_by_side
+
+def _apply_reallocation_freeze(
+    next_modes,
+    masks,
+    start_coefficients_by_side,
+    freeze_count,
+):
+    freeze_count = int(freeze_count)
+    if freeze_count <= 0:
+        return validate_mode_spec(next_modes), []
+
+    end_coefficients_by_side = _side_coefficients_from_spec(next_modes)
+    candidates = []
+    for mode, label in _target_modes_with_masks(next_modes, masks):
+        if not label.get("freeze_eligible", False):
+            continue
+        if label.get("newly_inserted_this_refinement", False):
+            continue
+        if label.get("frozen", False):
+            continue
+        side = _mode_side(mode)
+        index = _mode_basis_index(mode)
+        try:
+            end_value = float(end_coefficients_by_side[side][index])
+            start_value = float(start_coefficients_by_side[side][index])
+        except (KeyError, IndexError) as exc:
+            raise BSplineAdaptiveError(
+                "active-budget reallocation could not compute COEFF_DELTA "
+                f"for mode {mode.get('id')}"
+            ) from exc
+        left, _right, center = _mode_support(mode)
+        candidates.append(
+            (
+                abs(end_value - start_value),
+                _mode_side(mode),
+                float(center),
+                _mode_basis_index(mode),
+                str(mode.get("id", "")),
+                mode,
+            )
+        )
+
+    if len(candidates) < freeze_count:
+        raise BSplineAdaptiveError(
+            "active-budget reallocation expected at least "
+            f"{freeze_count} freeze-eligible target mode(s), got {len(candidates)}"
+        )
+
+    selected = sorted(candidates)[:freeze_count]
+    selected_keys = {
+        (_mode_side(item[-1]), _mode_basis_index(item[-1]))
+        for item in selected
+    }
+    frozen_ids = []
+    prepared_modes = []
+    for mode, label in _target_modes_with_masks(next_modes, masks):
+        copied = dict(mode)
+        key = (_mode_side(copied), _mode_basis_index(copied))
+        if label.get("frozen", False) or key in selected_keys:
+            copied["frozen"] = True
+            if key in selected_keys:
+                frozen_ids.append(str(copied["id"]))
+        else:
+            copied.pop("frozen", None)
+        prepared_modes.append(copied)
+
+    updated = validate_mode_spec(_copy_global_metadata(next_modes, prepared_modes))
+    if "knot_span_depths" in next_modes:
+        updated["knot_span_depths"] = next_modes["knot_span_depths"]
+    return updated, frozen_ids
 
 def _print_selected_insertion(step, selected, side_label):
     if str(selected.get("batch_penalty_mode", "NONE")).upper() == "NONE":
@@ -65,9 +322,21 @@ def _print_selected_insertion(step, selected, side_label):
             )
         )
 
-def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
+def build_next_knot_inserted_modes(
+    optimized_modes,
+    metadata,
+    signal,
+    settings,
+    level_start_modes=None,
+):
     if str((settings or {}).get("refine_side_coupling", "COUPLED")).upper() == "INDEPENDENT":
-        return _build_next_independent(optimized_modes, metadata, signal, settings)
+        return _build_next_independent(
+            optimized_modes,
+            metadata,
+            signal,
+            settings,
+            level_start_modes=level_start_modes,
+        )
     space = extract_clamped_knot_space(optimized_modes, settings)
     available_spans = len(
         knot_insertion_spans(
@@ -75,11 +344,25 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
             min_width=settings.get("knot_min_span_width", 1.0e-8),
         )
     )
-    n_insertions, batch_info = _requested_knot_insertions(
-        space,
-        settings,
-        available_spans,
+    reduced_per_insertion = (
+        1 if space.coupling in ("NORMAL_EQUAL", "NORMAL_OPPOSITE") else len(space.sides)
     )
+    if _reallocation_requested(settings):
+        n_insertions, batch_info = _forced_insertion_budget(
+            refinement_limit_ndv(optimized_modes, settings),
+            available_spans,
+            reduced_per_insertion,
+            settings,
+        )
+        reallocation_masks = _initial_reallocation_masks(optimized_modes)
+    else:
+        n_insertions, batch_info = _insertion_budget(
+            refinement_limit_ndv(optimized_modes, settings),
+            available_spans,
+            reduced_per_insertion,
+            settings,
+        )
+        reallocation_masks = None
     if n_insertions <= 0:
         return None, [], {
             "status": "no_valid_knot_span",
@@ -143,6 +426,14 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
             current_space.knot_vector,
             (selected["span_left"], selected["span_right"], selected["inserted_knot"]),
         )
+        if reallocation_masks is not None:
+            _insert_mask_slot(
+                reallocation_masks,
+                current_space.sides,
+                current_space.knot_vector,
+                current_space.degree,
+                selected["inserted_knot"],
+            )
         parent_key = _span_key(selected["span_left"], selected["span_right"])
         parent_depth = int(span_depths[parent_key])
         child_depth = parent_depth + 1
@@ -200,6 +491,27 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
     next_modes = regenerate_clamped_modes(space, new_knots, coefficients_by_side)
     next_modes["knot_span_depths"] = dict(span_depths)
     _check_transferred_coefficients_within_bounds(next_modes, settings)
+    frozen_mode_ids = []
+    n_design_before = refinement_limit_ndv(optimized_modes, settings)
+    if reallocation_masks is not None:
+        start_coefficients_by_side = _transfer_start_coefficients_to_target(
+            level_start_modes,
+            metadata,
+            new_knots,
+            settings,
+        )
+        next_modes, frozen_mode_ids = _apply_reallocation_freeze(
+            next_modes,
+            reallocation_masks,
+            start_coefficients_by_side,
+            settings.get("_reallocation_freeze_count", 0),
+        )
+        n_design_after = refinement_limit_ndv(next_modes, settings)
+        if n_design_after != n_design_before:
+            raise BSplineAdaptiveError(
+                "active-budget reallocation invariant failed: "
+                f"n_design_before={n_design_before} n_design_after={n_design_after}"
+            )
     if settings.get("nfinal") is not None and refinement_limit_ndv(next_modes, settings) > int(settings["nfinal"]):
         return None, score_rows, {
             "status": "nfinal_limit",
@@ -210,6 +522,12 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
             "selected_insertions": selected_insertions,
         }
     first = selected_insertions[0]
+    n_design_after = refinement_limit_ndv(next_modes, settings)
+    n_added_design = (
+        int(settings.get("_reallocation_forced_design_add_count", 0))
+        if reallocation_masks is not None
+        else max(0, int(n_design_after) - int(n_design_before))
+    )
     selected_data = {
         "status": "ok",
         "selected": True,
@@ -231,8 +549,20 @@ def build_next_knot_inserted_modes(optimized_modes, metadata, signal, settings):
         "residual_energy": float(first["residual_energy"]),
         "ndv_before": len(active_mode_ids(optimized_modes)),
         "ndv_after": len(active_mode_ids(next_modes)),
-        "reduced_ndv_before": reduced_ndv_for_knot_space(space),
+        "reduced_ndv_before": int(n_design_before),
         "reduced_ndv_after": refinement_limit_ndv(next_modes, settings),
+        "n_design_before": int(n_design_before),
+        "n_design_after": int(n_design_after),
+        "n_added_design": int(n_added_design),
+        "n_frozen": int(_count_frozen_modes(next_modes)),
+        "n_geometric_total": int(len(_active_modes(next_modes))),
+        "active_budget_reallocation": reallocation_masks is not None,
+        "reallocation_rel_improvement": settings.get("_reallocation_rel_improvement"),
+        "reallocation_forced_design_add_count": int(
+            settings.get("_reallocation_forced_design_add_count", 0)
+        ),
+        "reallocated_freeze_count": len(frozen_mode_ids),
+        "reallocated_frozen_mode_ids": frozen_mode_ids,
         "old_knot_vector": [float(value) for value in space.knot_vector],
         "new_knot_vector": [float(value) for value in new_knots],
         "selected_insertions": selected_insertions,
@@ -253,7 +583,13 @@ def _side_depth_spec(side_spec, raw_depths, side):
         side_depths = raw_depths
     return {**side_spec, "knot_span_depths": side_depths}
 
-def _build_next_independent(optimized_modes, metadata, signal, settings):
+def _build_next_independent(
+    optimized_modes,
+    metadata,
+    signal,
+    settings,
+    level_start_modes=None,
+):
     """Greedy per-side knot insertion: upper and lower diverge independently.
 
     Each side keeps its own knot vector and span-depth state. At every step both
@@ -294,17 +630,27 @@ def _build_next_independent(optimized_modes, metadata, signal, settings):
             settings,
         )
 
-    current_reduced = sum(reduced_ndv_for_knot_space(orig_space[side]) for side in sides)
+    current_reduced = refinement_limit_ndv(optimized_modes, settings)
     available_spans = sum(
         len(knot_insertion_spans(orig_space[side].knot_vector, min_width=min_width))
         for side in sides
     )
-    n_insertions, batch_info = _insertion_budget(
-        current_reduced,
-        available_spans,
-        1,
-        settings,
-    )
+    if _reallocation_requested(settings):
+        n_insertions, batch_info = _forced_insertion_budget(
+            current_reduced,
+            available_spans,
+            1,
+            settings,
+        )
+        reallocation_masks = _initial_reallocation_masks(optimized_modes)
+    else:
+        n_insertions, batch_info = _insertion_budget(
+            current_reduced,
+            available_spans,
+            1,
+            settings,
+        )
+        reallocation_masks = None
     if n_insertions <= 0:
         return None, [], {
             "status": "no_valid_knot_span",
@@ -385,6 +731,14 @@ def _build_next_independent(optimized_modes, metadata, signal, settings):
             cur_space[side].knot_vector,
             (selected["span_left"], selected["span_right"], selected["inserted_knot"]),
         )
+        if reallocation_masks is not None:
+            _insert_mask_slot(
+                reallocation_masks,
+                (side,),
+                cur_space[side].knot_vector,
+                cur_space[side].degree,
+                selected["inserted_knot"],
+            )
         depths = span_depths[side]
         parent_key = _span_key(selected["span_left"], selected["span_right"])
         parent_depth = int(depths[parent_key])
@@ -467,6 +821,27 @@ def _build_next_independent(optimized_modes, metadata, signal, settings):
     next_modes = validate_mode_spec(_copy_global_metadata(spec, ordered_modes))
     next_modes["knot_span_depths"] = {side: dict(span_depths[side]) for side in sides}
     _check_transferred_coefficients_within_bounds(next_modes, settings)
+    frozen_mode_ids = []
+    n_design_before = refinement_limit_ndv(optimized_modes, settings)
+    if reallocation_masks is not None:
+        start_coefficients_by_side = _transfer_independent_start_coefficients_to_target(
+            level_start_modes,
+            meta_side,
+            cur_knots,
+            settings,
+        )
+        next_modes, frozen_mode_ids = _apply_reallocation_freeze(
+            next_modes,
+            reallocation_masks,
+            start_coefficients_by_side,
+            settings.get("_reallocation_freeze_count", 0),
+        )
+        n_design_after = refinement_limit_ndv(next_modes, settings)
+        if n_design_after != n_design_before:
+            raise BSplineAdaptiveError(
+                "active-budget reallocation invariant failed: "
+                f"n_design_before={n_design_before} n_design_after={n_design_after}"
+            )
 
     reduced_after = refinement_limit_ndv(next_modes, settings)
     if settings.get("nfinal") is not None and reduced_after > int(settings["nfinal"]):
@@ -480,6 +855,12 @@ def _build_next_independent(optimized_modes, metadata, signal, settings):
         }
 
     first = selected_insertions[0]
+    n_design_after = refinement_limit_ndv(next_modes, settings)
+    n_added_design = (
+        int(settings.get("_reallocation_forced_design_add_count", 0))
+        if reallocation_masks is not None
+        else max(0, int(n_design_after) - int(n_design_before))
+    )
     selected_data = {
         "status": "ok",
         "selected": True,
@@ -504,6 +885,18 @@ def _build_next_independent(optimized_modes, metadata, signal, settings):
         "ndv_after": len(active_mode_ids(next_modes)),
         "reduced_ndv_before": int(current_reduced),
         "reduced_ndv_after": int(reduced_after),
+        "n_design_before": int(n_design_before),
+        "n_design_after": int(n_design_after),
+        "n_added_design": int(n_added_design),
+        "n_frozen": int(_count_frozen_modes(next_modes)),
+        "n_geometric_total": int(len(_active_modes(next_modes))),
+        "active_budget_reallocation": reallocation_masks is not None,
+        "reallocation_rel_improvement": settings.get("_reallocation_rel_improvement"),
+        "reallocation_forced_design_add_count": int(
+            settings.get("_reallocation_forced_design_add_count", 0)
+        ),
+        "reallocated_freeze_count": len(frozen_mode_ids),
+        "reallocated_frozen_mode_ids": frozen_mode_ids,
         "old_knot_vector": list(first["old_knot_vector"]),
         "new_knot_vector": list(first["new_knot_vector"]),
         "knot_vector_by_side": {

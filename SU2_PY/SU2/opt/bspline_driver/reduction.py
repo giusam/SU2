@@ -26,19 +26,26 @@ def _active_modes(mode_spec):
         if mode.get("active", True) is not False
     ]
 
+def _design_modes(mode_spec):
+    return [
+        mode
+        for mode in _active_modes(mode_spec)
+        if mode.get("frozen", False) is not True
+    ]
+
 def active_mode_ids(mode_spec):
-    return [str(mode["id"]) for mode in _active_modes(mode_spec)]
+    return [str(mode["id"]) for mode in _design_modes(mode_spec)]
 
 def active_coefficient_vector(mode_spec):
     return [
         _as_float(mode.get("coefficient", 0.0), f"mode {mode['id']} coefficient")
-        for mode in _active_modes(mode_spec)
+        for mode in _design_modes(mode_spec)
     ]
 
 def active_bounds(mode_spec, default_bounds=DEFAULT_BOUNDS):
     lower_default, upper_default = _validated_bounds(default_bounds, "default_bounds")
     bounds = []
-    for mode in _active_modes(mode_spec):
+    for mode in _design_modes(mode_spec):
         mode_bounds = mode.get("bounds")
         if mode_bounds is None:
             bounds.append((lower_default, upper_default))
@@ -120,7 +127,7 @@ def build_reduced_variables(mode_spec, coupling="NONE"):
             f"BSPLINE_SYMMETRY_COUPLING must be one of {ALLOWED_SYMMETRY_COUPLINGS}; got {coupling!r}"
         )
 
-    active_modes = _active_modes(mode_spec)
+    active_modes = _design_modes(mode_spec)
     if coupling == "NONE":
         return [
             ReducedVariable(
@@ -319,7 +326,7 @@ def reduced_step_limits_from_modes(mode_spec, reduced_variables, ratio):
     ratio = _as_float(ratio, "BSPLINE_LOCAL_STEP_LIMIT_RATIO")
     if ratio <= 0.0:
         raise BSplineSU2DriverError("BSPLINE_LOCAL_STEP_LIMIT_RATIO must be positive")
-    active_modes = _active_modes(mode_spec)
+    active_modes = _design_modes(mode_spec)
     limits = []
     for variable in reduced_variables:
         lengths = [mode_support_length(active_modes[int(index)]) for index in variable.mode_indices]
@@ -339,19 +346,19 @@ def _validated_bounds(bounds, name):
     return lower, upper
 
 def update_mode_coefficients(mode_spec, coefficients):
-    """Return a copy of mode_spec with active-mode coefficients replaced."""
+    """Return a copy of mode_spec with design-mode coefficients replaced."""
 
     spec = copy.deepcopy(validate_mode_spec(mode_spec))
     values = [_as_float(value, "coefficient") for value in coefficients]
-    active_count = len(_active_modes(spec))
-    if len(values) != active_count:
+    design_count = len(_design_modes(spec))
+    if len(values) != design_count:
         raise BSplineSU2DriverError(
-            f"expected {active_count} active coefficient(s), got {len(values)}"
+            f"expected {design_count} design coefficient(s), got {len(values)}"
         )
 
     index = 0
     for mode in spec.get("modes", []):
-        if mode.get("active", True) is False:
+        if mode.get("active", True) is False or mode.get("frozen", False) is True:
             continue
         mode["coefficient"] = values[index]
         index += 1

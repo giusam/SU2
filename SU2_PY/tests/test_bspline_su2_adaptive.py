@@ -1,4 +1,5 @@
 import csv
+import copy
 import json
 import math
 import sys
@@ -10,6 +11,7 @@ import numpy as np
 import pytest
 
 from SU2.opt.bspline_modes import clamped_basis_value, evaluate_all_modes
+from SU2.opt.bspline_driver.reduction import active_mode_ids
 from SU2.opt.bspline_su2_adaptive import (
     BSplineAdaptiveError,
     _boehm_insert_once,
@@ -1340,6 +1342,171 @@ def test_knot_insertion_growth_ratio_and_fixed_remain_supported(tmp_path):
     assert selected["reduced_ndv_after"] == selected["reduced_ndv_before"] + 1
 
 
+def test_active_budget_reallocation_freezes_existing_mode_after_boehm(tmp_path):
+    modes = tmp_path / "modes.json"
+    level_start = generate_initial_bspline_modes(
+        modes,
+        "AIRFOIL",
+        nper_side=4,
+        surface_mode="UPPER",
+        class_shape="none",
+    )
+    optimized = copy.deepcopy(level_start)
+    optimized["modes"][-1]["coefficient"] = 0.005
+    metadata = [
+        {"x_over_c": float(x_value), "side": "upper"}
+        for x_value in np.linspace(0.05, 0.95, 19)
+    ]
+    signal = [math.sin(5.0 * math.pi * row["x_over_c"]) for row in metadata]
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            active_budget_reallocation=True,
+            symmetry_coupling="NONE",
+            surface_mode="UPPER",
+            nfinal=4,
+            nadd_mode="FIXED",
+            fixed_nadd=1,
+            knot_insertions_per_refine="AUTO",
+            knot_score_mode="RESIDUAL_ENERGY",
+        )
+    )
+    settings = {
+        **settings,
+        "_active_budget_reallocation_current": True,
+        "_reallocation_forced_design_add_count": 1,
+        "_reallocation_freeze_count": 1,
+        "_reallocation_rel_improvement": 0.0,
+    }
+
+    next_modes, _rows, selected = build_next_knot_inserted_modes(
+        optimized,
+        metadata,
+        signal,
+        settings,
+        level_start_modes=level_start,
+    )
+
+    assert next_modes is not None
+    assert selected["active_budget_reallocation"] is True
+    assert selected["n_design_before"] == 4
+    assert selected["n_design_after"] == 4
+    assert selected["n_added_design"] == 1
+    assert selected["n_frozen"] == 1
+    assert selected["n_geometric_total"] == 5
+    assert len(active_mode_ids(next_modes)) == 4
+    frozen_modes = [
+        mode
+        for mode in next_modes["modes"]
+        if mode.get("frozen", False) is True
+    ]
+    assert len(frozen_modes) == 1
+    assert frozen_modes[0]["basis_index"] != 1
+    assert selected["reallocated_frozen_mode_ids"] == [frozen_modes[0]["id"]]
+
+
+def test_normal_refinement_after_reallocation_preserves_frozen_budget(tmp_path):
+    modes = tmp_path / "modes.json"
+    level_start = generate_initial_bspline_modes(
+        modes,
+        "AIRFOIL",
+        nper_side=4,
+        surface_mode="UPPER",
+        class_shape="none",
+    )
+    optimized = copy.deepcopy(level_start)
+    optimized["modes"][-1]["coefficient"] = 0.005
+    metadata = [
+        {"x_over_c": float(x_value), "side": "upper"}
+        for x_value in np.linspace(0.05, 0.95, 25)
+    ]
+    signal = [math.sin(7.0 * math.pi * row["x_over_c"]) for row in metadata]
+    reallocation_settings = validate_adaptive_options(
+        _minimal_settings(
+            active_budget_reallocation=True,
+            symmetry_coupling="NONE",
+            surface_mode="UPPER",
+            nfinal=4,
+            nadd_mode="FIXED",
+            fixed_nadd=1,
+            knot_insertions_per_refine="AUTO",
+            knot_score_mode="RESIDUAL_ENERGY",
+        )
+    )
+    reallocation_settings = {
+        **reallocation_settings,
+        "_active_budget_reallocation_current": True,
+        "_reallocation_forced_design_add_count": 1,
+        "_reallocation_freeze_count": 1,
+        "_reallocation_rel_improvement": 0.0,
+    }
+    reallocated_modes, _rows, reallocated = build_next_knot_inserted_modes(
+        optimized,
+        metadata,
+        signal,
+        reallocation_settings,
+        level_start_modes=level_start,
+    )
+    assert reallocated_modes is not None
+    assert reallocated["n_design_after"] == 4
+    assert reallocated["n_frozen"] == 1
+
+    frozen_before = {
+        str(mode["id"])
+        for mode in reallocated_modes["modes"]
+        if mode.get("active", True) is not False
+        and mode.get("frozen", False) is True
+    }
+    geometric_before = {
+        str(mode["id"])
+        for mode in reallocated_modes["modes"]
+        if mode.get("active", True) is not False
+    }
+    design_before = len(active_mode_ids(reallocated_modes))
+    normal_settings = validate_adaptive_options(
+        _minimal_settings(
+            active_budget_reallocation=True,
+            symmetry_coupling="NONE",
+            surface_mode="UPPER",
+            nfinal=design_before + 1,
+            nadd_mode="FIXED",
+            fixed_nadd=1,
+            knot_insertions_per_refine="AUTO",
+            knot_score_mode="RESIDUAL_ENERGY",
+        )
+    )
+
+    refined_modes, _normal_rows, normal = build_next_knot_inserted_modes(
+        reallocated_modes,
+        metadata,
+        signal,
+        normal_settings,
+    )
+
+    assert refined_modes is not None
+    assert normal["active_budget_reallocation"] is False
+    assert normal["n_design_before"] == design_before
+    assert normal["n_design_after"] == design_before + 1
+    assert normal["n_added_design"] == 1
+    assert normal["n_frozen"] == len(frozen_before)
+    assert normal["n_geometric_total"] == len(geometric_before) + 1
+
+    frozen_after = {
+        str(mode["id"])
+        for mode in refined_modes["modes"]
+        if mode.get("active", True) is not False
+        and mode.get("frozen", False) is True
+    }
+    geometric_after = {
+        str(mode["id"])
+        for mode in refined_modes["modes"]
+        if mode.get("active", True) is not False
+    }
+    newly_inserted_ids = geometric_after - geometric_before
+    assert frozen_after == frozen_before
+    assert len(newly_inserted_ids) == 1
+    assert not (newly_inserted_ids & frozen_after)
+
+
 def test_knot_span_depths_persist_between_refinements(tmp_path):
     modes = tmp_path / "modes.json"
     spec = generate_initial_bspline_modes(
@@ -1763,6 +1930,57 @@ def test_default_adaptive_sensitivity_weighting_is_nodal():
     settings = validate_adaptive_options(_minimal_settings())
     assert settings["sensitivity_weighting"] == "NODAL"
     assert settings["sensitivity_source"] == "DOT_AD_TRANSFER"
+
+
+def test_active_budget_reallocation_options_validate_and_map():
+    default = validate_adaptive_options(_minimal_settings())
+    assert default["active_budget_reallocation"] is False
+    assert default["reallocation_improvement_rel_tol"] == pytest.approx(0.10)
+    assert default["reallocation_count_mode"] == "LAST_ADDED"
+    assert default["reallocation_freeze_metric"] == "COEFF_DELTA"
+
+    enabled = validate_adaptive_options(
+        _minimal_settings(
+            active_budget_reallocation="YES",
+            symmetry_coupling="NONE",
+            reallocation_improvement_rel_tol=0.05,
+        )
+    )
+    assert enabled["active_budget_reallocation"] is True
+    assert enabled["reallocation_improvement_rel_tol"] == pytest.approx(0.05)
+
+    with pytest.raises(BSplineAdaptiveError, match="BSPLINE_REALLOCATION_COUNT_MODE"):
+        validate_adaptive_options(
+            _minimal_settings(
+                symmetry_coupling="NONE",
+                reallocation_count_mode="FIXED",
+            )
+        )
+    with pytest.raises(BSplineAdaptiveError, match="BSPLINE_REALLOCATION_FREEZE_METRIC"):
+        validate_adaptive_options(
+            _minimal_settings(
+                symmetry_coupling="NONE",
+                reallocation_freeze_metric="GRADIENT",
+            )
+        )
+    with pytest.raises(BSplineAdaptiveError, match="ACTIVE_BUDGET_REALLOCATION=YES"):
+        validate_adaptive_options(
+            _minimal_settings(
+                active_budget_reallocation=True,
+                symmetry_coupling="NORMAL_EQUAL",
+            )
+        )
+
+    options = adaptive_options_from_config(
+        {
+            "BSPLINE_ACTIVE_BUDGET_REALLOCATION": "YES",
+            "BSPLINE_REALLOCATION_IMPROVEMENT_REL_TOL": "0.03",
+            "BSPLINE_REALLOCATION_COUNT_MODE": "LAST_ADDED",
+            "BSPLINE_REALLOCATION_FREEZE_METRIC": "COEFF_DELTA",
+        }
+    )
+    assert options["active_budget_reallocation"] == "YES"
+    assert options["reallocation_improvement_rel_tol"] == "0.03"
 
 
 def test_gradient_guard_defaults_use_raw_norm_factor_100():

@@ -174,6 +174,8 @@ from SU2.opt.bspline_adaptive.scoring import (
 from SU2.opt.bspline_adaptive.settings import (
     ALLOWED_KNOT_SCORE_MODES,
     ALLOWED_NADD_MODES,
+    ALLOWED_REALLOCATION_COUNT_MODES,
+    ALLOWED_REALLOCATION_FREEZE_METRICS,
     ALLOWED_REFINE_MODES,
     ALLOWED_TRIGGERS,
     GLOBAL_MODE_KEYS,
@@ -460,6 +462,11 @@ def _build_arg_parser():
     parser.add_argument("--batch-size-max", type=int, default=1)
     parser.add_argument("--growth-ratio", type=float, default=2.0)
     parser.add_argument("--fixed-nadd", type=int, default=1)
+    parser.add_argument("--active-budget-reallocation", action="store_true", default=False)
+    parser.add_argument("--no-active-budget-reallocation", dest="active_budget_reallocation", action="store_false")
+    parser.add_argument("--reallocation-improvement-rel-tol", type=float, default=0.10)
+    parser.add_argument("--reallocation-count-mode", default="LAST_ADDED", choices=ALLOWED_REALLOCATION_COUNT_MODES)
+    parser.add_argument("--reallocation-freeze-metric", default="COEFF_DELTA", choices=ALLOWED_REALLOCATION_FREEZE_METRICS)
     parser.add_argument("--eval-layout", default="DSN", choices=ALLOWED_EVAL_LAYOUTS)
     parser.add_argument("--objective-adjoint", default="drag")
     parser.add_argument(

@@ -133,13 +133,19 @@ def _score_virtual_insertion(active_matrix, new_matrix, signal, regularization):
 # scoring point set (the geometry-transfer check still uses the full metadata).
 SCORING_CLOSURE_NODE_EPS = 1.0e-6
 
+def scoring_node_mask(metadata, eps=SCORING_CLOSURE_NODE_EPS):
+    mask = []
+    for row in metadata:
+        x_over_c = float(row["x_over_c"])
+        mask.append(not (x_over_c <= float(eps) or x_over_c >= 1.0 - float(eps)))
+    return np.asarray(mask, dtype=bool)
+
 def _drop_closure_nodes(metadata, signal, eps=SCORING_CLOSURE_NODE_EPS):
     signal = np.asarray(signal, dtype=float)
     kept_metadata = []
     kept_signal = []
-    for row, value in zip(metadata, signal):
-        x_over_c = float(row["x_over_c"])
-        if x_over_c <= float(eps) or x_over_c >= 1.0 - float(eps):
+    for keep, row, value in zip(scoring_node_mask(metadata, eps=eps), metadata, signal):
+        if not bool(keep):
             continue
         kept_metadata.append(row)
         kept_signal.append(float(value))
@@ -147,7 +153,12 @@ def _drop_closure_nodes(metadata, signal, eps=SCORING_CLOSURE_NODE_EPS):
 
 def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
     knot_score_mode = str(settings.get("knot_score_mode", "VIRTUAL_INSERTION")).upper()
-    metadata, signal = _drop_closure_nodes(metadata, signal)
+    mask = scoring_node_mask(metadata)
+    metadata = [row for keep, row in zip(mask, metadata) if bool(keep)]
+    signal = np.asarray(signal, dtype=float)[mask]
+    objective_signal = settings.get("_ikkt_objective_signal")
+    if objective_signal is not None:
+        objective_signal = np.asarray(objective_signal, dtype=float)[mask]
     spans = knot_insertion_spans(
         space.knot_vector,
         min_width=settings.get("knot_min_span_width", 1.0e-8),
@@ -178,7 +189,7 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
             rank = 0
             columns = 0
             condition = 0.0
-        elif knot_score_mode == "VIRTUAL_INSERTION":
+        elif knot_score_mode in ("VIRTUAL_INSERTION", "IKKT_VIRTUAL_INSERTION"):
             score, score_raw, rank, columns, condition = _score_virtual_insertion(
                 old_matrix,
                 new_matrix,
@@ -194,6 +205,28 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
         else:
             raise BSplineAdaptiveError(f"unsupported knot score mode {knot_score_mode!r}")
 
+        score_objective = ""
+        rank_objective = ""
+        objective_projection = ""
+        score_ikkt = ""
+        rank_ikkt = ""
+        lagrangian_projection = ""
+        if knot_score_mode == "IKKT_VIRTUAL_INSERTION":
+            score_ikkt = float(score)
+            lagrangian_projection = math.sqrt(float(score_raw)) if float(score_raw) >= 0.0 else 0.0
+            if objective_signal is not None:
+                obj_score, obj_raw, _obj_rank, _obj_columns, obj_condition = _score_virtual_insertion(
+                    old_matrix,
+                    new_matrix,
+                    objective_signal,
+                    regularization,
+                )
+                if not math.isfinite(obj_condition) or obj_condition > 1.0e14:
+                    obj_score = 0.0
+                    obj_raw = 0.0
+                score_objective = float(obj_score)
+                objective_projection = math.sqrt(float(obj_raw)) if float(obj_raw) >= 0.0 else 0.0
+
         rows.append(
             {
                 "batch_step": "",
@@ -206,6 +239,12 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
                 "score": float(score),
                 "score_raw": float(score_raw),
                 "residual_energy": float(residual_energy),
+                "score_objective": score_objective,
+                "score_ikkt": score_ikkt,
+                "rank_objective": rank_objective,
+                "rank_ikkt": rank_ikkt,
+                "objective_projection": objective_projection,
+                "lagrangian_projection": lagrangian_projection,
                 "incremental_rank": rank,
                 "incremental_columns": columns,
                 "condition_number": condition,
@@ -217,6 +256,23 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
     rows.sort(key=lambda row: (-float(row["score"]), float(row["span_left"]), float(row["span_right"])))
     for rank, row in enumerate(rows, start=1):
         row["rank"] = rank
+        if knot_score_mode == "IKKT_VIRTUAL_INSERTION":
+            row["rank_ikkt"] = rank
+    if knot_score_mode == "IKKT_VIRTUAL_INSERTION":
+        objective_rows = [
+            row for row in rows
+            if row.get("score_objective", "") != ""
+            and math.isfinite(float(row.get("score_objective", 0.0)))
+        ]
+        objective_rows.sort(
+            key=lambda row: (
+                -float(row["score_objective"]),
+                float(row["span_left"]),
+                float(row["span_right"]),
+            )
+        )
+        for rank, row in enumerate(objective_rows, start=1):
+            row["rank_objective"] = rank
     if rows and float(rows[0]["score"]) > 0.0 and math.isfinite(float(rows[0]["score"])):
         rows[0]["selected"] = True
     return rows

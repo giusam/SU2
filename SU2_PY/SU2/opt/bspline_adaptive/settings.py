@@ -52,7 +52,11 @@ ALLOWED_REALLOCATION_FREEZE_METRICS = ("COEFF_DELTA",)
 
 ALLOWED_REFINE_MODES = ("KNOT_INSERTION",)
 
-ALLOWED_KNOT_SCORE_MODES = ("VIRTUAL_INSERTION", "RESIDUAL_ENERGY")
+ALLOWED_KNOT_SCORE_MODES = (
+    "VIRTUAL_INSERTION",
+    "RESIDUAL_ENERGY",
+    "IKKT_VIRTUAL_INSERTION",
+)
 
 ALLOWED_REFINE_SIDE_COUPLINGS = ("COUPLED", "INDEPENDENT")
 
@@ -107,6 +111,12 @@ KNOT_SCORE_FIELDNAMES = [
     "batch_penalty",
     "batch_penalty_mode",
     "residual_energy",
+    "score_objective",
+    "score_ikkt",
+    "rank_objective",
+    "rank_ikkt",
+    "objective_projection",
+    "lagrangian_projection",
     "incremental_rank",
     "incremental_columns",
     "condition_number",
@@ -185,6 +195,46 @@ def validate_adaptive_options(opts):
     if opts["knot_score_mode"] not in ALLOWED_KNOT_SCORE_MODES:
         raise BSplineAdaptiveError(
             f"unsupported knot score mode {opts['knot_score_mode']!r}; allowed values are {ALLOWED_KNOT_SCORE_MODES}"
+        )
+    ikkt_mode = opts["knot_score_mode"] == "IKKT_VIRTUAL_INSERTION"
+    opts["ikkt_include_geometry_constraints"] = _as_bool(
+        opts.get("ikkt_include_geometry_constraints", True),
+        default=True,
+    )
+    opts["ikkt_include_aero_constraints"] = _as_bool(
+        opts.get("ikkt_include_aero_constraints", False),
+        default=False,
+    )
+    opts["ikkt_require_available_fields"] = _as_bool(
+        opts.get("ikkt_require_available_fields", True),
+        default=True,
+    )
+    default_scaling = "PHYSICAL" if ikkt_mode else "DRIVER"
+    opts["ikkt_scaling_mode"] = str(
+        opts.get("ikkt_scaling_mode", default_scaling) or default_scaling
+    ).strip().upper()
+    if opts["ikkt_scaling_mode"] not in ("PHYSICAL", "DRIVER"):
+        raise BSplineAdaptiveError(
+            "BSPLINE_IKKT_SCALING_MODE must be PHYSICAL or DRIVER"
+        )
+    default_sign = "SLSQP_GE_RAW" if ikkt_mode else "HH_RAW"
+    opts["ikkt_sign_convention"] = str(
+        opts.get("ikkt_sign_convention", default_sign) or default_sign
+    ).strip().upper()
+    if opts["ikkt_sign_convention"] not in ("SLSQP_GE_RAW", "HH_RAW"):
+        raise BSplineAdaptiveError(
+            "BSPLINE_IKKT_SIGN_CONVENTION must be SLSQP_GE_RAW or HH_RAW"
+        )
+    thickness_active_tol = opts.get("ikkt_geom_thickness_active_tol", 1.0e-4)
+    if thickness_active_tol is None:
+        thickness_active_tol = 1.0e-4
+    opts["ikkt_geom_thickness_active_tol"] = _as_float(
+        thickness_active_tol,
+        "BSPLINE_IKKT_GEOM_THICKNESS_ACTIVE_TOL",
+    )
+    if opts["ikkt_geom_thickness_active_tol"] < 0.0:
+        raise BSplineAdaptiveError(
+            "BSPLINE_IKKT_GEOM_THICKNESS_ACTIVE_TOL must be non-negative"
         )
     mode = _normalize_knot_depth_penalty_mode(
         opts.get(
@@ -701,6 +751,12 @@ def adaptive_options_from_config(config_values):
         "BSPLINE_SENSITIVITY_WEIGHTING": "sensitivity_weighting",
         "BSPLINE_SENSITIVITY_SOURCE": "sensitivity_source",
         "BSPLINE_KNOT_SCORE_MODE": "knot_score_mode",
+        "BSPLINE_IKKT_INCLUDE_GEOMETRY_CONSTRAINTS": "ikkt_include_geometry_constraints",
+        "BSPLINE_IKKT_INCLUDE_AERO_CONSTRAINTS": "ikkt_include_aero_constraints",
+        "BSPLINE_IKKT_REQUIRE_AVAILABLE_FIELDS": "ikkt_require_available_fields",
+        "BSPLINE_IKKT_SCALING_MODE": "ikkt_scaling_mode",
+        "BSPLINE_IKKT_SIGN_CONVENTION": "ikkt_sign_convention",
+        "BSPLINE_IKKT_GEOM_THICKNESS_ACTIVE_TOL": "ikkt_geom_thickness_active_tol",
         "BSPLINE_KNOT_INSERTIONS_PER_REFINE": "knot_insertions_per_refine",
         "BSPLINE_KNOT_MIN_SPAN_WIDTH": "knot_min_span_width",
         "BSPLINE_KNOT_DEPTH_PENALTY": "knot_depth_penalty",
@@ -1175,6 +1231,17 @@ def print_startup_summary(settings):
         f"{settings.get('sensitivity_source', 'DOT_AD_TRANSFER')}"
     )
     print("[PROGRESSIVE_BSPLINE] refinement: KNOT_INSERTION")
+    if str(settings.get("knot_score_mode", "")).upper() == "IKKT_VIRTUAL_INSERTION":
+        print(
+            "[PROGRESSIVE_BSPLINE] IKKT score: geometry={} aero={} require_fields={} scaling={} sign={} thickness_active_tol={}".format(
+                "YES" if settings.get("ikkt_include_geometry_constraints", True) else "NO",
+                "YES" if settings.get("ikkt_include_aero_constraints", False) else "NO",
+                "YES" if settings.get("ikkt_require_available_fields", True) else "NO",
+                settings.get("ikkt_scaling_mode", "PHYSICAL"),
+                settings.get("ikkt_sign_convention", "SLSQP_GE_RAW"),
+                settings.get("ikkt_geom_thickness_active_tol", 1.0e-4),
+            )
+        )
     print(
         "[PROGRESSIVE_BSPLINE] KNOT_DEPTH penalty={} mode={} gamma={} initial_depth={}".format(
             "YES" if settings.get("knot_depth_penalty", False) else "NO",
@@ -1273,6 +1340,28 @@ def _settings_from_args(args):
         "refine_mode": args.refine_mode,
         "refine_state": args.refine_state,
         "knot_score_mode": args.knot_score_mode,
+        "ikkt_include_geometry_constraints": getattr(
+            args,
+            "ikkt_include_geometry_constraints",
+            None,
+        ),
+        "ikkt_include_aero_constraints": getattr(
+            args,
+            "ikkt_include_aero_constraints",
+            None,
+        ),
+        "ikkt_require_available_fields": getattr(
+            args,
+            "ikkt_require_available_fields",
+            None,
+        ),
+        "ikkt_scaling_mode": getattr(args, "ikkt_scaling_mode", None),
+        "ikkt_sign_convention": getattr(args, "ikkt_sign_convention", None),
+        "ikkt_geom_thickness_active_tol": getattr(
+            args,
+            "ikkt_geom_thickness_active_tol",
+            None,
+        ),
         "knot_insertions_per_refine": args.knot_insertions_per_refine,
         "knot_min_span_width": args.knot_min_span_width,
         "knot_depth_penalty": getattr(args, "knot_depth_penalty", False),

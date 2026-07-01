@@ -31,6 +31,7 @@ from .history import (
     write_knot_span_scores_csv,
     write_selected_knot_refinement_json,
 )
+from .ikkt import build_ikkt_score_signal, write_ikkt_diagnostics
 from .knot_space import refinement_limit_ndv
 from .mode_utils import (
     build_level,
@@ -458,6 +459,27 @@ def progressive_bspline_su2_shape_optimization(settings):
                 adjoint_eval_dir / "bspline_surface_metadata.csv",
             )
             refinement_settings = settings
+            if str(settings.get("knot_score_mode", "VIRTUAL_INSERTION")).upper() == "IKKT_VIRTUAL_INSERTION":
+                objective_signal = signal
+                signal, ikkt_diagnostics = build_ikkt_score_signal(
+                    optimized_modes,
+                    metadata,
+                    objective_signal,
+                    settings,
+                )
+                ikkt_file = level.workdir / f"ikkt_score_signal_level_{level_id:03d}.json"
+                write_ikkt_diagnostics(ikkt_file, ikkt_diagnostics)
+                refinement_settings = dict(settings)
+                refinement_settings["_ikkt_objective_signal"] = objective_signal
+                print(
+                    "[PROGRESSIVE_BSPLINE] IKKT_VIRTUAL_INSERTION signal | "
+                    "constraints={} residual_norm={:.6e} rel={:.6e} diagnostics={}".format(
+                        len(ikkt_diagnostics.get("included_constraints", [])),
+                        float(ikkt_diagnostics.get("lagrangian_residual_norm", 0.0)),
+                        float(ikkt_diagnostics.get("relative_lagrangian_residual_norm", 0.0)),
+                        ikkt_file.name,
+                    )
+                )
             rel_improvement = None
             if settings.get("active_budget_reallocation", False):
                 rel_improvement = _relative_level_improvement(
@@ -503,7 +525,7 @@ def progressive_bspline_su2_shape_optimization(settings):
                                         int(k_eff),
                                     )
                                 )
-                            refinement_settings = dict(settings)
+                            refinement_settings = dict(refinement_settings)
                             refinement_settings["_active_budget_reallocation_current"] = True
                             refinement_settings["_reallocation_forced_design_add_count"] = int(k_eff)
                             refinement_settings["_reallocation_freeze_count"] = int(k_eff)

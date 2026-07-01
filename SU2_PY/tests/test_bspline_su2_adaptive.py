@@ -1935,6 +1935,42 @@ def test_default_adaptive_sensitivity_weighting_is_nodal():
     assert settings["sensitivity_source"] == "DOT_AD_TRANSFER"
 
 
+def test_ikkt_knot_score_options_validate_and_map():
+    default = validate_adaptive_options(_minimal_settings())
+    assert default["knot_score_mode"] == "VIRTUAL_INSERTION"
+    assert default["ikkt_include_geometry_constraints"] is True
+    assert default["ikkt_include_aero_constraints"] is False
+    assert default["ikkt_require_available_fields"] is True
+    assert default["ikkt_scaling_mode"] == "DRIVER"
+    assert default["ikkt_sign_convention"] == "HH_RAW"
+    assert default["ikkt_geom_thickness_active_tol"] == pytest.approx(1.0e-4)
+
+    enabled = validate_adaptive_options(
+        _minimal_settings(knot_score_mode="IKKT_VIRTUAL_INSERTION")
+    )
+    assert enabled["ikkt_scaling_mode"] == "PHYSICAL"
+    assert enabled["ikkt_sign_convention"] == "SLSQP_GE_RAW"
+
+    options = adaptive_options_from_config(
+        {
+            "BSPLINE_KNOT_SCORE_MODE": "IKKT_VIRTUAL_INSERTION",
+            "BSPLINE_IKKT_INCLUDE_GEOMETRY_CONSTRAINTS": "YES",
+            "BSPLINE_IKKT_INCLUDE_AERO_CONSTRAINTS": "NO",
+            "BSPLINE_IKKT_REQUIRE_AVAILABLE_FIELDS": "YES",
+            "BSPLINE_IKKT_SCALING_MODE": "PHYSICAL",
+            "BSPLINE_IKKT_SIGN_CONVENTION": "SLSQP_GE_RAW",
+            "BSPLINE_IKKT_GEOM_THICKNESS_ACTIVE_TOL": "5e-4",
+        }
+    )
+    assert options["knot_score_mode"] == "IKKT_VIRTUAL_INSERTION"
+    assert options["ikkt_include_geometry_constraints"] == "YES"
+    assert options["ikkt_include_aero_constraints"] == "NO"
+    assert options["ikkt_require_available_fields"] == "YES"
+    assert options["ikkt_scaling_mode"] == "PHYSICAL"
+    assert options["ikkt_sign_convention"] == "SLSQP_GE_RAW"
+    assert options["ikkt_geom_thickness_active_tol"] == "5e-4"
+
+
 def test_active_budget_reallocation_options_validate_and_map():
     default = validate_adaptive_options(_minimal_settings())
     assert default["active_budget_reallocation"] is False

@@ -2216,6 +2216,73 @@ def test_bspline_thickness_slsqp_jacobian_scales_by_relax_and_beta(tmp_path):
     )
 
 
+def test_bspline_thickness_logging_writes_station_values(tmp_path):
+    driver = _make_driver(tmp_path, spec=_single_mode_spec())
+    driver.thickness_constraint = _synthetic_thickness_constraint()
+    eval_dir = tmp_path / "run" / "eval_0000"
+
+    driver._append_history_record(
+        0,
+        1.0,
+        [-0.004],
+        [0.0],
+        "ok",
+        eval_dir=eval_dir,
+        eval_index=1,
+    )
+
+    values_file = eval_dir / "thickness_constraint" / "values.csv"
+    metadata_file = eval_dir / "thickness_constraint" / "metadata.json"
+    with values_file.open("r", newline="") as fp:
+        rows = list(csv.DictReader(fp))
+    metadata = json.loads(metadata_file.read_text())
+
+    assert len(rows) == 1
+    assert float(rows[0]["x"]) == pytest.approx(0.5)
+    assert float(rows[0]["current_measure"]) == pytest.approx(0.196)
+    assert float(rows[0]["reference_measure"]) == pytest.approx(0.2)
+    assert float(rows[0]["constraint_value"]) == pytest.approx(-0.004)
+    assert rows[0]["active"] == "1"
+    assert metadata["values_written"] is True
+    assert metadata["gradient_mode_used"] == "NOT_EVALUATED"
+
+
+def test_bspline_thickness_logging_writes_slsqp_jacobian(tmp_path):
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        opt_relax_factor=1000.0,
+    )
+    driver.thickness_constraint = _synthetic_thickness_constraint()
+    constraint = driver._thickness_constraint_functions()[0]
+    variables = driver.physical_to_optimizer([-0.004])
+
+    jacobian = constraint["jac"](variables)
+    eval_dir = tmp_path / "run" / "eval_0001"
+    driver._append_history_record(
+        1,
+        1.0,
+        [-0.004],
+        [0.0],
+        "ok",
+        eval_dir=eval_dir,
+        eval_index=1,
+    )
+
+    jacobian_file = eval_dir / "thickness_constraint" / "jacobian.csv"
+    metadata_file = eval_dir / "thickness_constraint" / "metadata.json"
+    with jacobian_file.open("r", newline="") as fp:
+        rows = list(csv.DictReader(fp))
+    metadata = json.loads(metadata_file.read_text())
+    field = f"dg_d_{driver.reduced_variable_ids[0]}"
+
+    assert len(rows) == 1
+    assert float(rows[0][field]) == pytest.approx(float(jacobian[0, 0]))
+    assert metadata["jacobian_written"] is True
+    assert metadata["gradient_mode_used"] == "ANALYTIC"
+    assert metadata["variable_space"] == "slsqp_reduced"
+
+
 def test_bspline_thickness_constraint_uses_line_search_limited_coefficients(
     tmp_path,
 ):

@@ -1094,6 +1094,9 @@ def test_single_cfg_launch_generates_modes_and_templates_relative_to_cfg(tmp_pat
     assert Path(settings["def_template"]) == workdir / "templates" / "def_template_auto.cfg"
     assert Path(settings["primal_template"]) == workdir / "templates" / "primal_template_auto.cfg"
     assert Path(settings["adjoint_template"]) == workdir / "templates" / "adjoint_template_auto.cfg"
+    full_config = workdir / "templates" / "optimizer_config_full.cfg"
+    assert Path(settings["optimizer_config_full_template"]) == full_config
+    assert full_config.read_text() == cfg.read_text()
     assert settings["base_mesh"] == str((tmp_path / "mesh.su2").resolve())
     assert settings["marker"] == "AIRFOIL"
     assert settings["mpi"] == "mpirun -n 8"

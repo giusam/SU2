@@ -501,6 +501,8 @@ class BSplineSU2Driver:
         )
         self._trust_clip_by_requested_key = {}
         self.last_trust_clip_stop = None
+        self._pending_thickness_jacobian_logs = {}
+        self._thickness_logging_warned = False
         self._slsqp_major_iter = 0
         self._run_eval_count = 0
         self._printed_commands_log_path = False
@@ -851,6 +853,238 @@ class BSplineSU2Driver:
             "thickness_constraint_active": 1 if min_value <= 1.0e-10 else 0,
         }
 
+    def _warn_thickness_logging_failure(self, message):
+        if self._thickness_logging_warned:
+            return
+        print(
+            "[BSPLINE_SU2_DRIVER] WARNING: "
+            f"thickness constraint logging failed: {message}"
+        )
+        self._thickness_logging_warned = True
+
+    def _thickness_log_dir(self, eval_dir):
+        if eval_dir is None:
+            return None
+        return Path(eval_dir) / "thickness_constraint"
+
+    def _write_thickness_metadata(
+        self,
+        log_dir,
+        *,
+        line_search_info=None,
+        gradient_mode_used=None,
+        values_written=None,
+        jacobian_written=None,
+    ):
+        if self.thickness_constraint is None or log_dir is None:
+            return
+        log_dir = Path(log_dir)
+        metadata_file = log_dir / "metadata.json"
+        metadata = {}
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, "r") as fp:
+                    existing = json.load(fp)
+                if isinstance(existing, dict):
+                    metadata.update(existing)
+            except Exception:
+                metadata = {}
+
+        info = {
+            **self._line_search_default_info(),
+            **(line_search_info or {}),
+        }
+        metadata.update(
+            {
+                "domain_mode": self.thickness_constraint.domain_mode,
+                "gradient_mode_requested": self.thickness_constraint.gradient_mode,
+                "gradient_mode_used": (
+                    gradient_mode_used
+                    if gradient_mode_used is not None
+                    else metadata.get("gradient_mode_used", "NOT_EVALUATED")
+                ),
+                "line_search_beta": float(info.get("line_search_beta", 1.0)),
+                "local_step_beta": float(info.get("local_step_beta", 1.0)),
+                "variable_space": "slsqp_reduced",
+                "n_stations": int(len(self.thickness_constraint.x_stations)),
+                "mode_ids": list(self.mode_ids),
+                "design_variable_ids": list(self.reduced_variable_ids),
+            }
+        )
+        if values_written is not None:
+            metadata["values_written"] = bool(values_written)
+        if jacobian_written is not None:
+            metadata["jacobian_written"] = bool(jacobian_written)
+
+        with open(metadata_file, "w") as fp:
+            json.dump(metadata, fp, indent=2, sort_keys=True)
+            fp.write("\n")
+
+    def _write_thickness_values_log(self, eval_dir, coefficients, line_search_info=None):
+        if self.thickness_constraint is None or eval_dir is None:
+            return
+        try:
+            log_dir = self._thickness_log_dir(eval_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            current = np.asarray(
+                self.thickness_constraint.section_measure(coefficients),
+                dtype=float,
+            )
+            reference = np.asarray(
+                self.thickness_constraint.reference_measure,
+                dtype=float,
+            )
+            x_stations = np.asarray(
+                self.thickness_constraint.x_stations,
+                dtype=float,
+            )
+            if not (
+                len(current) == len(reference) == len(x_stations)
+            ):
+                raise BSplineSU2DriverError(
+                    "thickness diagnostic row count mismatch"
+                )
+            margin = float(self.thickness_constraint.margin)
+            with open(log_dir / "values.csv", "w", newline="") as fp:
+                fieldnames = [
+                    "station_id",
+                    "x",
+                    "current_measure",
+                    "reference_measure",
+                    "margin",
+                    "constraint_value",
+                    "active",
+                ]
+                writer = csv.DictWriter(fp, fieldnames=fieldnames)
+                writer.writeheader()
+                for station_id, (x_value, current_value, reference_value) in enumerate(
+                    zip(x_stations, current, reference)
+                ):
+                    constraint_value = (
+                        float(current_value) - float(reference_value) - margin
+                    )
+                    writer.writerow(
+                        {
+                            "station_id": station_id,
+                            "x": _format_config_atom(float(x_value)),
+                            "current_measure": _format_config_atom(
+                                float(current_value)
+                            ),
+                            "reference_measure": _format_config_atom(
+                                float(reference_value)
+                            ),
+                            "margin": _format_config_atom(margin),
+                            "constraint_value": _format_config_atom(
+                                constraint_value
+                            ),
+                            "active": 1 if constraint_value <= 1.0e-10 else 0,
+                        }
+                    )
+            self._write_thickness_metadata(
+                log_dir,
+                line_search_info=line_search_info,
+                values_written=True,
+            )
+        except Exception as exc:
+            self._warn_thickness_logging_failure(exc)
+
+    def _write_thickness_jacobian_log(
+        self,
+        eval_dir,
+        jacobian,
+        line_search_info=None,
+        gradient_mode_used=None,
+    ):
+        if self.thickness_constraint is None or eval_dir is None:
+            return
+        try:
+            log_dir = self._thickness_log_dir(eval_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            jacobian = np.asarray(jacobian, dtype=float)
+            expected_shape = (
+                len(self.thickness_constraint.x_stations),
+                len(self.reduced_variable_ids),
+            )
+            if jacobian.shape != expected_shape:
+                raise BSplineSU2DriverError(
+                    "thickness jacobian diagnostic shape mismatch: "
+                    f"expected {expected_shape}, got {jacobian.shape}"
+                )
+
+            fieldnames = ["station_id", "x"] + [
+                f"dg_d_{variable_id}"
+                for variable_id in self.reduced_variable_ids
+            ]
+            with open(log_dir / "jacobian.csv", "w", newline="") as fp:
+                writer = csv.DictWriter(fp, fieldnames=fieldnames)
+                writer.writeheader()
+                for station_id, x_value in enumerate(
+                    self.thickness_constraint.x_stations
+                ):
+                    row = {
+                        "station_id": station_id,
+                        "x": _format_config_atom(float(x_value)),
+                    }
+                    for variable_id, value in zip(
+                        self.reduced_variable_ids,
+                        jacobian[station_id, :],
+                    ):
+                        row[f"dg_d_{variable_id}"] = _format_config_atom(
+                            float(value)
+                        )
+                    writer.writerow(row)
+            self._write_thickness_metadata(
+                log_dir,
+                line_search_info=line_search_info,
+                gradient_mode_used=gradient_mode_used,
+                jacobian_written=True,
+            )
+        except Exception as exc:
+            self._warn_thickness_logging_failure(exc)
+
+    def _record_thickness_jacobian_log(
+        self,
+        coefficients,
+        jacobian,
+        line_search_info=None,
+        gradient_mode_used=None,
+    ):
+        if self.thickness_constraint is None:
+            return
+        key = cache_key(coefficients, self.cache_tol)
+        record = self._design_points.get(key)
+        if record is not None and record.get("eval_dir") is not None:
+            self._write_thickness_jacobian_log(
+                record["eval_dir"],
+                jacobian,
+                line_search_info=line_search_info,
+                gradient_mode_used=gradient_mode_used,
+            )
+            return
+        self._pending_thickness_jacobian_logs[key] = {
+            "jacobian": np.asarray(jacobian, dtype=float).tolist(),
+            "line_search_info": dict(line_search_info or {}),
+            "gradient_mode_used": gradient_mode_used,
+        }
+
+    def _flush_pending_thickness_jacobian_log(
+        self,
+        coefficients,
+        eval_dir,
+    ):
+        if self.thickness_constraint is None or eval_dir is None:
+            return
+        key = cache_key(coefficients, self.cache_tol)
+        pending = self._pending_thickness_jacobian_logs.pop(key, None)
+        if pending is None:
+            return
+        self._write_thickness_jacobian_log(
+            eval_dir,
+            pending["jacobian"],
+            line_search_info=pending.get("line_search_info"),
+            gradient_mode_used=pending.get("gradient_mode_used"),
+        )
+
     def _thickness_constraint_functions(self):
         if self.thickness_constraint is None:
             return []
@@ -864,7 +1098,17 @@ class BSplineSU2Driver:
         def thickness_jac(variables):
             variables = np.asarray(variables, dtype=float)
             if self.thickness_constraint.gradient_mode == "FINITE_DIFFERENCE":
-                return self._thickness_jacobian_fd_optimizer(variables, thickness_fun)
+                reduced_trial = self.optimizer_to_physical(variables)
+                physical_trial = self.expand_reduced_physical(reduced_trial)
+                physical_eval, info = self._apply_line_search_bound(physical_trial)
+                jac_fd = self._thickness_jacobian_fd_optimizer(variables, thickness_fun)
+                self._record_thickness_jacobian_log(
+                    physical_eval,
+                    jac_fd,
+                    line_search_info=info,
+                    gradient_mode_used="FINITE_DIFFERENCE",
+                )
+                return jac_fd
 
             reduced_trial = self.optimizer_to_physical(variables)
             physical_trial = self.expand_reduced_physical(reduced_trial)
@@ -881,9 +1125,25 @@ class BSplineSU2Driver:
                         f"falling back to finite differences ({exc})"
                     )
                     self._thickness_fallback_warned = True
-                return self._thickness_jacobian_fd_optimizer(variables, thickness_fun)
+                jac_fd = self._thickness_jacobian_fd_optimizer(variables, thickness_fun)
+                self._record_thickness_jacobian_log(
+                    physical_eval,
+                    jac_fd,
+                    line_search_info=info,
+                    gradient_mode_used="FINITE_DIFFERENCE_FALLBACK",
+                )
+                return jac_fd
             jac_p = self.collapse_jacobian_to_reduced(jac_a)
-            return np.asarray(jac_p, dtype=float) * self.opt_relax_factor * beta
+            jac_optimizer = (
+                np.asarray(jac_p, dtype=float) * self.opt_relax_factor * beta
+            )
+            self._record_thickness_jacobian_log(
+                physical_eval,
+                jac_optimizer,
+                line_search_info=info,
+                gradient_mode_used="ANALYTIC",
+            )
+            return jac_optimizer
 
         return [{"type": "ineq", "fun": thickness_fun, "jac": thickness_jac}]
 
@@ -2169,6 +2429,15 @@ class BSplineSU2Driver:
             except Exception:
                 record["min_thickness_constraint"] = ""
                 record["thickness_constraint_active"] = ""
+            self._write_thickness_values_log(
+                eval_dir,
+                coefficients,
+                line_search_info=line_search_info,
+            )
+            self._flush_pending_thickness_jacobian_log(
+                coefficients,
+                eval_dir,
+            )
         for mode_id, coefficient in zip(self.mode_ids, coefficients):
             record[f"coeff__{mode_id}"] = coefficient
         if self.symmetry_coupling != "NONE":

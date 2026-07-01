@@ -1,5 +1,6 @@
 """Settings, config parsing, and startup helpers for adaptive B-splines."""
 
+import shutil
 from pathlib import Path
 
 
@@ -957,6 +958,25 @@ def _write_case_template(case_config, filename, forced):
         fp.write("\n".join(lines).rstrip())
         fp.write("\n")
 
+def _copy_optimizer_config_snapshot(case_config, template_dir):
+    if not case_config:
+        return None
+    try:
+        source = Path(case_config).resolve()
+        if not source.exists():
+            return None
+        destination = Path(template_dir) / "optimizer_config_full.cfg"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source != destination.resolve():
+            shutil.copy2(source, destination)
+        return destination
+    except Exception as exc:
+        print(
+            "[PROGRESSIVE_BSPLINE] WARNING: "
+            f"could not copy full optimizer config into templates ({exc})"
+        )
+        return None
+
 def generate_missing_templates(settings):
     workdir = Path(settings["workdir"])
     template_dir = workdir / "templates"
@@ -964,6 +984,9 @@ def generate_missing_templates(settings):
     base_mesh = settings["base_mesh"]
     marker = settings["marker"]
     case_config = settings.get("case_config") or settings.get("optimizer_config")
+    snapshot = _copy_optimizer_config_snapshot(case_config, template_dir)
+    if snapshot is not None:
+        settings["optimizer_config_full_template"] = str(snapshot.resolve())
 
     if not settings.get("def_template"):
         if not case_config:

@@ -225,6 +225,15 @@ def validate_adaptive_options(opts):
         raise BSplineAdaptiveError(
             "BSPLINE_IKKT_SIGN_CONVENTION must be SLSQP_GE_RAW or HH_RAW"
         )
+    active_tol = opts.get("ikkt_active_tol", 1.0e-6)
+    if active_tol is None:
+        active_tol = 1.0e-6
+    opts["ikkt_active_tol"] = _as_float(
+        active_tol,
+        "BSPLINE_IKKT_ACTIVE_TOL",
+    )
+    if opts["ikkt_active_tol"] < 0.0:
+        raise BSplineAdaptiveError("BSPLINE_IKKT_ACTIVE_TOL must be non-negative")
     thickness_active_tol = opts.get("ikkt_geom_thickness_active_tol", 1.0e-4)
     if thickness_active_tol is None:
         thickness_active_tol = 1.0e-4
@@ -754,6 +763,7 @@ def adaptive_options_from_config(config_values):
         "BSPLINE_IKKT_INCLUDE_GEOMETRY_CONSTRAINTS": "ikkt_include_geometry_constraints",
         "BSPLINE_IKKT_INCLUDE_AERO_CONSTRAINTS": "ikkt_include_aero_constraints",
         "BSPLINE_IKKT_REQUIRE_AVAILABLE_FIELDS": "ikkt_require_available_fields",
+        "BSPLINE_IKKT_ACTIVE_TOL": "ikkt_active_tol",
         "BSPLINE_IKKT_SCALING_MODE": "ikkt_scaling_mode",
         "BSPLINE_IKKT_SIGN_CONVENTION": "ikkt_sign_convention",
         "BSPLINE_IKKT_GEOM_THICKNESS_ACTIVE_TOL": "ikkt_geom_thickness_active_tol",
@@ -1357,6 +1367,7 @@ def _settings_from_args(args):
         ),
         "ikkt_scaling_mode": getattr(args, "ikkt_scaling_mode", None),
         "ikkt_sign_convention": getattr(args, "ikkt_sign_convention", None),
+        "ikkt_active_tol": getattr(args, "ikkt_active_tol", None),
         "ikkt_geom_thickness_active_tol": getattr(
             args,
             "ikkt_geom_thickness_active_tol",

@@ -1943,6 +1943,7 @@ def test_ikkt_knot_score_options_validate_and_map():
     assert default["ikkt_require_available_fields"] is True
     assert default["ikkt_scaling_mode"] == "DRIVER"
     assert default["ikkt_sign_convention"] == "HH_RAW"
+    assert default["ikkt_active_tol"] == pytest.approx(1.0e-6)
     assert default["ikkt_geom_thickness_active_tol"] == pytest.approx(1.0e-4)
 
     enabled = validate_adaptive_options(
@@ -1957,6 +1958,7 @@ def test_ikkt_knot_score_options_validate_and_map():
             "BSPLINE_IKKT_INCLUDE_GEOMETRY_CONSTRAINTS": "YES",
             "BSPLINE_IKKT_INCLUDE_AERO_CONSTRAINTS": "NO",
             "BSPLINE_IKKT_REQUIRE_AVAILABLE_FIELDS": "YES",
+            "BSPLINE_IKKT_ACTIVE_TOL": "2e-6",
             "BSPLINE_IKKT_SCALING_MODE": "PHYSICAL",
             "BSPLINE_IKKT_SIGN_CONVENTION": "SLSQP_GE_RAW",
             "BSPLINE_IKKT_GEOM_THICKNESS_ACTIVE_TOL": "5e-4",
@@ -1966,6 +1968,7 @@ def test_ikkt_knot_score_options_validate_and_map():
     assert options["ikkt_include_geometry_constraints"] == "YES"
     assert options["ikkt_include_aero_constraints"] == "NO"
     assert options["ikkt_require_available_fields"] == "YES"
+    assert options["ikkt_active_tol"] == "2e-6"
     assert options["ikkt_scaling_mode"] == "PHYSICAL"
     assert options["ikkt_sign_convention"] == "SLSQP_GE_RAW"
     assert options["ikkt_geom_thickness_active_tol"] == "5e-4"

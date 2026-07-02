@@ -452,6 +452,7 @@ def _build_arg_parser():
     parser.add_argument("--no-ikkt-require-available-fields", dest="ikkt_require_available_fields", action="store_false")
     parser.add_argument("--ikkt-scaling-mode", default=None, choices=("PHYSICAL", "DRIVER"))
     parser.add_argument("--ikkt-sign-convention", default=None, choices=("SLSQP_GE_RAW", "HH_RAW"))
+    parser.add_argument("--ikkt-active-tol", type=float, default=None)
     parser.add_argument("--ikkt-geom-thickness-active-tol", type=float, default=None)
     parser.add_argument("--knot-insertions-per-refine", default="1")
     parser.add_argument("--knot-min-span-width", type=float, default=1.0e-8)

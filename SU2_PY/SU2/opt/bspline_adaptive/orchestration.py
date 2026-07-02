@@ -461,15 +461,17 @@ def progressive_bspline_su2_shape_optimization(settings):
             refinement_settings = settings
             if str(settings.get("knot_score_mode", "VIRTUAL_INSERTION")).upper() == "IKKT_VIRTUAL_INSERTION":
                 objective_signal = signal
+                ikkt_settings = dict(settings)
+                ikkt_settings["_ikkt_eval_dir"] = str(adjoint_eval_dir)
                 signal, ikkt_diagnostics = build_ikkt_score_signal(
                     optimized_modes,
                     metadata,
                     objective_signal,
-                    settings,
+                    ikkt_settings,
                 )
                 ikkt_file = level.workdir / f"ikkt_score_signal_level_{level_id:03d}.json"
                 write_ikkt_diagnostics(ikkt_file, ikkt_diagnostics)
-                refinement_settings = dict(settings)
+                refinement_settings = dict(ikkt_settings)
                 refinement_settings["_ikkt_objective_signal"] = objective_signal
                 print(
                     "[PROGRESSIVE_BSPLINE] IKKT_VIRTUAL_INSERTION signal | "

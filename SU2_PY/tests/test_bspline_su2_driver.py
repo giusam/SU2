@@ -45,6 +45,7 @@ from SU2.opt.bspline_su2_driver import (
     run_bspline_su2_optimization,
     thickness_options_from_config,
     update_mode_coefficients,
+    worst_box_def,
 )
 
 
@@ -939,6 +940,234 @@ def test_rejected_statuses_are_not_best_safe_or_cache_ok(tmp_path):
     assert toxic_class == "rejected_toxic_clip"
     assert driver.best_safe_entry is old_safe
     assert driver._best_ok_history_record() is None
+
+
+def test_worst_box_def_handles_mixed_sign_columns():
+    summary = worst_box_def(
+        [[2.0, -1.0], [-3.0, 4.0]],
+        [-1.0, -2.0],
+        [0.5, 1.0],
+    )
+
+    assert summary["max_def_possible"] == pytest.approx(9.5)
+    assert summary["limiting_point_id"] == 1
+    assert summary["limiting_direction"] == "down"
+
+
+def test_moving_bounds_requires_positive_line_search_bound(tmp_path):
+    with pytest.raises(BSplineSU2DriverError, match="BSPLINE_MOVING_BOUNDS requires"):
+        _make_driver(tmp_path, moving_bounds=True)
+
+
+def test_moving_bounds_disables_trust_clip_policy(tmp_path):
+    driver = _make_driver(
+        tmp_path,
+        moving_bounds=True,
+        opt_line_search_bound=0.01,
+        trust_clip_policy="ACCEPT_RESTART",
+    )
+
+    assert driver._trust_clip_enabled() is False
+
+
+def test_moving_bounds_trial_policy_bypasses_line_search_and_local_step_limit(
+    tmp_path,
+    monkeypatch,
+):
+    spec = _base_spec()
+    spec["modes"][0]["coefficient"] = 0.0
+    spec["modes"][1]["coefficient"] = 0.0
+    monkeypatch.setattr(
+        BSplineSU2Driver,
+        "_probe_geometry_aware_bounds",
+        lambda self: ([], [[1.0, 0.0], [0.0, 1.0]]),
+    )
+    driver = _make_driver(
+        tmp_path,
+        spec=spec,
+        moving_bounds=True,
+        opt_line_search_bound=0.25,
+        local_step_limit=True,
+    )
+    calls = []
+
+    def fake_evaluate(coefficients, line_search_info=None):
+        calls.append((list(coefficients), dict(line_search_info or {})))
+        return {
+            "eval_id": len(calls),
+            "objective": 1.0,
+            "gradient": [1.0, 0.0],
+            "coefficients": list(coefficients),
+            "status": "ok",
+        }
+
+    monkeypatch.setattr(driver, "evaluate", fake_evaluate)
+
+    result, info = driver._evaluate_optimizer_variables([1.0, 0.0])
+
+    assert result["coefficients"] == pytest.approx([1.0, 0.0])
+    assert calls[0][0] == pytest.approx([1.0, 0.0])
+    assert info["line_search_beta"] == pytest.approx(1.0)
+    assert info["line_search_limited"] == 0
+    assert info["local_step_beta"] == pytest.approx(1.0)
+    assert info["local_step_limited"] == 0
+
+
+def test_moving_bounds_expands_local_box_and_restarts_from_cached_eval(
+    tmp_path,
+    monkeypatch,
+):
+    spec = _single_mode_spec(coefficient=0.0)
+    monkeypatch.setattr(
+        BSplineSU2Driver,
+        "_probe_geometry_aware_bounds",
+        lambda self: ([], [[1.0]]),
+    )
+    driver = _make_driver(
+        tmp_path,
+        spec=spec,
+        moving_bounds=True,
+        opt_line_search_bound=0.25,
+    )
+    eval_calls = []
+    minimize_calls = []
+
+    def fake_evaluate(coefficients, line_search_info=None):
+        eval_calls.append(list(coefficients))
+        value = float(coefficients[0])
+        return {
+            "eval_id": len(eval_calls) - 1,
+            "eval_index": len(eval_calls),
+            "objective": value * value,
+            "gradient": [2.0 * value],
+            "coefficients": list(coefficients),
+            "status": "ok",
+        }
+
+    def fake_minimize(fun, x0, jac, bounds, constraints, method, callback, options):
+        del constraints, method
+        minimize_calls.append(
+            {
+                "x0": list(x0),
+                "bounds": list(bounds),
+                "maxiter": int(options["maxiter"]),
+            }
+        )
+        fun(list(x0))
+        if len(minimize_calls) == 1:
+            x_eval = [float(bounds[0][1])]
+            x_final = [x_eval[0] - 2.0e-8]
+        else:
+            x_eval = [0.3]
+            x_final = list(x_eval)
+        objective = fun(x_eval)
+        fun(x_final)
+        jac(x_final)
+        callback(x_final)
+        return types.SimpleNamespace(
+            x=x_final,
+            fun=objective,
+            success=True,
+            message="ok",
+            status=0,
+            nit=1,
+            nfev=2,
+            njev=1,
+        )
+
+    _install_fake_scipy_minimize(monkeypatch, fake_minimize)
+    monkeypatch.setattr(driver, "evaluate", fake_evaluate)
+
+    result = driver.optimize(maxiter=3)
+
+    assert result["coefficients"] == pytest.approx([0.3])
+    assert [call["bounds"] for call in minimize_calls] == [
+        [(-0.25, 0.25)],
+        [(-0.5, 0.5)],
+    ]
+    assert [call["maxiter"] for call in minimize_calls] == [3, 2]
+    assert minimize_calls[1]["x0"] == pytest.approx([0.25])
+    assert len(eval_calls) == 3
+    assert eval_calls[0] == pytest.approx([0.0])
+    assert eval_calls[1] == pytest.approx([0.25])
+    assert eval_calls[2] == pytest.approx([0.3])
+
+
+def test_moving_bounds_aero_constraint_reuses_allclose_design_point(
+    tmp_path,
+    monkeypatch,
+):
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(coefficient=0.0),
+        moving_bounds=True,
+        opt_line_search_bound=0.25,
+    )
+    core_calls = []
+    adjoint_calls = []
+
+    def fake_run_shared_core(coefficients, paths, record=None):
+        core_calls.append((list(coefficients), paths.eval_dir.name))
+        if record is not None:
+            record["core_done"] = True
+            record["primal_values"] = {"LIFT": 0.7}
+        return {"LIFT": 0.7}
+
+    def fake_run_function_adjoint(paths, function_name, record=None, **kwargs):
+        del kwargs
+        adjoint_calls.append((function_name, paths.eval_dir.name))
+        gradient = [1.0]
+        if record is not None:
+            record["func_adjoints"][driver._function_record_key(function_name)] = gradient
+        return gradient
+
+    monkeypatch.setattr(driver, "_run_shared_core", fake_run_shared_core)
+    monkeypatch.setattr(driver, "_run_function_adjoint", fake_run_function_adjoint)
+    monkeypatch.setattr(driver, "_write_eval_summary_metadata", lambda *args, **kwargs: None)
+
+    first = driver.evaluate_constraint_function([0.25], "LIFT")
+    second = driver.evaluate_constraint_function([0.25000000005], "LIFT")
+
+    assert second is first
+    assert first["eval_id"] == 0
+    assert first["coefficients"] == pytest.approx([0.25])
+    assert core_calls == [([0.25], "eval_0000")]
+    assert adjoint_calls == [("LIFT", "eval_0000")]
+    assert driver._next_eval_id == 1
+
+
+def test_moving_bounds_geometry_constraint_reuses_allclose_cache(
+    tmp_path,
+    monkeypatch,
+):
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(coefficient=0.0),
+        moving_bounds=True,
+        opt_line_search_bound=0.25,
+    )
+    metric_calls = []
+
+    class FakeMetric:
+        def value_and_gradient(self, coefficients):
+            metric_calls.append(list(coefficients))
+            return float(coefficients[0]), [1.0]
+
+    monkeypatch.setattr(driver, "_geometry_backend_for", lambda function_name: "ANALYTIC")
+    monkeypatch.setattr(driver, "_geometry_metric_for", lambda function_name: FakeMetric())
+
+    first = driver.evaluate_geometry_constraint_function([0.25], "AIRFOIL_AREA")
+    second = driver.evaluate_geometry_constraint_function(
+        [0.25000000005],
+        "AIRFOIL_AREA",
+    )
+
+    assert second is first
+    assert metric_calls == [[0.25]]
+    with open(driver.geometry_constraint_history_filename, newline="") as fp:
+        rows = list(csv.DictReader(fp))
+    assert len(rows) == 1
+    assert json.loads(rows[0]["coefficients"]) == pytest.approx([0.25])
 
 
 def test_best_ok_history_allows_weak_but_not_rejected_or_failed_rows(tmp_path):
@@ -2847,6 +3076,43 @@ def test_objective_without_constraints_keeps_single_drag_adjoint(tmp_path, monke
     assert [call[0] for call in calls].count("su2_cfd_ad") == 1
 
 
+def test_ikkt_refinement_prepares_missing_active_aero_adjoints_on_best_eval(
+    tmp_path, monkeypatch
+):
+    calls = _install_fake_aero_run(monkeypatch)
+    driver = _make_driver(
+        tmp_path,
+        spec=_single_mode_spec(),
+        objective_adjoint="DRAG",
+        gradient_guard=False,
+        native_constraints="(LIFT=0.22)*1; (MOMENT_Z<1.0)*1",
+        prepare_ikkt_aero_adjoints=True,
+        refinement_available=True,
+    )
+
+    objective = driver.evaluate([0.0])
+    eval_dir = Path(objective["eval_dir"])
+    assert sorted(path.name for path in eval_dir.glob("adjoint_*")) == ["adjoint_drag"]
+
+    result = types.SimpleNamespace(
+        x=[0.0],
+        fun=objective["objective"],
+        success=True,
+        message="done",
+        status=0,
+        nit=0,
+        nfev=1,
+        njev=1,
+    )
+    driver._finalize_slsqp_result(result, early_refine_triggered=True)
+
+    assert (eval_dir / "adjoint_lift" / "surface_sens.csv").read_text() == "adjoint_lift"
+    assert not (eval_dir / "adjoint_momentz").exists()
+    assert (eval_dir / "surface_sens.csv").read_text() == "adjoint_drag"
+    assert [call[0] for call in calls].count("su2_cfd") == 1
+    assert [call[0] for call in calls].count("su2_cfd_ad") == 2
+
+
 def test_objective_guard_stop_does_not_invalidate_shared_constraint_results(
     tmp_path, monkeypatch
 ):
@@ -3220,6 +3486,7 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
         "OPT_BOUND_LOWER= -0.02\n"
         "OPT_BOUND_UPPER= 0.03\n"
         "OPT_LINE_SEARCH_BOUND= 0.004\n"
+        "BSPLINE_MOVING_BOUNDS= YES\n"
         "BSPLINE_EVAL_LAYOUT= DSN\n"
         "BSPLINE_SENSITIVITY_SOURCE= CFD_ADJOINT_SURFACE\n"
         "BSPLINE_GEOMETRY_FD_EPS= 2e-6\n"
@@ -3241,6 +3508,7 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert values["OPT_BOUND_LOWER"] == pytest.approx(-0.02)
     assert values["OPT_BOUND_UPPER"] == pytest.approx(0.03)
     assert values["OPT_LINE_SEARCH_BOUND"] == pytest.approx(0.004)
+    assert values["BSPLINE_MOVING_BOUNDS"] is True
     assert values["BSPLINE_EVAL_LAYOUT"] == "DSN"
     assert values["BSPLINE_SENSITIVITY_SOURCE"] == "CFD_ADJOINT_SURFACE"
     assert values["BSPLINE_GEOMETRY_FD_EPS"] == pytest.approx(2.0e-6)
@@ -3261,6 +3529,7 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert options["opt_bound_lower"] == pytest.approx(-0.02)
     assert options["opt_bound_upper"] == pytest.approx(0.03)
     assert options["opt_line_search_bound"] == pytest.approx(0.004)
+    assert options["moving_bounds"] is True
     assert options["eval_layout"] == "DSN"
     assert options["sensitivity_source"] == "CFD_ADJOINT_SURFACE"
     assert options["geometry_fd_eps"] == pytest.approx(2.0e-6)
@@ -3321,6 +3590,7 @@ def test_optimizer_config_parsing_and_cli_precedence(tmp_path, capsys):
     assert args.opt_bound_lower == pytest.approx(-0.02)
     assert args.opt_bound_upper == pytest.approx(0.03)
     assert args.opt_line_search_bound == pytest.approx(0.004)
+    assert args.moving_bounds is True
     assert args.sensitivity_weighting == "NODAL"
     assert args.sensitivity_source == "CFD_ADJOINT_SURFACE"
     assert args.geometry_fd_eps == pytest.approx(2.0e-6)

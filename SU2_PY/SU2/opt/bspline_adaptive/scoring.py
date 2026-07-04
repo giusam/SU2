@@ -89,6 +89,39 @@ def _rank_incremental_columns(active_matrix, candidate_matrix, regularization):
 
     return U[:, :rank]
 
+def _score_virtual_insertion_on_basis(
+    z_matrix,
+    signal,
+    regularization,
+    rank=None,
+    condition=None,
+):
+    if z_matrix.shape[1] == 0:
+        return 0.0, 0.0, 0, 0, 0.0
+
+    b = z_matrix.T.dot(signal)
+    gram = z_matrix.T.dot(z_matrix)
+    if condition is None:
+        try:
+            condition = float(np.linalg.cond(gram))
+        except Exception:
+            condition = math.inf
+    try:
+        solve = np.linalg.solve(gram, b)
+    except np.linalg.LinAlgError:
+        gram = gram + float(regularization) * np.eye(gram.shape[0])
+        try:
+            solve = np.linalg.solve(gram, b)
+        except np.linalg.LinAlgError:
+            solve = np.linalg.lstsq(gram, b, rcond=None)[0]
+    score = float(b.dot(solve))
+    if not math.isfinite(score) or score < 0.0:
+        score = 0.0
+    if rank is None:
+        rank = int(np.linalg.matrix_rank(z_matrix))
+    return score, score, int(rank), int(z_matrix.shape[1]), float(condition)
+
+
 def _score_virtual_insertion(active_matrix, new_matrix, signal, regularization):
     """Score a virtual knot insertion via the incremental-energy metric.
 
@@ -104,27 +137,7 @@ def _score_virtual_insertion(active_matrix, new_matrix, signal, regularization):
     that risk and should be consulted before accepting a span.
     """
     z_matrix = _rank_incremental_columns(active_matrix, new_matrix, regularization)
-    if z_matrix.shape[1] == 0:
-        return 0.0, 0.0, 0, 0, 0.0
-
-    b = z_matrix.T.dot(signal)
-    gram = z_matrix.T.dot(z_matrix)
-    try:
-        condition = float(np.linalg.cond(gram))
-    except Exception:
-        condition = math.inf
-    try:
-        solve = np.linalg.solve(gram, b)
-    except np.linalg.LinAlgError:
-        gram = gram + float(regularization) * np.eye(gram.shape[0])
-        try:
-            solve = np.linalg.solve(gram, b)
-        except np.linalg.LinAlgError:
-            solve = np.linalg.lstsq(gram, b, rcond=None)[0]
-    score = float(b.dot(solve))
-    if not math.isfinite(score) or score < 0.0:
-        score = 0.0
-    return score, score, int(np.linalg.matrix_rank(z_matrix)), int(z_matrix.shape[1]), condition
+    return _score_virtual_insertion_on_basis(z_matrix, signal, regularization)
 
 # Leading/trailing-edge closure nodes (x/c == 0 and == 1) are geometrically
 # pinned and carry a degenerate surface normal. Their sensitivity — typically a
@@ -154,11 +167,16 @@ def _drop_closure_nodes(metadata, signal, eps=SCORING_CLOSURE_NODE_EPS):
 def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
     knot_score_mode = str(settings.get("knot_score_mode", "VIRTUAL_INSERTION")).upper()
     mask = scoring_node_mask(metadata)
-    metadata = [row for keep, row in zip(mask, metadata) if bool(keep)]
-    signal = np.asarray(signal, dtype=float)[mask]
     objective_signal = settings.get("_ikkt_objective_signal")
     if objective_signal is not None:
-        objective_signal = np.asarray(objective_signal, dtype=float)[mask]
+        objective_signal = np.asarray(objective_signal, dtype=float)
+        if objective_signal.shape[0] != len(mask):
+            raise BSplineAdaptiveError(
+                "IKKT objective signal length does not match knot-scoring metadata"
+            )
+        objective_signal = objective_signal[mask]
+    metadata = [row for keep, row in zip(mask, metadata) if bool(keep)]
+    signal = np.asarray(signal, dtype=float)[mask]
     spans = knot_insertion_spans(
         space.knot_vector,
         min_width=settings.get("knot_min_span_width", 1.0e-8),
@@ -190,9 +208,13 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
             columns = 0
             condition = 0.0
         elif knot_score_mode in ("VIRTUAL_INSERTION", "IKKT_VIRTUAL_INSERTION"):
-            score, score_raw, rank, columns, condition = _score_virtual_insertion(
+            z_matrix = _rank_incremental_columns(
                 old_matrix,
                 new_matrix,
+                regularization,
+            )
+            score, score_raw, rank, columns, condition = _score_virtual_insertion_on_basis(
+                z_matrix,
                 signal,
                 regularization,
             )
@@ -215,11 +237,12 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
             score_ikkt = float(score)
             lagrangian_projection = math.sqrt(float(score_raw)) if float(score_raw) >= 0.0 else 0.0
             if objective_signal is not None:
-                obj_score, obj_raw, _obj_rank, _obj_columns, obj_condition = _score_virtual_insertion(
-                    old_matrix,
-                    new_matrix,
+                obj_score, obj_raw, _obj_rank, _obj_columns, obj_condition = _score_virtual_insertion_on_basis(
+                    z_matrix,
                     objective_signal,
                     regularization,
+                    rank=rank,
+                    condition=condition,
                 )
                 if not math.isfinite(obj_condition) or obj_condition > 1.0e14:
                     obj_score = 0.0

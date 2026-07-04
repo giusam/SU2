@@ -562,6 +562,7 @@ def _build_arg_parser():
     parser.add_argument("--trust-clip-stag-tol", type=float, default=1.0e-6)
     parser.add_argument("--trust-clip-restart-limit", type=int, default=1)
     parser.add_argument("--opt-line-search-bound", type=float, default=None)
+    parser.add_argument("--moving-bounds", action="store_true", default=False)
     parser.add_argument("--local-step-limit", action="store_true", default=False)
     parser.add_argument("--local-step-limit-ratio", type=float, default=200.0)
     parser.add_argument(

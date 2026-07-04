@@ -2048,6 +2048,21 @@ def test_trust_clip_policy_defaults_off_with_requested_phase_one_values():
     assert settings["trust_clip_restart_limit"] == 1
 
 
+def test_moving_bounds_defaults_off_and_requires_line_search_bound():
+    settings = validate_adaptive_options(_minimal_settings())
+
+    assert settings["moving_bounds"] is False
+
+    with pytest.raises(BSplineAdaptiveError, match="BSPLINE_MOVING_BOUNDS requires"):
+        validate_adaptive_options(_minimal_settings(moving_bounds=True))
+
+    enabled = validate_adaptive_options(
+        _minimal_settings(moving_bounds=True, opt_line_search_bound=0.005)
+    )
+    assert enabled["moving_bounds"] is True
+    assert enabled["opt_line_search_bound"] == pytest.approx(0.005)
+
+
 @pytest.mark.parametrize(
     "key,value",
     [
@@ -2220,6 +2235,52 @@ def test_independent_refines_upper_and_lower_in_different_zones(tmp_path):
     assert len(knot_vectors["upper"]) == len(initial) + 1
     assert len(knot_vectors["lower"]) == len(initial) + 1
     assert set(next_modes["knot_span_depths"]) == {"upper", "lower"}
+
+
+def test_independent_ikkt_objective_signal_is_split_by_side(tmp_path):
+    modes = tmp_path / "modes.json"
+    spec = generate_initial_bspline_modes(
+        modes,
+        "AIRFOIL",
+        nper_side=6,
+        surface_mode="BOTH",
+        class_shape="none",
+    )
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            symmetry_coupling="NONE",
+            surface_mode="BOTH",
+            refine_side_coupling="INDEPENDENT",
+            nadd_mode="FIXED",
+            fixed_nadd=1,
+            nfinal=40,
+            knot_score_mode="IKKT_VIRTUAL_INSERTION",
+        )
+    )
+
+    metadata = []
+    signal = []
+    objective_signal = []
+    for side, phase in (("upper", 0.0), ("lower", 0.25)):
+        for x in np.linspace(0.1, 0.9, 10):
+            value = math.sin(math.pi * (float(x) + phase))
+            metadata.append({"x_over_c": float(x), "side": side})
+            signal.append(value)
+            objective_signal.append(0.5 * value)
+    settings["_ikkt_objective_signal"] = objective_signal
+
+    next_modes, rows, selected = build_next_knot_inserted_modes(
+        spec,
+        metadata,
+        signal,
+        settings,
+    )
+
+    assert next_modes is not None
+    assert selected["selected"] is True
+    assert rows
+    assert {row["side"] for row in rows} == {"UPPER", "LOWER"}
+    assert any(row.get("score_objective", "") != "" for row in rows)
 
 
 def test_independent_knot_span_depths_persist_per_side(tmp_path):

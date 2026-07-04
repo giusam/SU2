@@ -1,5 +1,6 @@
 """SU2-style native objective constraints for the B-spline driver."""
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -36,6 +37,61 @@ class NativeConstraint:
             "scale": float(self.scale),
             "kind": self.kind,
         }
+
+
+def native_constraint_internal_form(spec, current_value):
+    sign = str(spec.sign).strip()
+    target = float(spec.target)
+    current_value = float(current_value)
+    if sign == "<":
+        return {
+            "c_value": target - current_value,
+            "field_sign": -1.0,
+            "representation": "c = target - F >= 0",
+            "lambda_bounds": (0.0, math.inf),
+            "bounds_reason": "internal c>=0: F < target -> c=target-F, lambda>=0",
+        }
+    if sign == ">":
+        return {
+            "c_value": current_value - target,
+            "field_sign": 1.0,
+            "representation": "c = F - target >= 0",
+            "lambda_bounds": (0.0, math.inf),
+            "bounds_reason": "internal c>=0: F > target -> c=F-target, lambda>=0",
+        }
+    if sign == "=":
+        return {
+            "c_value": current_value - target,
+            "field_sign": 1.0,
+            "representation": "c = F - target = 0",
+            "lambda_bounds": (-math.inf, math.inf),
+            "bounds_reason": "internal c=0: equality uses free lambda",
+        }
+    raise BSplineSU2DriverError(
+        f"unsupported OPT_CONSTRAINT sign {sign!r} for native constraint {spec.name}"
+    )
+
+
+def native_constraint_active_status(sign, c_value, active_tol):
+    if str(sign).strip() == "=":
+        return "equality"
+    if float(c_value) < 0.0:
+        return "violated"
+    if float(c_value) <= float(active_tol):
+        return "near_active"
+    return "inactive"
+
+
+def native_constraint_status(spec, current_value, active_tol):
+    internal = native_constraint_internal_form(spec, current_value)
+    return (
+        native_constraint_active_status(
+            spec.sign,
+            internal["c_value"],
+            active_tol,
+        ),
+        internal,
+    )
 
 
 def _constraint_from_parts(name, sign, target, scale=1.0):

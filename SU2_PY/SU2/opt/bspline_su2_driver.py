@@ -254,6 +254,7 @@ from SU2.opt.bspline_driver.driver import (
     BSplineSU2Driver,
     _project_to_bounds,
     run_bspline_su2_optimization,
+    worst_box_def,
 )
 
 
@@ -413,6 +414,12 @@ def _build_arg_parser():
         help="Maximum accepted physical normal-displacement jump per SLSQP iteration",
     )
     parser.add_argument(
+        "--moving-bounds",
+        action="store_true",
+        default=False,
+        help="Use progressive B-spline coefficient bounds instead of LS_BETA clipping",
+    )
+    parser.add_argument(
         "--eval-layout",
         default="DSN",
         choices=ALLOWED_EVAL_LAYOUTS,
@@ -543,6 +550,7 @@ def main(argv=None):
             trust_clip_bad_window=args.trust_clip_bad_window,
             trust_clip_stag_tol=args.trust_clip_stag_tol,
             opt_line_search_bound=args.opt_line_search_bound,
+            moving_bounds=args.moving_bounds,
             thickness_options=getattr(args, "thickness_options", None),
             native_constraints=getattr(args, "native_constraints", None),
             geometry_fd_eps=getattr(args, "geometry_fd_eps", 1.0e-6),

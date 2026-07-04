@@ -11,7 +11,11 @@ from scipy.optimize import lsq_linear
 from SU2.opt.bspline_common import normalized_name
 from SU2.opt.bspline_dot import read_sensitivity_file
 from SU2.opt.bspline_driver.geometry_constraints import is_geometry_constraint_name
-from SU2.opt.bspline_driver.native_constraints import normalize_native_constraints
+from SU2.opt.bspline_driver.native_constraints import (
+    native_constraint_active_status,
+    native_constraint_internal_form,
+    normalize_native_constraints,
+)
 from SU2.opt.bspline_driver.reduction import (
     build_reduced_variables,
     collapse_full_jacobian,
@@ -479,36 +483,10 @@ def _read_aero_current_value(function_name, settings, eval_dir):
 
 
 def _aero_internal_constraint(spec, current_value):
-    sign = str(spec.sign).strip()
-    target = float(spec.target)
-    current_value = float(current_value)
-    if sign == "<":
-        return {
-            "c_value": target - current_value,
-            "field_sign": -1.0,
-            "representation": "c = target - F >= 0",
-            "lambda_bounds": (0.0, math.inf),
-            "bounds_reason": "internal c>=0: F < target -> c=target-F, lambda>=0",
-        }
-    if sign == ">":
-        return {
-            "c_value": current_value - target,
-            "field_sign": 1.0,
-            "representation": "c = F - target >= 0",
-            "lambda_bounds": (0.0, math.inf),
-            "bounds_reason": "internal c>=0: F > target -> c=F-target, lambda>=0",
-        }
-    if sign == "=":
-        return {
-            "c_value": current_value - target,
-            "field_sign": 1.0,
-            "representation": "c = F - target = 0",
-            "lambda_bounds": (-math.inf, math.inf),
-            "bounds_reason": "internal c=0: equality uses free lambda",
-        }
-    raise BSplineAdaptiveError(
-        f"unsupported OPT_CONSTRAINT sign {sign!r} for IKKT aero constraint {spec.name}"
-    )
+    try:
+        return native_constraint_internal_form(spec, current_value)
+    except Exception as exc:
+        raise BSplineAdaptiveError(str(exc)) from exc
 
 
 def _native_internal_constraint(spec, current_value):
@@ -516,13 +494,7 @@ def _native_internal_constraint(spec, current_value):
 
 
 def _aero_active_status(sign, c_value, active_tol):
-    if sign == "=":
-        return "equality"
-    if float(c_value) < 0.0:
-        return "violated"
-    if float(c_value) <= float(active_tol):
-        return "near_active"
-    return "inactive"
+    return native_constraint_active_status(sign, c_value, active_tol)
 
 
 def _aero_skip_record(spec, reason, **extra):

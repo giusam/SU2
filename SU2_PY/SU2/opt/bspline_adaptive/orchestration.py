@@ -280,6 +280,11 @@ def progressive_bspline_su2_shape_optimization(settings):
                 or int(current_reduced_ndv) < int(settings["nfinal"])
             )
         )
+        ikkt_aero_refinement = (
+            str(settings.get("knot_score_mode", "VIRTUAL_INSERTION")).strip().upper()
+            == "IKKT_VIRTUAL_INSERTION"
+            and bool(settings.get("ikkt_include_aero_constraints", False))
+        )
         optimizer_kwargs = {
             "modes_filename": str(level.active_modes_start_filename),
             "base_mesh": settings["base_mesh"],
@@ -326,10 +331,17 @@ def progressive_bspline_su2_shape_optimization(settings):
             "trust_clip_bad_window": settings.get("trust_clip_bad_window", 5),
             "trust_clip_stag_tol": settings.get("trust_clip_stag_tol", 1.0e-6),
             "opt_line_search_bound": settings.get("opt_line_search_bound"),
+            "moving_bounds": settings.get("moving_bounds", False),
             "local_step_limit": settings.get("local_step_limit", False),
             "local_step_limit_ratio": settings.get("local_step_limit_ratio", 200.0),
             "sensitivity_weighting": settings.get("sensitivity_weighting", "NODAL"),
             "sensitivity_source": settings.get("sensitivity_source", "DOT_AD_TRANSFER"),
+            "prepare_ikkt_aero_adjoints": ikkt_aero_refinement,
+            "force_prepare_ikkt_aero_adjoints": (
+                ikkt_aero_refinement
+                and str(settings.get("trigger", "MAX_ITER")).strip().upper() == "MAX_ITER"
+            ),
+            "ikkt_active_tol": settings.get("ikkt_active_tol", 1.0e-6),
             "thickness_options": settings.get("thickness_options"),
             "native_constraints": settings.get("native_constraints"),
             "geometry_fd_eps": settings.get("geometry_fd_eps", 1.0e-6),

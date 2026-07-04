@@ -608,6 +608,11 @@ def validate_adaptive_options(opts):
     )
     if opts["opt_line_search_bound"] is not None and opts["opt_line_search_bound"] <= 0.0:
         raise BSplineAdaptiveError("--opt-line-search-bound must be positive")
+    opts["moving_bounds"] = _as_bool(opts.get("moving_bounds", False), default=False)
+    if opts["moving_bounds"] and opts["opt_line_search_bound"] is None:
+        raise BSplineAdaptiveError(
+            "BSPLINE_MOVING_BOUNDS requires OPT_LINE_SEARCH_BOUND to be positive"
+        )
     opts["local_step_limit"] = _as_bool(opts.get("local_step_limit", False), default=False)
     opts["log_active_modes"] = _as_bool(opts.get("log_active_modes", False), default=False)
     opts["local_step_limit_ratio"] = _as_float(
@@ -1326,6 +1331,12 @@ def print_startup_summary(settings):
             settings.get("trust_clip_restart_limit", 1),
         )
     )
+    print(
+        "[PROGRESSIVE_BSPLINE] moving-bounds: {} limit={}".format(
+            "ON" if settings.get("moving_bounds", False) else "OFF",
+            settings.get("opt_line_search_bound"),
+        )
+    )
 
 def _settings_from_args(args):
     return {
@@ -1492,6 +1503,7 @@ def _settings_from_args(args):
         "trust_clip_stag_tol": getattr(args, "trust_clip_stag_tol", 1.0e-6),
         "trust_clip_restart_limit": getattr(args, "trust_clip_restart_limit", 1),
         "opt_line_search_bound": args.opt_line_search_bound,
+        "moving_bounds": getattr(args, "moving_bounds", False),
         "local_step_limit": args.local_step_limit,
         "local_step_limit_ratio": args.local_step_limit_ratio,
         "thickness_options": getattr(args, "thickness_options", None),

@@ -113,7 +113,10 @@ from .reduction import (
     update_mode_coefficients,
     write_mode_spec,
 )
-from .native_constraints import normalize_native_constraints
+from .native_constraints import (
+    native_constraint_status,
+    normalize_native_constraints,
+)
 from .tables import (
     FUNCTION_HISTORY_COLUMNS,
     history_column_for_function,
@@ -140,6 +143,52 @@ def _project_to_bounds(coefficients, bounds):
     for value, (lower, upper) in zip(coefficients, bounds):
         clipped.append(min(max(float(value), lower), upper))
     return clipped
+
+
+def worst_box_def(basis_matrix, delta_low, delta_up):
+    basis_matrix = np.asarray(basis_matrix, dtype=float)
+    delta_low = np.asarray(delta_low, dtype=float)
+    delta_up = np.asarray(delta_up, dtype=float)
+    if basis_matrix.ndim != 2:
+        raise BSplineSU2DriverError("moving-bounds basis matrix must be two-dimensional")
+    if delta_low.shape != delta_up.shape:
+        raise BSplineSU2DriverError("moving-bounds delta bounds must have matching shapes")
+    if basis_matrix.shape[1] != delta_low.size:
+        raise BSplineSU2DriverError(
+            "moving-bounds basis matrix column count must match delta length"
+        )
+    if basis_matrix.shape[0] == 0 or basis_matrix.shape[1] == 0:
+        return {
+            "max_def_possible": 0.0,
+            "limiting_point_id": None,
+            "limiting_direction": "",
+            "limiting_value": 0.0,
+        }
+
+    low_contrib = basis_matrix * delta_low[None, :]
+    up_contrib = basis_matrix * delta_up[None, :]
+    row_max = np.maximum(low_contrib, up_contrib).sum(axis=1)
+    row_min = np.minimum(low_contrib, up_contrib).sum(axis=1)
+    row_worst = np.maximum(np.abs(row_max), np.abs(row_min))
+    limiting_index = int(np.argmax(row_worst))
+    limiting_value = (
+        float(row_max[limiting_index])
+        if abs(float(row_max[limiting_index])) >= abs(float(row_min[limiting_index]))
+        else float(row_min[limiting_index])
+    )
+    return {
+        "max_def_possible": float(row_worst[limiting_index]),
+        "limiting_point_id": limiting_index,
+        "limiting_direction": "up" if limiting_value >= 0.0 else "down",
+        "limiting_value": limiting_value,
+    }
+
+
+class MovingBoundsRestart(Exception):
+    def __init__(self, x, active_bounds):
+        super().__init__("moving bounds local bound reached")
+        self.x = [float(value) for value in x]
+        self.active_bounds = list(active_bounds)
 
 
 
@@ -192,6 +241,7 @@ class BSplineSU2Driver:
         trust_clip_bad_window=5,
         trust_clip_stag_tol=1.0e-6,
         opt_line_search_bound=None,
+        moving_bounds=False,
         thickness_options=None,
         native_constraints=None,
         geometry_fd_eps=1.0e-6,
@@ -205,6 +255,9 @@ class BSplineSU2Driver:
         local_step_limit=False,
         local_step_limit_ratio=200.0,
         trigger_opts=None,
+        prepare_ikkt_aero_adjoints=False,
+        force_prepare_ikkt_aero_adjoints=False,
+        ikkt_active_tol=1.0e-6,
         progressive_label="PROGRESSIVE_BSPLINE",
         deformation_direction_mode=None,
         le_safe_direction=False,
@@ -384,6 +437,16 @@ class BSplineSU2Driver:
         )
         if self.opt_line_search_bound is not None and self.opt_line_search_bound <= 0.0:
             raise BSplineSU2DriverError("OPT_LINE_SEARCH_BOUND must be positive")
+        self.moving_bounds = _thickness_as_bool(moving_bounds, default=False)
+        if self.moving_bounds and self.opt_line_search_bound is None:
+            raise BSplineSU2DriverError(
+                "BSPLINE_MOVING_BOUNDS requires OPT_LINE_SEARCH_BOUND to be positive"
+            )
+        if self.moving_bounds and self._trust_clip_enabled():
+            print(
+                "[BSPLINE_MOVING_BOUNDS] enabled: disabling trust clip policy / LS_BETA clipping"
+            )
+            self.trust_clip_options["policy"] = "OFF"
         self.local_step_limit = _thickness_as_bool(local_step_limit, default=False)
         self.local_step_limit_ratio = _as_float(
             local_step_limit_ratio,
@@ -397,6 +460,14 @@ class BSplineSU2Driver:
             )
         self.thickness_options = dict(thickness_options or {})
         self.native_constraints = normalize_native_constraints(native_constraints)
+        self.prepare_ikkt_aero_adjoints = bool(prepare_ikkt_aero_adjoints)
+        self.force_prepare_ikkt_aero_adjoints = bool(force_prepare_ikkt_aero_adjoints)
+        self.ikkt_active_tol = _as_float(
+            1.0e-6 if ikkt_active_tol is None else ikkt_active_tol,
+            "BSPLINE_IKKT_ACTIVE_TOL",
+        )
+        if self.ikkt_active_tol < 0.0:
+            raise BSplineSU2DriverError("BSPLINE_IKKT_ACTIVE_TOL must be non-negative")
         self.geometry_fd_eps = _as_float(
             1.0e-6 if geometry_fd_eps is None else geometry_fd_eps,
             "BSPLINE_GEOMETRY_FD_EPS",
@@ -483,6 +554,11 @@ class BSplineSU2Driver:
         self._line_search_bound_configured = False
         self._line_search_anchor_physical = list(self.initial_coefficients)
         self._local_step_anchor_reduced = list(self.initial_reduced_coefficients)
+        self._moving_bounds_full_basis_matrix = None
+        self._moving_bounds_reduced_basis_matrix = None
+        self._moving_bounds_previous_eval_physical = None
+        self._moving_bounds_current_local_bounds = None
+        self._moving_bounds_interrupt_on_active_bound = False
         self._cache = {}
         self._constraint_cache = {}
         self._design_points = {}
@@ -681,12 +757,15 @@ class BSplineSU2Driver:
         return collapse_full_jacobian(jacobian, self.reduced_variables)
 
     def optimizer_bounds(self):
+        return self._optimizer_bounds_from_physical(self.reduced_bounds)
+
+    def _optimizer_bounds_from_physical(self, bounds):
         return [
             (
                 float(lower) / self.opt_relax_factor,
                 float(upper) / self.opt_relax_factor,
             )
-            for lower, upper in self.reduced_bounds
+            for lower, upper in bounds
         ]
 
     def _line_search_default_info(self):
@@ -701,6 +780,136 @@ class BSplineSU2Driver:
             "local_step_da": 0.0,
             "local_step_limit": 0.0,
         }
+
+    def _collapse_basis_matrix_to_reduced(self, basis_matrix):
+        basis_matrix = np.asarray(basis_matrix, dtype=float)
+        if basis_matrix.ndim != 2:
+            raise BSplineSU2DriverError("basis matrix must be two-dimensional")
+        if basis_matrix.shape[1] != len(self.mode_ids):
+            raise BSplineSU2DriverError(
+                "basis matrix column count must match the number of active modes"
+            )
+        columns = []
+        for variable in self.reduced_variables:
+            column = np.zeros(basis_matrix.shape[0], dtype=float)
+            for index, sign in zip(variable.mode_indices, variable.signs):
+                column += float(sign) * basis_matrix[:, int(index)]
+            columns.append(column)
+        if not columns:
+            return np.zeros((basis_matrix.shape[0], 0), dtype=float)
+        return np.column_stack(columns)
+
+    def _moving_bounds_basis_matrices(self):
+        if self._moving_bounds_reduced_basis_matrix is not None:
+            return (
+                self._moving_bounds_full_basis_matrix,
+                self._moving_bounds_reduced_basis_matrix,
+            )
+        _metadata, basis_matrix = self._probe_geometry_aware_bounds()
+        basis_matrix = np.asarray(basis_matrix, dtype=float)
+        if basis_matrix.ndim != 2:
+            raise BSplineSU2DriverError("moving-bounds basis matrix must be two-dimensional")
+        if basis_matrix.shape[1] != len(self.mode_ids):
+            raise BSplineSU2DriverError(
+                "moving-bounds basis matrix column count must match the number of active modes"
+            )
+        reduced = self._collapse_basis_matrix_to_reduced(basis_matrix)
+        self._moving_bounds_full_basis_matrix = basis_matrix
+        self._moving_bounds_reduced_basis_matrix = reduced
+        return basis_matrix, reduced
+
+    def _moving_bounds_local_bounds(self, center, global_bounds, gamma):
+        gamma = float(gamma)
+        return [
+            (
+                float(c) + gamma * (float(lower) - float(c)),
+                float(c) + gamma * (float(upper) - float(c)),
+            )
+            for c, (lower, upper) in zip(center, global_bounds)
+        ]
+
+    def _moving_bounds_active_bounds(self, reduced_physical, local_bounds):
+        active = []
+        for index, (value, (lower, upper)) in enumerate(
+            zip(reduced_physical, local_bounds)
+        ):
+            width = abs(float(upper) - float(lower))
+            tol = max(1.0e-12, 1.0e-8 * width)
+            value = float(value)
+            if abs(value - float(lower)) <= tol:
+                active.append((index, "lower"))
+            elif abs(value - float(upper)) <= tol:
+                active.append((index, "upper"))
+        return active
+
+    def _moving_bounds_snap_tolerance(self, lower, upper):
+        width = abs(float(upper) - float(lower))
+        return max(1.0e-12, 1.0e-6 * width)
+
+    def _moving_bounds_snap_reduced_to_local_bounds(self, reduced_physical):
+        local_bounds = self._moving_bounds_current_local_bounds
+        if local_bounds is None:
+            return list(reduced_physical), False
+        snapped = []
+        changed = False
+        for value, (lower, upper) in zip(reduced_physical, local_bounds):
+            value = float(value)
+            lower = float(lower)
+            upper = float(upper)
+            tol = self._moving_bounds_snap_tolerance(lower, upper)
+            if abs(value - lower) <= tol:
+                snapped.append(lower)
+                changed = changed or value != lower
+            elif abs(value - upper) <= tol:
+                snapped.append(upper)
+                changed = changed or value != upper
+            else:
+                snapped.append(value)
+        return snapped, changed
+
+    def _moving_bounds_trial_policy(self, physical_trial):
+        physical_trial = [_as_float(value, "coefficient") for value in physical_trial]
+        if len(physical_trial) != len(self.mode_ids):
+            raise BSplineSU2DriverError(
+                f"expected {len(self.mode_ids)} coefficients, got {len(physical_trial)}"
+            )
+        info = self._line_search_default_info()
+        reduced_trial = self.compress_full_physical(physical_trial)
+        reduced_eval, snapped = self._moving_bounds_snap_reduced_to_local_bounds(
+            reduced_trial
+        )
+        if snapped:
+            info["moving_bounds_snapped"] = 1
+            return self.expand_reduced_physical(reduced_eval), info
+        info["moving_bounds_snapped"] = 0
+        return list(physical_trial), info
+
+    def _apply_optimizer_trial_policy(self, physical_trial):
+        if self.moving_bounds:
+            return self._moving_bounds_trial_policy(physical_trial)
+        return self._apply_line_search_bound(physical_trial)
+
+    def _moving_bounds_note_real_eval(self, physical_eval):
+        if not self.moving_bounds:
+            return
+        if self.opt_line_search_bound is None:
+            return
+        if self._moving_bounds_full_basis_matrix is None:
+            return
+        current = np.asarray(physical_eval, dtype=float)
+        previous = self._moving_bounds_previous_eval_physical
+        if previous is not None:
+            delta = current - np.asarray(previous, dtype=float)
+            delta_dn = self._moving_bounds_full_basis_matrix.dot(delta)
+            maxdiff = float(np.max(np.abs(delta_dn))) if len(delta_dn) else 0.0
+            limit = float(self.opt_line_search_bound)
+            tol = max(1.0e-12, 1.0e-8 * limit)
+            if maxdiff > limit + tol:
+                print(
+                    "[BSPLINE_MOVING_BOUNDS] WARNING: measured eval-to-eval deformation "
+                    "jump {:.6e} exceeds limit {:.6e}".format(maxdiff, limit)
+                )
+        self._moving_bounds_previous_eval_physical = [float(value) for value in current]
 
     def _configure_line_search_bound(self):
         if self._line_search_bound_configured:
@@ -1092,7 +1301,7 @@ class BSplineSU2Driver:
         def thickness_fun(variables):
             reduced_trial = self.optimizer_to_physical(variables)
             physical_trial = self.expand_reduced_physical(reduced_trial)
-            physical_eval, _info = self._apply_line_search_bound(physical_trial)
+            physical_eval, _info = self._apply_optimizer_trial_policy(physical_trial)
             return self._thickness_values_for_physical(physical_eval)
 
         def thickness_jac(variables):
@@ -1100,7 +1309,7 @@ class BSplineSU2Driver:
             if self.thickness_constraint.gradient_mode == "FINITE_DIFFERENCE":
                 reduced_trial = self.optimizer_to_physical(variables)
                 physical_trial = self.expand_reduced_physical(reduced_trial)
-                physical_eval, info = self._apply_line_search_bound(physical_trial)
+                physical_eval, info = self._apply_optimizer_trial_policy(physical_trial)
                 jac_fd = self._thickness_jacobian_fd_optimizer(variables, thickness_fun)
                 self._record_thickness_jacobian_log(
                     physical_eval,
@@ -1112,7 +1321,7 @@ class BSplineSU2Driver:
 
             reduced_trial = self.optimizer_to_physical(variables)
             physical_trial = self.expand_reduced_physical(reduced_trial)
-            physical_eval, info = self._apply_line_search_bound(physical_trial)
+            physical_eval, info = self._apply_optimizer_trial_policy(physical_trial)
             beta = float(info.get("line_search_beta", 1.0))
             try:
                 jac_a = self.thickness_constraint.jacobian_analytic(physical_eval)
@@ -1332,7 +1541,10 @@ class BSplineSU2Driver:
                 f"expected {len(self.mode_ids)} coefficients, got {len(coefficients)}"
             )
         function_name = normalize_geometry_constraint_name(function_name)
-        key = (cache_key(coefficients, self.cache_tol), _normalized_name(function_name))
+        coefficient_key, coefficients = self._coefficient_cache_key_and_values(
+            coefficients
+        )
+        key = (coefficient_key, _normalized_name(function_name))
         if key in self._constraint_cache:
             return self._constraint_cache[key]
 
@@ -1387,7 +1599,7 @@ class BSplineSU2Driver:
     def _native_constraint_result_for_variables(self, variables, spec):
         reduced_trial = self.optimizer_to_physical(variables)
         physical_trial = self.expand_reduced_physical(reduced_trial)
-        physical_eval, info = self._apply_line_search_bound(physical_trial)
+        physical_eval, info = self._apply_optimizer_trial_policy(physical_trial)
         if is_geometry_constraint_name(spec.name):
             result = self.evaluate_geometry_constraint_function(physical_eval, spec.name)
         else:
@@ -1703,6 +1915,95 @@ class BSplineSU2Driver:
             self._line_search_anchor_key(),
         )
 
+    def _optimizer_cache_info(
+        self,
+        info,
+        variables,
+        physical_trial,
+        physical_eval,
+        *,
+        last_eval=False,
+    ):
+        cached_info = dict(info)
+        cached_info["cache_hit"] = True
+        if last_eval:
+            cached_info["last_eval_cache_hit"] = True
+        cached_info["requested_optimizer_x"] = [float(value) for value in variables]
+        cached_info["requested_x"] = [float(value) for value in physical_trial]
+        cached_info["evaluated_x"] = [float(value) for value in physical_eval]
+        return cached_info
+
+    def _last_eval_matches_physical(self, physical_eval, physical_key):
+        if self._last_eval_physical_key == physical_key:
+            return True
+        if self._last_eval_result is None or self._last_eval_info is None:
+            return False
+        previous = self._last_eval_info.get(
+            "evaluated_x",
+            self._last_eval_result.get("coefficients"),
+        )
+        if previous is None:
+            return False
+        previous = np.asarray(previous, dtype=float)
+        current = np.asarray(physical_eval, dtype=float)
+        if previous.shape != current.shape:
+            return False
+        return bool(
+            np.allclose(
+                previous,
+                current,
+                rtol=1.0e-10,
+                atol=max(float(self.cache_tol), 1.0e-10),
+            )
+        )
+
+    def _coefficients_match_cached_design(self, previous, current):
+        if not self.moving_bounds:
+            return False
+        if previous is None:
+            return False
+        previous = np.asarray(previous, dtype=float)
+        current = np.asarray(current, dtype=float)
+        if previous.shape != current.shape:
+            return False
+        return bool(
+            np.allclose(
+                previous,
+                current,
+                rtol=1.0e-10,
+                atol=max(float(self.cache_tol), 1.0e-9),
+            )
+        )
+
+    def _matching_design_point(self, coefficients):
+        key = cache_key(coefficients, self.cache_tol)
+        record = self._design_points.get(key)
+        if record is not None:
+            return record.get("cache_key", key), record
+        if not self.moving_bounds:
+            return key, None
+        for existing_key, existing_record in self._design_points.items():
+            if self._coefficients_match_cached_design(
+                existing_record.get("coefficients"),
+                coefficients,
+            ):
+                return existing_record.get("cache_key", existing_key), existing_record
+        return key, None
+
+    def _coefficient_cache_key_and_values(self, coefficients):
+        key, record = self._matching_design_point(coefficients)
+        if record is not None:
+            return key, [float(value) for value in record.get("coefficients", coefficients)]
+        if not self.moving_bounds:
+            return key, [float(value) for value in coefficients]
+        for existing_key, cached_result in self._constraint_cache.items():
+            if not isinstance(existing_key, tuple) or not existing_key:
+                continue
+            cached_coefficients = cached_result.get("coefficients")
+            if self._coefficients_match_cached_design(cached_coefficients, coefficients):
+                return existing_key[0], [float(value) for value in cached_coefficients]
+        return key, [float(value) for value in coefficients]
+
     def _prune_stale_trust_clip_pending(self):
         current_anchor_key = self._line_search_anchor_key()
         for key in list(self._trust_clip_by_requested_key):
@@ -1810,15 +2111,16 @@ class BSplineSU2Driver:
     def _evaluate_optimizer_variables(self, variables):
         reduced_trial = self.optimizer_to_physical(variables)
         physical_trial = self.expand_reduced_physical(reduced_trial)
-        physical_eval, info = self._apply_line_search_bound(physical_trial)
+        physical_eval, info = self._apply_optimizer_trial_policy(physical_trial)
         info["requested_x"] = list(physical_trial)
         info["evaluated_x"] = list(physical_eval)
         info["requested_optimizer_x"] = [float(value) for value in variables]
         physical_key = cache_key(physical_eval, self.cache_tol)
+        cache_physical_key, _ = self._coefficient_cache_key_and_values(physical_eval)
         beta_tol = float(self.trust_clip_options.get("beta_tol", 1.0e-12))
         beta_now = float(info.get("beta_eff", info.get("line_search_beta", 1.0)))
         if (
-            self._last_eval_physical_key == physical_key
+            self._last_eval_matches_physical(physical_eval, physical_key)
             and self._last_eval_result is not None
             and self._last_eval_info is not None
         ):
@@ -1834,28 +2136,46 @@ class BSplineSU2Driver:
                 and beta_now >= 1.0 - beta_tol
                 and prev_class not in LAST_EVAL_CACHE_BLOCKED_TRUST_CLIP_CLASSES
             ):
-                cached_info = dict(self._last_eval_info)
-                cached_info["cache_hit"] = True
-                cached_info["last_eval_cache_hit"] = True
-                cached_info["requested_optimizer_x"] = [float(value) for value in variables]
-                cached_info["requested_x"] = list(physical_trial)
-                cached_info["evaluated_x"] = list(physical_eval)
+                cached_info = self._optimizer_cache_info(
+                    self._last_eval_info,
+                    variables,
+                    physical_trial,
+                    physical_eval,
+                    last_eval=True,
+                )
                 return self._last_eval_result, cached_info
+        if (
+            cache_physical_key in self._cache
+            and not self._trust_clip_enabled()
+            and beta_now >= 1.0 - beta_tol
+        ):
+            cached_info = self._optimizer_cache_info(
+                info,
+                variables,
+                physical_trial,
+                physical_eval,
+            )
+            return self._cache[cache_physical_key], cached_info
         if self._trust_clip_enabled():
             pending = self._trust_clip_by_requested_key.get(
                 self._pending_trust_clip_key(variables)
             )
             if pending is not None:
                 return pending["result"], info
+        cache_will_hit = (
+            cache_physical_key in self._cache and not self._trust_clip_enabled()
+        )
         result = self.evaluate(physical_eval, line_search_info=info)
         self._last_eval_physical_key = physical_key
         self._last_eval_result = result
         self._last_eval_info = dict(info)
+        if not cache_will_hit:
+            self._moving_bounds_note_real_eval(physical_eval)
         return result, info
 
     def _evaluate_reduced_physical(self, reduced_coefficients):
         physical_trial = self.expand_reduced_physical(reduced_coefficients)
-        physical_eval, info = self._apply_line_search_bound(physical_trial)
+        physical_eval, info = self._apply_optimizer_trial_policy(physical_trial)
         info["requested_x"] = list(physical_trial)
         info["evaluated_x"] = list(physical_eval)
         result = self.evaluate(physical_eval, line_search_info=info)
@@ -2121,12 +2441,12 @@ class BSplineSU2Driver:
         return self._primal_value_for_function(primal_values, self.objective_adjoint)
 
     def _design_point(self, coefficients, objective_adjoint=None):
-        key = cache_key(coefficients, self.cache_tol)
-        record = self._design_points.get(key)
+        key, record = self._matching_design_point(coefficients)
         if record is not None:
             return key, record
         eval_id, paths = self._next_paths(objective_adjoint=objective_adjoint)
         record = {
+            "cache_key": key,
             "eval_id": eval_id,
             "eval_dir": paths.eval_dir,
             "coefficients": list(coefficients),
@@ -2532,6 +2852,114 @@ class BSplineSU2Driver:
                     }
                 )
 
+    def _design_record_for_eval_id(self, eval_id):
+        if eval_id is None:
+            return None
+        try:
+            eval_id = int(eval_id)
+        except Exception:
+            return None
+        for record in self._design_points.values():
+            if int(record.get("eval_id", -1)) == eval_id:
+                return record
+        return None
+
+    def _ikkt_aero_constraint_status(self, spec, current_value):
+        active_status, internal = native_constraint_status(
+            spec,
+            current_value,
+            self.ikkt_active_tol,
+        )
+        return active_status, float(internal["c_value"])
+
+    def _ikkt_aero_field_available(self, paths):
+        source = str(self.sensitivity_source).strip().upper()
+        candidates = (
+            (paths.surface_sens, paths.surface_adjoint)
+            if source == "DOT_AD_TRANSFER"
+            else (paths.surface_adjoint, paths.surface_sens)
+        )
+        return any(path.exists() for path in candidates)
+
+    def _should_prepare_ikkt_aero_adjoints_for_refinement(self, early_refine_triggered=False):
+        if not self.prepare_ikkt_aero_adjoints:
+            return False
+        if not self.refinement_available:
+            return False
+        if self.force_prepare_ikkt_aero_adjoints:
+            return True
+        return bool(
+            early_refine_triggered
+            or getattr(self.trigger_project, "refinement_triggered", False)
+        )
+
+    def prepare_ikkt_aero_adjoints_for_refinement(self, eval_id=None, history_record=None):
+        if not self.prepare_ikkt_aero_adjoints or not self.native_constraints:
+            return []
+        if history_record is None and eval_id is None:
+            history_record = self._best_ok_history_record()
+        if history_record is not None and eval_id is None:
+            eval_id = history_record.get("eval_id")
+        record = self._design_record_for_eval_id(eval_id)
+        if record is None:
+            raise BSplineSU2DriverError(
+                "cannot prepare IKKT aero adjoints: eval_id {} is not in the driver design cache".format(
+                    eval_id
+                )
+            )
+
+        primal_values = dict(record.get("primal_values") or {})
+        if not primal_values:
+            paths = self._record_paths_for_function(record, self.objective_adjoint)
+            primal_values = self._read_primal_values(paths)
+            record["primal_values"] = primal_values
+
+        prepared = []
+        for spec in self.native_constraints:
+            function_name = str(spec.name).strip().upper()
+            if is_geometry_constraint_name(function_name):
+                continue
+            current_value = self._primal_value_for_function(primal_values, function_name)
+            active_status, c_value = self._ikkt_aero_constraint_status(spec, current_value)
+            if active_status == "inactive":
+                continue
+            paths = self._record_paths_for_function(record, function_name)
+            if self._ikkt_aero_field_available(paths):
+                continue
+            print(
+                "[BSPLINE_SU2_DRIVER] IKKT aero adjoint for refinement | "
+                "eval_id={} | function={} | active_status={} | c_value={:.6e}".format(
+                    int(record.get("eval_id", -1)),
+                    function_name,
+                    active_status,
+                    float(c_value),
+                )
+            )
+            gradient = self._run_function_adjoint(
+                paths,
+                function_name,
+                record=record,
+            )
+            self._write_eval_summary_metadata(
+                paths,
+                objective_function=function_name,
+            )
+            prepared.append(
+                {
+                    "eval_id": int(record.get("eval_id", -1)),
+                    "function": function_name,
+                    "active_status": active_status,
+                    "c_value": float(c_value),
+                    "gradient": list(gradient),
+                    "field": str(
+                        paths.surface_sens
+                        if str(self.sensitivity_source).strip().upper() == "DOT_AD_TRANSFER"
+                        else paths.surface_adjoint
+                    ),
+                }
+            )
+        return prepared
+
     def evaluate_constraint_function(self, coefficients, function_name):
         coefficients = [_as_float(value, "coefficient") for value in coefficients]
         if len(coefficients) != len(self.mode_ids):
@@ -2544,14 +2972,16 @@ class BSplineSU2Driver:
         if is_geometry_constraint_name(function_name):
             return self.evaluate_geometry_constraint_function(coefficients, function_name)
 
-        key = (cache_key(coefficients, self.cache_tol), _normalized_name(function_name))
-        if key in self._constraint_cache:
-            return self._constraint_cache[key]
-
-        _design_key, record = self._design_point(
+        design_key, record = self._design_point(
             coefficients,
             objective_adjoint=function_name,
         )
+        coefficients = [
+            float(value) for value in record.get("coefficients", coefficients)
+        ]
+        key = (design_key, _normalized_name(function_name))
+        if key in self._constraint_cache:
+            return self._constraint_cache[key]
         paths = self._record_paths_for_function(record, function_name)
         try:
             primal_values = self._run_shared_core(coefficients, paths, record=record)
@@ -2742,14 +3172,19 @@ class BSplineSU2Driver:
                 f"expected {len(self.mode_ids)} coefficients, got {len(coefficients)}"
             )
 
-        key = cache_key(coefficients, self.cache_tol)
+        key, _ = self._coefficient_cache_key_and_values(coefficients)
         if key in self._cache and not self._trust_clip_enabled():
             return self._cache[key]
 
-        _design_key, record = self._design_point(
+        key, record = self._design_point(
             coefficients,
             objective_adjoint=self.objective_adjoint,
         )
+        coefficients = [
+            float(value) for value in record.get("coefficients", coefficients)
+        ]
+        if key in self._cache and not self._trust_clip_enabled():
+            return self._cache[key]
         paths = self._record_paths_for_function(record, self.objective_adjoint)
         self._run_eval_count += 1
         eval_index = self._run_eval_count
@@ -3035,6 +3470,8 @@ class BSplineSU2Driver:
         refine = self.gradient_guard_next_action == "refine"
         if refine:
             self.trigger_project.refinement_triggered = True
+        if refine and safe_eval_id is not None:
+            self.prepare_ikkt_aero_adjoints_for_refinement(eval_id=safe_eval_id)
         if self.print_optimizer_table:
             print("Raw-gradient guard stop    (controlled rollback)")
             print(f"            Restored evaluation: {safe_eval_id}")
@@ -3072,6 +3509,8 @@ class BSplineSU2Driver:
         refine = next_action == "refine"
         if refine:
             self.trigger_project.refinement_triggered = True
+        if refine and restore_eval_id is not None:
+            self.prepare_ikkt_aero_adjoints_for_refinement(eval_id=restore_eval_id)
         return self._attach_trigger_state({
             "optimizer": optimizer,
             "success": True,
@@ -3090,100 +3529,71 @@ class BSplineSU2Driver:
             "refinement_triggered": refine,
         })
 
-    def optimize(
-        self,
-        maxiter=5,
-        fallback_step=0.1,
-        gradient_tol=1.0e-8,
-        trigger_resume_state=None,
-    ):
-        self._apply_trigger_resume_state(trigger_resume_state)
-        self.configure_geometry_aware_bounds()
-        self._configure_line_search_bound()
-        self.configure_thickness_constraint()
-        try:
-            from scipy.optimize import minimize
-        except Exception:
-            if self.thickness_constraint is not None or self.native_constraints:
-                raise BSplineSU2DriverError(
-                    "SciPy is required when optimization constraints are active"
-                )
-            try:
-                return self._attach_trigger_state(self._optimize_projected_gradient_descent(
-                    maxiter=maxiter,
-                    step_size=fallback_step,
-                    gradient_tol=gradient_tol,
-                ))
-            except GradientGuardStop as stop:
-                return self._controlled_gradient_guard_result(
-                    stop,
-                    optimizer="projected_gradient_descent",
-                )
+    def _slsqp_eval_for_objective(self, x):
+        result, info = self._evaluate_optimizer_variables(list(x))
+        if result.get("trust_clip_class") not in (
+            "weak_clipped_progress",
+            "accepted_clipped_restart",
+            "rejected_toxic_clip",
+        ) and not info.get("cache_hit", False):
+            record_objective_and_check(
+                self.trigger_project,
+                float(result["objective"]),
+            )
+        return result, info
 
-        x0 = self.physical_to_optimizer(self.initial_reduced_coefficients)
-        bounds_u = self.optimizer_bounds()
-        constraints = (
-            self._thickness_constraint_functions()
-            + self._native_constraint_functions()
-        )
-        self._print_slsqp_parameters(maxiter, optimizer_bounds=bounds_u)
+    def _slsqp_fun_value(self, x):
+        result, _info = self._slsqp_eval_for_objective(x)
+        return float(result["objective"]) * self.opt_gradient_factor
 
-        def fun(x):
-            result, info = self._evaluate_optimizer_variables(list(x))
-            if result.get("trust_clip_class") not in (
-                "weak_clipped_progress",
-                "accepted_clipped_restart",
-                "rejected_toxic_clip",
-            ) and not info.get("cache_hit", False):
-                record_objective_and_check(
-                    self.trigger_project,
-                    float(result["objective"]),
-                )
-            return float(result["objective"]) * self.opt_gradient_factor
+    def _slsqp_jac_value(self, x):
+        result, info = self._evaluate_optimizer_variables(list(x))
+        beta = float(info.get("line_search_beta", 1.0))
+        reduced_gradient = self.collapse_gradient_to_reduced(result["gradient"])
+        return [
+            float(value) * self.opt_relax_factor * self.opt_gradient_factor * beta
+            for value in reduced_gradient
+        ]
 
-        def jac(x):
-            result, info = self._evaluate_optimizer_variables(list(x))
-            beta = float(info.get("line_search_beta", 1.0))
-            reduced_gradient = self.collapse_gradient_to_reduced(result["gradient"])
-            return [
-                float(value) * self.opt_relax_factor * self.opt_gradient_factor * beta
-                for value in reduced_gradient
-            ]
-
-        def callback(x):
-            self._slsqp_major_iter += 1
-            self._trust_clip_callback(list(x))
-
+    def _slsqp_options(self, maxiter):
         options = {
             "maxiter": int(maxiter),
             "disp": False,
         }
         if self.opt_accuracy is not None:
             options["ftol"] = float(self.opt_accuracy) * self.opt_gradient_factor
+        return options
 
-        early_refine_triggered = False
-        result = None
-        try:
-            result = minimize(
-                fun,
-                x0,
-                jac=jac,
-                bounds=bounds_u,
-                constraints=constraints,
-                method="SLSQP",
-                callback=callback,
-                options=options,
-            )
-        except TrustClipStop as stop:
-            return self._controlled_trust_clip_result(stop, optimizer="SLSQP")
-        except GradientGuardStop as stop:
-            return self._controlled_gradient_guard_result(stop, optimizer="SLSQP")
-        except RefinementTriggered:
-            early_refine_triggered = True
-            print(
-                f"[{trigger_prefix(self.trigger_project)}] "
-                "Optimization stopped early due to refinement trigger"
-            )
+    def _run_slsqp_minimize(self, minimize, x0, bounds, constraints, maxiter, callback):
+        return minimize(
+            self._slsqp_fun_value,
+            x0,
+            jac=self._slsqp_jac_value,
+            bounds=bounds,
+            constraints=constraints,
+            method="SLSQP",
+            callback=callback,
+            options=self._slsqp_options(maxiter),
+        )
+
+    def _slsqp_legacy_callback(self, x):
+        self._slsqp_major_iter += 1
+        self._trust_clip_callback(list(x))
+
+    def _slsqp_moving_bounds_callback(self, x):
+        self._slsqp_major_iter += 1
+        if not self._moving_bounds_interrupt_on_active_bound:
+            return
+        local_bounds = self._moving_bounds_current_local_bounds
+        if local_bounds is None:
+            return
+        reduced = self.optimizer_to_physical(list(x))
+        reduced, _snapped = self._moving_bounds_snap_reduced_to_local_bounds(reduced)
+        active_bounds = self._moving_bounds_active_bounds(reduced, local_bounds)
+        if active_bounds:
+            raise MovingBoundsRestart(x, active_bounds)
+
+    def _finalize_slsqp_result(self, result, early_refine_triggered):
         best_record = self._best_ok_history_record()
         if best_record is not None:
             final_coefficients = [
@@ -3192,7 +3602,9 @@ class BSplineSU2Driver:
                     self.mode_ids,
                     self.initial_coefficients
                     if result is None
-                    else self.expand_reduced_physical(self.optimizer_to_physical(result.x)),
+                    else self.expand_reduced_physical(
+                        self.optimizer_to_physical(result.x)
+                    ),
                 )
             ]
             final_objective = float(best_record["objective"])
@@ -3205,6 +3617,11 @@ class BSplineSU2Driver:
             else:
                 final_coefficients = list(self.initial_coefficients)
                 final_objective = math.inf
+        if (
+            best_record is not None
+            and self._should_prepare_ikkt_aero_adjoints_for_refinement(early_refine_triggered)
+        ):
+            self.prepare_ikkt_aero_adjoints_for_refinement(history_record=best_record)
         self.write_optimized_modes(final_coefficients)
         if self.print_optimizer_table:
             if early_refine_triggered:
@@ -3212,7 +3629,17 @@ class BSplineSU2Driver:
             else:
                 print("{}    (Exit mode {})".format(str(result.message), int(result.status)))
             print("            Current function value: {:.12g}".format(final_objective))
-            print("            Iterations: {}".format(int(getattr(result, "nit", self._slsqp_major_iter))))
+            print(
+                "            Iterations: {}".format(
+                    int(
+                        getattr(
+                            result,
+                            "moving_bounds_total_nit",
+                            getattr(result, "nit", self._slsqp_major_iter),
+                        )
+                    )
+                )
+            )
             print("            Function evaluations: {}".format(int(getattr(result, "nfev", len(self._history_records)))))
             print("            Gradient evaluations: {}".format(int(getattr(result, "njev", len(self._history_records)))))
         return self._attach_trigger_state({
@@ -3235,6 +3662,243 @@ class BSplineSU2Driver:
                 getattr(self.trigger_project, "refinement_triggered", False)
             ),
         })
+
+    def _optimize_slsqp_legacy(self, minimize, maxiter, constraints):
+        x0 = self.physical_to_optimizer(self.initial_reduced_coefficients)
+        bounds_u = self.optimizer_bounds()
+        self._print_slsqp_parameters(maxiter, optimizer_bounds=bounds_u)
+        return self._run_slsqp_minimize(
+            minimize,
+            x0,
+            bounds_u,
+            constraints,
+            int(maxiter),
+            self._slsqp_legacy_callback,
+        )
+
+    def _optimize_slsqp_moving_bounds(self, minimize, maxiter, constraints):
+        if self.opt_line_search_bound is None:
+            raise BSplineSU2DriverError(
+                "BSPLINE_MOVING_BOUNDS requires OPT_LINE_SEARCH_BOUND to be positive"
+            )
+        full_basis, reduced_basis = self._moving_bounds_basis_matrices()
+        del full_basis
+        center = np.asarray(self.initial_reduced_coefficients, dtype=float)
+        global_bounds = list(self.reduced_bounds)
+        global_low = np.asarray([bounds[0] for bounds in global_bounds], dtype=float)
+        global_up = np.asarray([bounds[1] for bounds in global_bounds], dtype=float)
+        unit = worst_box_def(reduced_basis, global_low - center, global_up - center)
+        unit_def = float(unit["max_def_possible"])
+        limit = float(self.opt_line_search_bound)
+        eps = 1.0e-30
+        gamma_step = 1.0 if unit_def <= eps else min(1.0, limit / unit_def)
+        gamma = 1.0 if unit_def <= eps else min(1.0, gamma_step)
+        local_bounds = self._moving_bounds_local_bounds(
+            center,
+            global_bounds,
+            gamma,
+        )
+        self._print_slsqp_parameters(
+            maxiter,
+            optimizer_bounds=self._optimizer_bounds_from_physical(local_bounds),
+        )
+        print(
+            "[BSPLINE_MOVING_BOUNDS] enabled | disabling trust clip policy | limit={:.6e}".format(
+                limit
+            )
+        )
+        print(
+            "[BSPLINE_MOVING_BOUNDS] initial bounds | gamma={:.6e} | predicted_max_def={:.6e} | limit={:.6e}".format(
+                gamma,
+                gamma * unit_def,
+                limit,
+            )
+        )
+
+        x0 = self.physical_to_optimizer(self.initial_reduced_coefficients)
+        result = None
+        total_nit = 0
+        total_nfev = 0
+        total_njev = 0
+        maxiter = int(maxiter)
+        previous_local_bounds = self._moving_bounds_current_local_bounds
+        previous_interrupt = self._moving_bounds_interrupt_on_active_bound
+        try:
+            while True:
+                remaining = maxiter - total_nit
+                if remaining <= 0 and result is not None:
+                    break
+                self._moving_bounds_current_local_bounds = local_bounds
+                bounds_u = self._optimizer_bounds_from_physical(local_bounds)
+                major_iter_before = int(self._slsqp_major_iter)
+                interrupted = None
+                self._moving_bounds_interrupt_on_active_bound = (
+                    gamma < 1.0 - 1.0e-15
+                )
+                try:
+                    result = self._run_slsqp_minimize(
+                        minimize,
+                        x0,
+                        bounds_u,
+                        constraints,
+                        max(1, remaining),
+                        self._slsqp_moving_bounds_callback,
+                    )
+                except MovingBoundsRestart as stop:
+                    interrupted = stop
+                    result = SimpleNamespace(
+                        x=list(stop.x),
+                        fun=math.nan,
+                        success=True,
+                        message="moving bounds restart",
+                        status=0,
+                        nit=0,
+                        nfev=0,
+                        njev=0,
+                    )
+                finally:
+                    self._moving_bounds_interrupt_on_active_bound = False
+                callback_nit = max(0, int(self._slsqp_major_iter) - major_iter_before)
+                if interrupted is None:
+                    nit = int(getattr(result, "nit", callback_nit) or 0)
+                    if nit <= 0:
+                        nit = callback_nit
+                else:
+                    nit = callback_nit
+                total_nit += max(0, nit)
+                total_nfev += int(getattr(result, "nfev", 0) or 0)
+                total_njev += int(getattr(result, "njev", 0) or 0)
+
+                final_eval, _final_info = self._slsqp_eval_for_objective(result.x)
+                result.fun = float(final_eval["objective"]) * self.opt_gradient_factor
+                reduced_final = np.asarray(
+                    self.compress_full_physical(final_eval.get("coefficients", []))
+                    if final_eval.get("coefficients") is not None
+                    else self.optimizer_to_physical(result.x),
+                    dtype=float,
+                )
+                active_bounds = (
+                    list(interrupted.active_bounds)
+                    if interrupted is not None
+                    else self._moving_bounds_active_bounds(
+                        reduced_final,
+                        local_bounds,
+                    )
+                )
+                if not active_bounds or gamma >= 1.0 - 1.0e-15:
+                    break
+                remaining = maxiter - total_nit
+                if remaining <= 0:
+                    break
+
+                gamma_old = gamma
+                gamma = min(1.0, gamma + gamma_step)
+                local_bounds = self._moving_bounds_local_bounds(
+                    center,
+                    global_bounds,
+                    gamma,
+                )
+                print(
+                    "[BSPLINE_MOVING_BOUNDS] local bound reached | eval_id={} | active_bounds={}".format(
+                        final_eval.get("eval_id"),
+                        len(active_bounds),
+                    )
+                )
+                print(
+                    "[BSPLINE_MOVING_BOUNDS] expanding bounds | gamma {:.6e} -> {:.6e} | predicted_incremental_max_def={:.6e} | limit={:.6e}".format(
+                        gamma_old,
+                        gamma,
+                        (gamma - gamma_old) * unit_def,
+                        limit,
+                    )
+                )
+                print(
+                    "[BSPLINE_MOVING_BOUNDS] restart SLSQP from cached eval_id={}".format(
+                        final_eval.get("eval_id")
+                    )
+                )
+                final_coefficients = final_eval.get("coefficients")
+                if final_coefficients is None:
+                    x0 = [float(value) for value in result.x]
+                else:
+                    reduced_restart = self.compress_full_physical(final_coefficients)
+                    x0 = self.physical_to_optimizer(reduced_restart)
+        finally:
+            self._moving_bounds_current_local_bounds = previous_local_bounds
+            self._moving_bounds_interrupt_on_active_bound = previous_interrupt
+
+        if result is not None:
+            result.moving_bounds_total_nit = total_nit
+            result.nfev = total_nfev or getattr(result, "nfev", 0)
+            result.njev = total_njev or getattr(result, "njev", 0)
+        return result
+
+    def optimize(
+        self,
+        maxiter=5,
+        fallback_step=0.1,
+        gradient_tol=1.0e-8,
+        trigger_resume_state=None,
+    ):
+        self._apply_trigger_resume_state(trigger_resume_state)
+        self.configure_geometry_aware_bounds()
+        if not self.moving_bounds:
+            self._configure_line_search_bound()
+        self.configure_thickness_constraint()
+        try:
+            from scipy.optimize import minimize
+        except Exception:
+            if self.moving_bounds:
+                raise BSplineSU2DriverError(
+                    "SciPy is required when BSPLINE_MOVING_BOUNDS=YES"
+                )
+            if self.thickness_constraint is not None or self.native_constraints:
+                raise BSplineSU2DriverError(
+                    "SciPy is required when optimization constraints are active"
+                )
+            try:
+                return self._attach_trigger_state(self._optimize_projected_gradient_descent(
+                    maxiter=maxiter,
+                    step_size=fallback_step,
+                    gradient_tol=gradient_tol,
+                ))
+            except GradientGuardStop as stop:
+                return self._controlled_gradient_guard_result(
+                    stop,
+                    optimizer="projected_gradient_descent",
+                )
+
+        constraints = (
+            self._thickness_constraint_functions()
+            + self._native_constraint_functions()
+        )
+
+        early_refine_triggered = False
+        result = None
+        try:
+            if self.moving_bounds:
+                result = self._optimize_slsqp_moving_bounds(
+                    minimize,
+                    maxiter,
+                    constraints,
+                )
+            else:
+                result = self._optimize_slsqp_legacy(
+                    minimize,
+                    maxiter,
+                    constraints,
+                )
+        except TrustClipStop as stop:
+            return self._controlled_trust_clip_result(stop, optimizer="SLSQP")
+        except GradientGuardStop as stop:
+            return self._controlled_gradient_guard_result(stop, optimizer="SLSQP")
+        except RefinementTriggered:
+            early_refine_triggered = True
+            print(
+                f"[{trigger_prefix(self.trigger_project)}] "
+                "Optimization stopped early due to refinement trigger"
+            )
+        return self._finalize_slsqp_result(result, early_refine_triggered)
 
     def _optimize_projected_gradient_descent(self, maxiter, step_size, gradient_tol):
         self.configure_geometry_aware_bounds()
@@ -3346,6 +4010,7 @@ def run_bspline_su2_optimization(
     trust_clip_bad_window=5,
     trust_clip_stag_tol=1.0e-6,
     opt_line_search_bound=None,
+    moving_bounds=False,
     thickness_options=None,
     native_constraints=None,
     geometry_fd_eps=1.0e-6,
@@ -3360,6 +4025,9 @@ def run_bspline_su2_optimization(
     local_step_limit_ratio=200.0,
     trigger_opts=None,
     trigger_resume_state=None,
+    prepare_ikkt_aero_adjoints=False,
+    force_prepare_ikkt_aero_adjoints=False,
+    ikkt_active_tol=1.0e-6,
     progressive_label="PROGRESSIVE_BSPLINE",
     deformation_direction_mode=None,
     le_safe_direction=False,
@@ -3410,6 +4078,7 @@ def run_bspline_su2_optimization(
         trust_clip_bad_window=trust_clip_bad_window,
         trust_clip_stag_tol=trust_clip_stag_tol,
         opt_line_search_bound=opt_line_search_bound,
+        moving_bounds=moving_bounds,
         thickness_options=thickness_options,
         native_constraints=native_constraints,
         geometry_fd_eps=geometry_fd_eps,
@@ -3423,6 +4092,9 @@ def run_bspline_su2_optimization(
         local_step_limit=local_step_limit,
         local_step_limit_ratio=local_step_limit_ratio,
         trigger_opts=trigger_opts,
+        prepare_ikkt_aero_adjoints=prepare_ikkt_aero_adjoints,
+        force_prepare_ikkt_aero_adjoints=force_prepare_ikkt_aero_adjoints,
+        ikkt_active_tol=ikkt_active_tol,
         progressive_label=progressive_label,
         deformation_direction_mode=deformation_direction_mode,
         le_safe_direction=le_safe_direction,

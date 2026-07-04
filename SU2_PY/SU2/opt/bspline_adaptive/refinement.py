@@ -604,11 +604,24 @@ def _build_next_independent(
 
     meta_side = {side: [] for side in INDEPENDENT_SIDES}
     sig_side = {side: [] for side in INDEPENDENT_SIDES}
+    objective_signal = settings.get("_ikkt_objective_signal")
+    obj_side = {side: [] for side in INDEPENDENT_SIDES}
+    if objective_signal is not None:
+        objective_signal = list(objective_signal)
+        if len(objective_signal) != len(metadata):
+            raise BSplineAdaptiveError(
+                "IKKT objective signal length does not match refinement metadata"
+            )
     for row, value in zip(metadata, signal):
         side = str(row.get("side", "")).strip().lower()
         if side in meta_side:
             meta_side[side].append(row)
             sig_side[side].append(float(value))
+    if objective_signal is not None:
+        for row, value in zip(metadata, objective_signal):
+            side = str(row.get("side", "")).strip().lower()
+            if side in obj_side:
+                obj_side[side].append(float(value))
 
     orig_space = extract_independent_side_spaces(spec, settings)
     sides = tuple(side for side in INDEPENDENT_SIDES if side in orig_space)
@@ -687,12 +700,16 @@ def _build_next_independent(
         for side in sides:
             if not knot_insertion_spans(cur_space[side].knot_vector, min_width=min_width):
                 continue
+            score_settings = settings
+            if objective_signal is not None:
+                score_settings = dict(settings)
+                score_settings["_ikkt_objective_signal"] = obj_side[side]
             try:
                 side_rows = score_knot_spans(
                     cur_space[side],
                     meta_side[side],
                     sig_side[side],
-                    settings,
+                    score_settings,
                 )
             except BSplineAdaptiveError:
                 continue

@@ -55,6 +55,7 @@ def fixed_driver_options_from_config(config_values):
         "OPT_RELAX_FACTOR": "opt_relax_factor",
         "OPT_GRADIENT_FACTOR": "opt_gradient_factor",
         "OPT_LINE_SEARCH_BOUND": "opt_line_search_bound",
+        "BSPLINE_MOVING_BOUNDS": "moving_bounds",
         "BSPLINE_LOCAL_STEP_LIMIT": "local_step_limit",
         "BSPLINE_LOCAL_STEP_LIMIT_RATIO": "local_step_limit_ratio",
         "BSPLINE_AUTO_SCALE_BOUNDS_TO_GEOMETRY": "auto_scale_bounds_to_geometry",

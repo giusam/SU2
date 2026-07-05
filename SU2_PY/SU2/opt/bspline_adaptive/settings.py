@@ -196,6 +196,31 @@ def validate_adaptive_options(opts):
         raise BSplineAdaptiveError(
             f"unsupported knot score mode {opts['knot_score_mode']!r}; allowed values are {ALLOWED_KNOT_SCORE_MODES}"
         )
+    opts["scoring_diagnostics"] = _as_bool(
+        opts.get("scoring_diagnostics", False),
+        default=False,
+    )
+    opts["scoring_diagnostic_dir"] = str(
+        opts.get("scoring_diagnostic_dir", "DIAGNOSTIC") or "DIAGNOSTIC"
+    ).strip()
+    if not opts["scoring_diagnostic_dir"]:
+        opts["scoring_diagnostic_dir"] = "DIAGNOSTIC"
+    opts["scoring_diagnostic_nodal_fields"] = _as_bool(
+        opts.get("scoring_diagnostic_nodal_fields", True),
+        default=True,
+    )
+    opts["scoring_diagnostic_svd"] = _as_bool(
+        opts.get("scoring_diagnostic_svd", True),
+        default=True,
+    )
+    opts["scoring_diagnostic_basis"] = _as_bool(
+        opts.get("scoring_diagnostic_basis", True),
+        default=True,
+    )
+    opts["scoring_diagnostic_ikkt"] = _as_bool(
+        opts.get("scoring_diagnostic_ikkt", True),
+        default=True,
+    )
     ikkt_mode = opts["knot_score_mode"] == "IKKT_VIRTUAL_INSERTION"
     opts["ikkt_include_geometry_constraints"] = _as_bool(
         opts.get("ikkt_include_geometry_constraints", True),
@@ -765,6 +790,12 @@ def adaptive_options_from_config(config_values):
         "BSPLINE_SENSITIVITY_WEIGHTING": "sensitivity_weighting",
         "BSPLINE_SENSITIVITY_SOURCE": "sensitivity_source",
         "BSPLINE_KNOT_SCORE_MODE": "knot_score_mode",
+        "BSPLINE_SCORING_DIAGNOSTICS": "scoring_diagnostics",
+        "BSPLINE_SCORING_DIAGNOSTIC_DIR": "scoring_diagnostic_dir",
+        "BSPLINE_SCORING_DIAGNOSTIC_NODAL_FIELDS": "scoring_diagnostic_nodal_fields",
+        "BSPLINE_SCORING_DIAGNOSTIC_SVD": "scoring_diagnostic_svd",
+        "BSPLINE_SCORING_DIAGNOSTIC_BASIS": "scoring_diagnostic_basis",
+        "BSPLINE_SCORING_DIAGNOSTIC_IKKT": "scoring_diagnostic_ikkt",
         "BSPLINE_IKKT_INCLUDE_GEOMETRY_CONSTRAINTS": "ikkt_include_geometry_constraints",
         "BSPLINE_IKKT_INCLUDE_AERO_CONSTRAINTS": "ikkt_include_aero_constraints",
         "BSPLINE_IKKT_REQUIRE_AVAILABLE_FIELDS": "ikkt_require_available_fields",
@@ -1246,6 +1277,12 @@ def print_startup_summary(settings):
         f"{settings.get('sensitivity_source', 'DOT_AD_TRANSFER')}"
     )
     print("[PROGRESSIVE_BSPLINE] refinement: KNOT_INSERTION")
+    print(
+        "[PROGRESSIVE_BSPLINE] scoring diagnostics: {} dir={}".format(
+            "ON" if settings.get("scoring_diagnostics", False) else "OFF",
+            settings.get("scoring_diagnostic_dir", "DIAGNOSTIC"),
+        )
+    )
     if str(settings.get("knot_score_mode", "")).upper() == "IKKT_VIRTUAL_INSERTION":
         print(
             "[PROGRESSIVE_BSPLINE] IKKT score: geometry={} aero={} require_fields={} scaling={} sign={} thickness_active_tol={}".format(
@@ -1361,6 +1398,20 @@ def _settings_from_args(args):
         "refine_mode": args.refine_mode,
         "refine_state": args.refine_state,
         "knot_score_mode": args.knot_score_mode,
+        "scoring_diagnostics": getattr(args, "scoring_diagnostics", False),
+        "scoring_diagnostic_dir": getattr(
+            args,
+            "scoring_diagnostic_dir",
+            "DIAGNOSTIC",
+        ),
+        "scoring_diagnostic_nodal_fields": getattr(
+            args,
+            "scoring_diagnostic_nodal_fields",
+            True,
+        ),
+        "scoring_diagnostic_svd": getattr(args, "scoring_diagnostic_svd", True),
+        "scoring_diagnostic_basis": getattr(args, "scoring_diagnostic_basis", True),
+        "scoring_diagnostic_ikkt": getattr(args, "scoring_diagnostic_ikkt", True),
         "ikkt_include_geometry_constraints": getattr(
             args,
             "ikkt_include_geometry_constraints",

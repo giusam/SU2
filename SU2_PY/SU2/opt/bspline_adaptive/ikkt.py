@@ -920,6 +920,18 @@ def _diagnostics_base(
         settings.get("ikkt_sign_convention", "SLSQP_GE_RAW")
     )
     lambda_values = [None] * len(constraints) if lambdas is None else lambdas
+    nodal_constraints = []
+    for field, lam in zip(constraints, lambda_values):
+        nodal_constraints.append(
+            {
+                "name": field.name,
+                "source": field.source,
+                "function_name": field.function_name or field.name,
+                "raw_field": np.asarray(field.raw_field, dtype=float),
+                "fit_field": np.asarray(field.fit_field, dtype=float),
+                "lambda": None if lam is None else float(lam),
+            }
+        )
     return {
         "score_mode": "IKKT_VIRTUAL_INSERTION",
         "status": status,
@@ -950,6 +962,11 @@ def _diagnostics_base(
         ),
         "least_squares": {} if lsq_diag is None else lsq_diag,
         "node_mask": _node_mask_diagnostics(mask),
+        "_nodal_fields_payload": {
+            "objective_fit": np.asarray(objective_fit, dtype=float),
+            "residual": np.asarray(residual, dtype=float),
+            "constraints": nodal_constraints,
+        },
         **basis_diag,
     }
 
@@ -1036,8 +1053,21 @@ def build_ikkt_score_signal(mode_spec, metadata, objective_signal, settings):
 
 
 def write_ikkt_diagnostics(filename, diagnostics):
+    def _public_payload(value):
+        if isinstance(value, dict):
+            return {
+                key: _public_payload(item)
+                for key, item in value.items()
+                if not str(key).startswith("_")
+            }
+        if isinstance(value, list):
+            return [_public_payload(item) for item in value]
+        if isinstance(value, tuple):
+            return [_public_payload(item) for item in value]
+        return value
+
     path = Path(filename)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as fp:
-        json.dump(diagnostics, fp, indent=2)
+        json.dump(_public_payload(diagnostics), fp, indent=2)
         fp.write("\n")

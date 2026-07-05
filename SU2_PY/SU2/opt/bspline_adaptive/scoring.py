@@ -11,6 +11,12 @@ from SU2.opt.bspline_dot import (
 )
 
 from .errors import BSplineAdaptiveError
+from .diagnostics import (
+    candidate_id,
+    old_basis_payload,
+    record_scoring_pass,
+    scoring_pass_active,
+)
 from .knot_space import (
     insert_knot_midpoint,
     knot_insertion_spans,
@@ -31,7 +37,12 @@ def project_onto_basis(matrix, values, regularization=1.0e-12):
         coeffs = _tikhonov_projection(matrix, values, regularization)
     return matrix.dot(coeffs)
 
-def _rank_incremental_columns(active_matrix, candidate_matrix, regularization):
+def _rank_incremental_columns(
+    active_matrix,
+    candidate_matrix,
+    regularization,
+    return_diagnostics=False,
+):
     # Return an orthonormal basis for the truly new incremental subspace.
     #
     # Knot insertion can add several candidate columns, but after projection
@@ -40,6 +51,7 @@ def _rank_incremental_columns(active_matrix, candidate_matrix, regularization):
     # Z.T @ Z nearly singular. We therefore residualize the block and compress
     # it with SVD to its numerical rank.
     residual_columns = []
+    residual_norms_all = []
 
     for column in range(candidate_matrix.shape[1]):
         z = residualize_candidate(
@@ -48,13 +60,100 @@ def _rank_incremental_columns(active_matrix, candidate_matrix, regularization):
             regularization=regularization,
         )
         h = float(np.dot(z, z))
+        residual_norms_all.append(math.sqrt(max(h, 0.0)) if math.isfinite(h) else math.nan)
         if h > float(regularization) and math.isfinite(h):
             residual_columns.append(z)
 
     if not residual_columns:
-        return np.zeros((candidate_matrix.shape[0], 0), dtype=float)
+        basis = np.zeros((candidate_matrix.shape[0], 0), dtype=float)
+        if return_diagnostics:
+            return basis, {
+                "candidate_columns": int(candidate_matrix.shape[1]),
+                "residual_columns_kept": 0,
+                "rejected_columns": int(candidate_matrix.shape[1]),
+                "residual_column_norms_all": residual_norms_all,
+                "residual_column_norms_kept": [],
+                "svd_backend": "none",
+                "svd_singular_values_all": [],
+                "svd_singular_values_kept": [],
+                "svd_tol": None,
+                "incremental_rank": 0,
+                "rank_gap": None,
+                "raw_incremental_condition": None,
+                "gram_condition_after_svd": None,
+                "u_orthogonality_error": None,
+                "old_space_orthogonality": None,
+            }
+        return basis
 
     Z = np.column_stack(residual_columns)
+    residual_norms_kept = [
+        float(np.linalg.norm(Z[:, column]))
+        for column in range(Z.shape[1])
+    ]
+
+    def _basis_diagnostics(basis, singular_values, tol, backend, rank):
+        if int(rank) <= 0 or basis.shape[1] == 0:
+            return {
+                "candidate_columns": int(candidate_matrix.shape[1]),
+                "residual_columns_kept": int(len(residual_columns)),
+                "rejected_columns": int(candidate_matrix.shape[1] - len(residual_columns)),
+                "residual_column_norms_all": residual_norms_all,
+                "residual_column_norms_kept": residual_norms_kept,
+                "svd_backend": backend,
+                "svd_singular_values_all": [float(value) for value in singular_values],
+                "svd_singular_values_kept": [],
+                "svd_tol": None if tol is None else float(tol),
+                "incremental_rank": 0,
+                "rank_gap": None,
+                "raw_incremental_condition": None,
+                "gram_condition_after_svd": None,
+                "u_orthogonality_error": None,
+                "old_space_orthogonality": None,
+            }
+        singular_values = [float(value) for value in singular_values]
+        kept = singular_values[: int(rank)]
+        rank_gap = (
+            kept[-1] / singular_values[int(rank)]
+            if int(rank) < len(singular_values) and singular_values[int(rank)] != 0.0
+            else None
+        )
+        raw_condition = (
+            kept[0] / kept[-1]
+            if kept and kept[-1] != 0.0
+            else None
+        )
+        gram = basis.T.dot(basis)
+        try:
+            gram_condition = float(np.linalg.cond(gram))
+        except Exception:
+            gram_condition = math.inf
+        try:
+            u_error = float(np.linalg.norm(gram - np.eye(gram.shape[0]), ord="fro"))
+        except Exception:
+            u_error = math.inf
+        denom = float(np.linalg.norm(active_matrix, ord="fro") * np.linalg.norm(basis, ord="fro")) + 1.0e-300
+        try:
+            old_orthogonality = float(np.linalg.norm(active_matrix.T.dot(basis), ord="fro") / denom)
+        except Exception:
+            old_orthogonality = math.inf
+        return {
+            "candidate_columns": int(candidate_matrix.shape[1]),
+            "residual_columns_kept": int(len(residual_columns)),
+            "rejected_columns": int(candidate_matrix.shape[1] - len(residual_columns)),
+            "residual_column_norms_all": residual_norms_all,
+            "residual_column_norms_kept": residual_norms_kept,
+            "svd_backend": backend,
+            "svd_singular_values_all": singular_values,
+            "svd_singular_values_kept": kept,
+            "svd_tol": None if tol is None else float(tol),
+            "incremental_rank": int(rank),
+            "rank_gap": rank_gap,
+            "raw_incremental_condition": raw_condition,
+            "gram_condition_after_svd": gram_condition,
+            "u_orthogonality_error": u_error,
+            "old_space_orthogonality": old_orthogonality,
+        }
 
     try:
         U, S, _Vt = np.linalg.svd(Z, full_matrices=False)
@@ -62,7 +161,10 @@ def _rank_incremental_columns(active_matrix, candidate_matrix, regularization):
         Q, R = np.linalg.qr(Z, mode="reduced")
         diag = np.abs(np.diag(R)) if R.ndim == 2 else np.array([])
         if diag.size == 0:
-            return np.zeros((candidate_matrix.shape[0], 0), dtype=float)
+            basis = np.zeros((candidate_matrix.shape[0], 0), dtype=float)
+            if return_diagnostics:
+                return basis, _basis_diagnostics(basis, [], None, "qr_fallback", 0)
+            return basis
 
         tol = max(
             float(regularization) ** 0.5,
@@ -71,12 +173,21 @@ def _rank_incremental_columns(active_matrix, candidate_matrix, regularization):
         rank = int(np.sum(diag > tol))
 
         if rank <= 0:
-            return np.zeros((candidate_matrix.shape[0], 0), dtype=float)
+            basis = np.zeros((candidate_matrix.shape[0], 0), dtype=float)
+            if return_diagnostics:
+                return basis, _basis_diagnostics(basis, diag, tol, "qr_fallback", 0)
+            return basis
 
-        return Q[:, :rank]
+        basis = Q[:, :rank]
+        if return_diagnostics:
+            return basis, _basis_diagnostics(basis, diag, tol, "qr_fallback", rank)
+        return basis
 
     if S.size == 0:
-        return np.zeros((candidate_matrix.shape[0], 0), dtype=float)
+        basis = np.zeros((candidate_matrix.shape[0], 0), dtype=float)
+        if return_diagnostics:
+            return basis, _basis_diagnostics(basis, S, None, "svd", 0)
+        return basis
 
     tol = max(
         float(regularization) ** 0.5,
@@ -85,9 +196,15 @@ def _rank_incremental_columns(active_matrix, candidate_matrix, regularization):
     rank = int(np.sum(S > tol))
 
     if rank <= 0:
-        return np.zeros((candidate_matrix.shape[0], 0), dtype=float)
+        basis = np.zeros((candidate_matrix.shape[0], 0), dtype=float)
+        if return_diagnostics:
+            return basis, _basis_diagnostics(basis, S, tol, "svd", 0)
+        return basis
 
-    return U[:, :rank]
+    basis = U[:, :rank]
+    if return_diagnostics:
+        return basis, _basis_diagnostics(basis, S, tol, "svd", rank)
+    return basis
 
 def _score_virtual_insertion_on_basis(
     z_matrix,
@@ -166,6 +283,23 @@ def _drop_closure_nodes(metadata, signal, eps=SCORING_CLOSURE_NODE_EPS):
 
 def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
     knot_score_mode = str(settings.get("knot_score_mode", "VIRTUAL_INSERTION")).upper()
+    diagnostics_active = scoring_pass_active(settings)
+    diagnostic_state = (
+        settings.get("_scoring_diagnostics_state", {})
+        if diagnostics_active
+        else {}
+    )
+    diagnostic_context = diagnostic_state.get("context", {}) if diagnostics_active else {}
+    diagnostic_level = int(diagnostic_context.get("level", 0)) if diagnostics_active else 0
+    diagnostic_batch_step = int(settings.get("_diagnostic_batch_step", 1) or 1)
+    diagnostic_pass_id = int(
+        settings.get("_diagnostic_scoring_pass_id", diagnostic_batch_step)
+        or diagnostic_batch_step
+    )
+    diagnostic_side = str(
+        settings.get("_diagnostic_side")
+        or (space.sides[0].upper() if len(space.sides) == 1 else "BOTH")
+    ).upper()
     mask = scoring_node_mask(metadata)
     objective_signal = settings.get("_ikkt_objective_signal")
     if objective_signal is not None:
@@ -185,9 +319,41 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
         raise BSplineAdaptiveError("KNOT_INSERTION found no non-degenerate knot spans")
 
     old_modes, old_matrix = reduced_basis_matrix_for_space(space, space.spec, metadata)
+    del old_modes
     signal = np.asarray(signal, dtype=float)
     residual = signal - project_onto_basis(old_matrix, signal, regularization=regularization)
     candidate_side = space.sides[0].upper() if len(space.sides) == 1 else "BOTH"
+    if settings.get("_diagnostic_side"):
+        candidate_side = diagnostic_side
+    primary_signal_name = (
+        "ikkt_residual"
+        if knot_score_mode == "IKKT_VIRTUAL_INSERTION"
+        else "objective"
+    )
+    score_signal_norm = float(np.linalg.norm(signal))
+    objective_signal_norm = (
+        float(np.linalg.norm(objective_signal))
+        if objective_signal is not None
+        else None
+    )
+    pass_payload = None
+    if diagnostics_active:
+        pass_payload = {
+            "batch_step": diagnostic_batch_step,
+            "scoring_pass_id": diagnostic_pass_id,
+            "side": diagnostic_side,
+            "old_basis": (
+                old_basis_payload(
+                    old_matrix,
+                    signal,
+                    objective_signal if objective_signal is not None else signal,
+                    primary_signal_name,
+                    regularization,
+                )
+                if settings.get("scoring_diagnostic_basis", True)
+                else {"status": "disabled"}
+            ),
+        }
     rows = []
     for left, right, inserted in spans:
         new_knots = insert_knot_midpoint(space.knot_vector, (left, right, inserted))
@@ -200,6 +366,21 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
             in_span = left <= x_over_c <= right if last_span else left <= x_over_c < right
             if in_span:
                 residual_energy += float(value) * float(value)
+        span_mask = []
+        for row in metadata:
+            x_over_c = float(row["x_over_c"])
+            span_mask.append(left <= x_over_c <= right if last_span else left <= x_over_c < right)
+        span_mask = np.asarray(span_mask, dtype=bool)
+        span_upper = np.asarray(
+            [str(row.get("side", "")).strip().lower() == "upper" for row in metadata],
+            dtype=bool,
+        )
+        span_lower = np.asarray(
+            [str(row.get("side", "")).strip().lower() == "lower" for row in metadata],
+            dtype=bool,
+        )
+        z_matrix = np.zeros((len(metadata), 0), dtype=float)
+        rank_diag = {}
 
         if knot_score_mode == "RESIDUAL_ENERGY":
             score_raw = float(residual_energy)
@@ -208,11 +389,19 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
             columns = 0
             condition = 0.0
         elif knot_score_mode in ("VIRTUAL_INSERTION", "IKKT_VIRTUAL_INSERTION"):
-            z_matrix = _rank_incremental_columns(
-                old_matrix,
-                new_matrix,
-                regularization,
-            )
+            if diagnostics_active and settings.get("scoring_diagnostic_svd", True):
+                z_matrix, rank_diag = _rank_incremental_columns(
+                    old_matrix,
+                    new_matrix,
+                    regularization,
+                    return_diagnostics=True,
+                )
+            else:
+                z_matrix = _rank_incremental_columns(
+                    old_matrix,
+                    new_matrix,
+                    regularization,
+                )
             score, score_raw, rank, columns, condition = _score_virtual_insertion_on_basis(
                 z_matrix,
                 signal,
@@ -230,11 +419,16 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
         score_objective = ""
         rank_objective = ""
         objective_projection = ""
+        score_objective_normalized = ""
         score_ikkt = ""
         rank_ikkt = ""
         lagrangian_projection = ""
+        score_ikkt_normalized = ""
+        ikkt_objective_score_ratio = ""
+        candidate_projection_cosine_ikkt_objective = ""
         if knot_score_mode == "IKKT_VIRTUAL_INSERTION":
             score_ikkt = float(score)
+            score_ikkt_normalized = float(score) / (score_signal_norm * score_signal_norm + 1.0e-300)
             lagrangian_projection = math.sqrt(float(score_raw)) if float(score_raw) >= 0.0 else 0.0
             if objective_signal is not None:
                 obj_score, obj_raw, _obj_rank, _obj_columns, obj_condition = _score_virtual_insertion_on_basis(
@@ -248,11 +442,77 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
                     obj_score = 0.0
                     obj_raw = 0.0
                 score_objective = float(obj_score)
+                score_objective_normalized = (
+                    float(obj_score)
+                    / (float(objective_signal_norm) * float(objective_signal_norm) + 1.0e-300)
+                    if objective_signal_norm is not None
+                    else ""
+                )
                 objective_projection = math.sqrt(float(obj_raw)) if float(obj_raw) >= 0.0 else 0.0
+                ikkt_objective_score_ratio = float(score) / (float(obj_score) + 1.0e-300)
+                p_l = z_matrix.T.dot(signal)
+                p_j = z_matrix.T.dot(objective_signal)
+                denom = float(np.linalg.norm(p_l) * np.linalg.norm(p_j)) + 1.0e-300
+                candidate_projection_cosine_ikkt_objective = float(np.dot(p_l, p_j) / denom)
+
+        support_mask = (
+            np.linalg.norm(z_matrix, axis=1) > 1.0e-12
+            if z_matrix.shape[1] > 0
+            else np.zeros(len(metadata), dtype=bool)
+        )
+        residual_norms = rank_diag.get("residual_column_norms_kept", [])
+        projection_norm = math.sqrt(float(score_raw)) if float(score_raw) >= 0.0 else 0.0
+        row_payload = {
+            "level": diagnostic_level if diagnostics_active else "",
+            "batch_step": diagnostic_batch_step if diagnostics_active else "",
+            "scoring_pass_id": diagnostic_pass_id if diagnostics_active else "",
+            "candidate_id": (
+                candidate_id(
+                    diagnostic_level,
+                    diagnostic_pass_id,
+                    diagnostic_batch_step,
+                    candidate_side,
+                    left,
+                    right,
+                    inserted,
+                )
+                if diagnostics_active
+                else ""
+            ),
+            "primary_signal_name": primary_signal_name,
+            "span_node_count": int(np.sum(span_mask)),
+            "span_node_count_upper": int(np.sum(span_mask & span_upper)),
+            "span_node_count_lower": int(np.sum(span_mask & span_lower)),
+            "incremental_support_node_count": int(np.sum(support_mask)),
+            "incremental_support_node_count_upper": int(np.sum(support_mask & span_upper)),
+            "incremental_support_node_count_lower": int(np.sum(support_mask & span_lower)),
+            "pre_svd_columns": rank_diag.get("candidate_columns", int(new_matrix.shape[1])),
+            "rejected_columns": rank_diag.get("rejected_columns", ""),
+            "residual_column_norm_min": min(residual_norms) if residual_norms else "",
+            "residual_column_norm_max": max(residual_norms) if residual_norms else "",
+            "residual_column_norms": residual_norms,
+            "svd_tol": rank_diag.get("svd_tol", ""),
+            "svd_singular_values_all": rank_diag.get("svd_singular_values_all", []),
+            "svd_singular_values_kept": rank_diag.get("svd_singular_values_kept", []),
+            "rank_gap": rank_diag.get("rank_gap", ""),
+            "raw_incremental_condition": rank_diag.get("raw_incremental_condition", ""),
+            "gram_condition_after_svd": rank_diag.get("gram_condition_after_svd", ""),
+            "u_orthogonality_error": rank_diag.get("u_orthogonality_error", ""),
+            "old_space_orthogonality": rank_diag.get("old_space_orthogonality", ""),
+            "score_signal_norm": score_signal_norm,
+            "projection_norm": projection_norm,
+            "score_normalized": float(score) / (score_signal_norm * score_signal_norm + 1.0e-300),
+            "score_ikkt_normalized": score_ikkt_normalized,
+            "score_objective_normalized": score_objective_normalized,
+            "ikkt_objective_score_ratio": ikkt_objective_score_ratio,
+            "candidate_projection_cosine_ikkt_objective": candidate_projection_cosine_ikkt_objective,
+        }
 
         rows.append(
             {
-                "batch_step": "",
+                "batch_step": diagnostic_batch_step if diagnostics_active else "",
+                "scoring_pass_id": diagnostic_pass_id if diagnostics_active else "",
+                "candidate_id": row_payload["candidate_id"],
                 "span_left": float(left),
                 "span_right": float(right),
                 "span_width": float(right) - float(left),
@@ -273,6 +533,7 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
                 "condition_number": condition,
                 "selected": False,
                 "status": "ok",
+                **row_payload,
             }
         )
 
@@ -298,6 +559,8 @@ def score_knot_spans(space, metadata, signal, settings, regularization=1.0e-12):
             row["rank_objective"] = rank
     if rows and float(rows[0]["score"]) > 0.0 and math.isfinite(float(rows[0]["score"])):
         rows[0]["selected"] = True
+    if diagnostics_active and pass_payload is not None:
+        record_scoring_pass(settings, pass_payload)
     return rows
 
 def build_scalar_deformation_sensitivity(metadata, sensitivities):

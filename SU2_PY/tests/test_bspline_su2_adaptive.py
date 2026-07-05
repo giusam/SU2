@@ -38,6 +38,10 @@ from SU2.opt.bspline_su2_adaptive import (
     validate_adaptive_options,
 )
 from SU2.opt.bspline_su2_driver import BSplineSU2Driver
+from SU2.opt.bspline_adaptive.diagnostics import (
+    finalize_level_diagnostics,
+    initialize_level_diagnostics,
+)
 from SU2.opt.progressive_trigger import (
     RefinementTriggered,
     build_online_trigger_opts,
@@ -826,6 +830,30 @@ def test_legacy_streuber_cfg_alias_populates_canonical_depth_options():
     assert settings["knot_depth_penalty_mode"] == "STREUBER_DEPTH"
 
 
+def test_scoring_diagnostics_cfg_defaults_and_flags():
+    defaults = validate_adaptive_options(_minimal_settings())
+    options = adaptive_options_from_config(
+        {
+            "BSPLINE_SCORING_DIAGNOSTICS": "YES",
+            "BSPLINE_SCORING_DIAGNOSTIC_DIR": "MY_DIAG",
+            "BSPLINE_SCORING_DIAGNOSTIC_NODAL_FIELDS": "NO",
+            "BSPLINE_SCORING_DIAGNOSTIC_SVD": "NO",
+            "BSPLINE_SCORING_DIAGNOSTIC_BASIS": "NO",
+            "BSPLINE_SCORING_DIAGNOSTIC_IKKT": "NO",
+        }
+    )
+    settings = validate_adaptive_options(_minimal_settings(**options))
+
+    assert defaults["scoring_diagnostics"] is False
+    assert defaults["scoring_diagnostic_dir"] == "DIAGNOSTIC"
+    assert settings["scoring_diagnostics"] is True
+    assert settings["scoring_diagnostic_dir"] == "MY_DIAG"
+    assert settings["scoring_diagnostic_nodal_fields"] is False
+    assert settings["scoring_diagnostic_svd"] is False
+    assert settings["scoring_diagnostic_basis"] is False
+    assert settings["scoring_diagnostic_ikkt"] is False
+
+
 def test_knot_batch_penalty_legacy_mode_preserves_order_and_score():
     rows = [
         {"rank": 1, "span_left": 0.0, "span_right": 0.25, "score": 10.0},
@@ -1343,6 +1371,86 @@ def test_knot_insertion_growth_ratio_and_fixed_remain_supported(tmp_path):
     assert rows
     assert selected["refine_mode"] == "KNOT_INSERTION"
     assert selected["reduced_ndv_after"] == selected["reduced_ndv_before"] + 1
+
+
+def test_scoring_diagnostics_write_multi_pass_outputs(tmp_path):
+    modes = tmp_path / "modes.json"
+    spec = generate_initial_bspline_modes(
+        modes,
+        "AIRFOIL",
+        nper_side=6,
+        surface_mode="UPPER",
+        class_shape="none",
+    )
+    metadata = [
+        {"x_over_c": float(x_value), "side": "upper", "x": float(x_value), "y": 0.0}
+        for x_value in np.linspace(0.05, 0.95, 21)
+    ]
+    signal = [
+        math.sin(5.0 * math.pi * row["x_over_c"])
+        + 0.25 * math.sin(9.0 * math.pi * row["x_over_c"])
+        for row in metadata
+    ]
+    settings = validate_adaptive_options(
+        _minimal_settings(
+            workdir=str(tmp_path),
+            scoring_diagnostics=True,
+            scoring_diagnostic_dir="DIAGNOSTIC",
+            symmetry_coupling="NONE",
+            surface_mode="UPPER",
+            nadd_mode="FIXED",
+            fixed_nadd=2,
+            nfinal=20,
+            knot_insertions_per_refine=2,
+            knot_score_mode="RESIDUAL_ENERGY",
+        )
+    )
+    initialize_level_diagnostics(
+        settings,
+        {
+            "level": 0,
+            "score_mode": "RESIDUAL_ENERGY",
+            "primary_signal_name": "objective",
+            "workdir": str(tmp_path),
+        },
+        metadata,
+        signal,
+        objective_signal=signal,
+        ikkt_diagnostics=None,
+    )
+
+    next_modes, rows, selected = build_next_knot_inserted_modes(
+        spec,
+        metadata,
+        signal,
+        settings,
+    )
+    finalize_level_diagnostics(settings, rows, selected)
+
+    assert next_modes is not None
+    diag = tmp_path / "DIAGNOSTIC" / "level_000"
+    assert (diag / "00_context.json").exists()
+    assert (diag / "05_nodal_fields.csv").exists()
+    old_basis = json.loads((diag / "06_old_basis.json").read_text())
+    ranking = json.loads((diag / "08_ranking_summary.json").read_text())
+    assert len(old_basis["passes"]) >= 2
+    assert len(ranking["passes"]) >= 2
+    assert "RANKING_RECOMPUTED_AFTER_INSERTION" in ranking["warnings"]
+
+    with open(diag / "07_knot_span_scores_extended.csv", newline="") as fp:
+        score_rows = list(csv.DictReader(fp))
+    with open(diag / "09_selected_candidates.csv", newline="") as fp:
+        selected_rows = list(csv.DictReader(fp))
+    assert score_rows
+    assert selected_rows
+    assert {"candidate_id", "scoring_pass_id", "batch_step"}.issubset(score_rows[0])
+    score_ids = {row["candidate_id"] for row in score_rows}
+    assert all(row["candidate_id"] in score_ids for row in selected_rows)
+
+    with open(tmp_path / "DIAGNOSTIC" / "summary_levels.csv", newline="") as fp:
+        summary_rows = list(csv.DictReader(fp))
+    assert summary_rows[0]["level"] == "0"
+    assert "RANKING_RECOMPUTED_AFTER_INSERTION" in summary_rows[0]["warnings"]
 
 
 def test_active_budget_reallocation_freezes_existing_mode_after_boehm(tmp_path):

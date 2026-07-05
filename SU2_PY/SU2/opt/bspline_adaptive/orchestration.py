@@ -31,6 +31,10 @@ from .history import (
     write_knot_span_scores_csv,
     write_selected_knot_refinement_json,
 )
+from .diagnostics import (
+    finalize_level_diagnostics,
+    initialize_level_diagnostics,
+)
 from .ikkt import build_ikkt_score_signal, write_ikkt_diagnostics
 from .knot_space import refinement_limit_ndv
 from .mode_utils import (
@@ -83,6 +87,69 @@ def _relative_level_improvement(safe_opt_rows, eps):
     start = float(safe_opt_rows[0]["_objective"])
     best = min(float(row["_objective"]) for row in safe_opt_rows)
     return (start - best) / (abs(start) + float(eps))
+
+
+def _eval_id_from_eval_dir(eval_dir):
+    if eval_dir is None:
+        return None
+    name = Path(eval_dir).name
+    if name.startswith("eval_"):
+        try:
+            return int(name.split("_", 1)[1])
+        except Exception:
+            return None
+    return None
+
+
+def _history_row_for_eval_id(rows, eval_id):
+    if eval_id is None:
+        return {}
+    for row in rows:
+        try:
+            if int(row.get("_eval_id", row.get("eval_id", -1))) == int(eval_id):
+                return row
+        except Exception:
+            continue
+    return {}
+
+
+def _scoring_diagnostic_context(
+    settings,
+    level,
+    level_id,
+    adjoint_eval_dir,
+    opt_rows,
+    optimized_modes_filename,
+):
+    eval_id = _eval_id_from_eval_dir(adjoint_eval_dir)
+    history_row = _history_row_for_eval_id(opt_rows, eval_id)
+    score_mode = str(settings.get("knot_score_mode", "VIRTUAL_INSERTION")).upper()
+    return {
+        "diagnostic_version": 1,
+        "level": int(level_id),
+        "batch_step": 1,
+        "scoring_pass_id": 1,
+        "score_mode": score_mode,
+        "primary_signal_name": (
+            "ikkt_residual"
+            if score_mode == "IKKT_VIRTUAL_INSERTION"
+            else "objective"
+        ),
+        "workdir": str(settings.get("workdir")),
+        "case_name": Path(str(settings.get("workdir", ""))).name,
+        "config_file": settings.get("case_config") or settings.get("optimizer_config"),
+        "modes_file": str(optimized_modes_filename),
+        "eval_id": eval_id,
+        "slsqp_it": history_row.get("slsqp_iter", history_row.get("slsqp_it")),
+        "sensitivity_source": settings.get("sensitivity_source", "DOT_AD_TRANSFER"),
+        "sensitivity_weighting": "NODAL",
+        "deformation_direction": settings.get("deformation_direction_mode"),
+        "surface_mode": settings.get("surface_mode", "BOTH"),
+        "symmetry_coupling": settings.get("symmetry_coupling", "NONE"),
+        "refine_side_coupling": settings.get("refine_side_coupling", "COUPLED"),
+        "ikkt_scaling_mode": settings.get("ikkt_scaling_mode"),
+        "ikkt_sign_convention": settings.get("ikkt_sign_convention"),
+    }
 
 
 
@@ -471,6 +538,8 @@ def progressive_bspline_su2_shape_optimization(settings):
                 adjoint_eval_dir / "bspline_surface_metadata.csv",
             )
             refinement_settings = settings
+            ikkt_diagnostics = None
+            objective_signal_for_diagnostics = signal
             if str(settings.get("knot_score_mode", "VIRTUAL_INSERTION")).upper() == "IKKT_VIRTUAL_INSERTION":
                 objective_signal = signal
                 ikkt_settings = dict(settings)
@@ -485,6 +554,7 @@ def progressive_bspline_su2_shape_optimization(settings):
                 write_ikkt_diagnostics(ikkt_file, ikkt_diagnostics)
                 refinement_settings = dict(ikkt_settings)
                 refinement_settings["_ikkt_objective_signal"] = objective_signal
+                objective_signal_for_diagnostics = objective_signal
                 print(
                     "[PROGRESSIVE_BSPLINE] IKKT_VIRTUAL_INSERTION signal | "
                     "constraints={} residual_norm={:.6e} rel={:.6e} diagnostics={}".format(
@@ -494,6 +564,21 @@ def progressive_bspline_su2_shape_optimization(settings):
                         ikkt_file.name,
                     )
                 )
+            initialize_level_diagnostics(
+                refinement_settings,
+                _scoring_diagnostic_context(
+                    settings,
+                    level,
+                    level_id,
+                    adjoint_eval_dir,
+                    opt_rows,
+                    level.optimized_modes_filename,
+                ),
+                metadata,
+                signal,
+                objective_signal=objective_signal_for_diagnostics,
+                ikkt_diagnostics=ikkt_diagnostics,
+            )
             rel_improvement = None
             if settings.get("active_budget_reallocation", False):
                 rel_improvement = _relative_level_improvement(
@@ -569,6 +654,11 @@ def progressive_bspline_su2_shape_optimization(settings):
                 knot_selected_data,
                 knot_score_rows,
                 knot_selected_file,
+            )
+            finalize_level_diagnostics(
+                refinement_settings,
+                knot_score_rows,
+                knot_selected_data,
             )
             if next_modes is not None:
                 if knot_selected_data.get("active_budget_reallocation", False):

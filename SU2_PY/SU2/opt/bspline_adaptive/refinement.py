@@ -31,6 +31,7 @@ from .penalties import (
     apply_knot_depth_penalty,
     get_or_initialize_knot_span_depths,
 )
+from .diagnostics import begin_scoring_pass
 from .scoring import score_knot_spans
 
 INDEPENDENT_SIDES = ("upper", "lower")
@@ -402,6 +403,7 @@ def build_next_knot_inserted_modes(
     current_spec["knot_span_depths"] = dict(span_depths)
 
     for step in range(1, int(n_insertions) + 1):
+        begin_scoring_pass(settings, step, side=space.sides[0].upper() if len(space.sides) == 1 else "BOTH")
         try:
             step_rows = score_knot_spans(current_space, metadata, signal, settings)
         except BSplineAdaptiveError:
@@ -443,6 +445,9 @@ def build_next_knot_inserted_modes(
         selected_insertions.append(
             {
                 "step": step,
+                "batch_step": int(selected.get("batch_step", step)),
+                "scoring_pass_id": int(selected.get("scoring_pass_id", step) or step),
+                "candidate_id": str(selected.get("candidate_id", "")),
                 "span_key": str(selected.get("span_key", parent_key)),
                 "span_left": float(selected["span_left"]),
                 "span_right": float(selected["span_right"]),
@@ -704,6 +709,7 @@ def _build_next_independent(
             if objective_signal is not None:
                 score_settings = dict(settings)
                 score_settings["_ikkt_objective_signal"] = obj_side[side]
+            begin_scoring_pass(score_settings, step, side=side.upper())
             try:
                 side_rows = score_knot_spans(
                     cur_space[side],
@@ -766,6 +772,9 @@ def _build_next_independent(
         selected_insertions.append(
             {
                 "step": step,
+                "batch_step": int(selected.get("batch_step", step)),
+                "scoring_pass_id": int(selected.get("scoring_pass_id", step) or step),
+                "candidate_id": str(selected.get("candidate_id", "")),
                 "span_key": str(selected.get("span_key", parent_key)),
                 "span_left": float(selected["span_left"]),
                 "span_right": float(selected["span_right"]),

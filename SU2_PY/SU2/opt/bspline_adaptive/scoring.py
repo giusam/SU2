@@ -256,25 +256,48 @@ def _score_virtual_insertion(active_matrix, new_matrix, signal, regularization):
     z_matrix = _rank_incremental_columns(active_matrix, new_matrix, regularization)
     return _score_virtual_insertion_on_basis(z_matrix, signal, regularization)
 
-# Leading/trailing-edge closure nodes (x/c == 0 and == 1) are geometrically
-# pinned and carry a degenerate surface normal. Their sensitivity — typically a
-# trailing-edge adjoint singularity — cannot be reduced by knot insertion, so it
-# must never drive refinement. These two endpoints are always dropped from the
-# scoring point set (the geometry-transfer check still uses the full metadata).
-SCORING_CLOSURE_NODE_EPS = 1.0e-6
+# Leading/trailing-edge closure nodes are geometrically pinned and carry a
+# degenerate surface normal. The trailing edge can also carry an adjoint
+# singularity just upstream of x/c = 1, so its exclusion band is wider.
+SCORING_LE_CLOSURE_NODE_EPS = 1.0e-6
+SCORING_TE_CLOSURE_NODE_EPS = 5.0e-3
+SCORING_CLOSURE_NODE_EPS = SCORING_LE_CLOSURE_NODE_EPS
 
-def scoring_node_mask(metadata, eps=SCORING_CLOSURE_NODE_EPS):
+def scoring_node_mask(
+    metadata,
+    eps=None,
+    le_eps=SCORING_LE_CLOSURE_NODE_EPS,
+    te_eps=SCORING_TE_CLOSURE_NODE_EPS,
+):
+    if eps is not None:
+        le_eps = eps
+        te_eps = eps
     mask = []
     for row in metadata:
         x_over_c = float(row["x_over_c"])
-        mask.append(not (x_over_c <= float(eps) or x_over_c >= 1.0 - float(eps)))
+        mask.append(
+            not (
+                x_over_c <= float(le_eps)
+                or x_over_c >= 1.0 - float(te_eps)
+            )
+        )
     return np.asarray(mask, dtype=bool)
 
-def _drop_closure_nodes(metadata, signal, eps=SCORING_CLOSURE_NODE_EPS):
+def _drop_closure_nodes(
+    metadata,
+    signal,
+    eps=None,
+    le_eps=SCORING_LE_CLOSURE_NODE_EPS,
+    te_eps=SCORING_TE_CLOSURE_NODE_EPS,
+):
     signal = np.asarray(signal, dtype=float)
     kept_metadata = []
     kept_signal = []
-    for keep, row, value in zip(scoring_node_mask(metadata, eps=eps), metadata, signal):
+    for keep, row, value in zip(
+        scoring_node_mask(metadata, eps=eps, le_eps=le_eps, te_eps=te_eps),
+        metadata,
+        signal,
+    ):
         if not bool(keep):
             continue
         kept_metadata.append(row)

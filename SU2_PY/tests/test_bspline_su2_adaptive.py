@@ -42,6 +42,7 @@ from SU2.opt.bspline_adaptive.diagnostics import (
     finalize_level_diagnostics,
     initialize_level_diagnostics,
 )
+from SU2.opt.bspline_adaptive.scoring import scoring_node_mask
 from SU2.opt.progressive_trigger import (
     RefinementTriggered,
     build_online_trigger_opts,
@@ -2571,3 +2572,21 @@ def test_scoring_excludes_le_te_closure_nodes(tmp_path):
     # No scored span is dominated by the 1e3 closure-node spike.
     assert rows
     assert all(float(row["score_raw"]) < 1.0e2 for row in rows)
+
+
+def test_scoring_exclusion_keeps_le_tight_and_widens_te_only():
+    metadata = [
+        {"x_over_c": 0.0, "side": "upper"},
+        {"x_over_c": 0.004, "side": "upper"},
+        {"x_over_c": 0.994, "side": "lower"},
+        {"x_over_c": 0.996, "side": "lower"},
+        {"x_over_c": 1.0, "side": "lower"},
+    ]
+
+    assert scoring_node_mask(metadata).tolist() == [
+        False,
+        True,
+        True,
+        False,
+        False,
+    ]

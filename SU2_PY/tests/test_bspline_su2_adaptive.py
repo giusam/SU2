@@ -1337,7 +1337,9 @@ def test_bspline_driver_online_trigger_stops_cleanly_and_writes_best(tmp_path, m
     assert result["status"] == "early_refine_trigger"
     assert result["success"] is True
     assert result["objective"] == pytest.approx(0.89)
+    assert (driver.workdir / "optimization_information.csv").exists()
     assert (driver.workdir / "optimization_history.csv").exists()
+    assert (driver.workdir / "optimization_history_light.csv").exists()
     assert (driver.workdir / "optimized_modes.json").exists()
 
 

@@ -121,6 +121,7 @@ from .tables import (
     FUNCTION_HISTORY_COLUMNS,
     history_column_for_function,
     read_gradient_vector,
+    read_last_history_row,
     read_objective_from_history,
 )
 from .thickness import BSplineThicknessConstraint
@@ -2192,8 +2193,16 @@ class BSplineSU2Driver:
         return max(ids) + 1 if ids else 0
 
     @property
+    def optimization_information_filename(self):
+        return self.workdir / "optimization_information.csv"
+
+    @property
     def optimization_history_filename(self):
         return self.workdir / "optimization_history.csv"
+
+    @property
+    def optimization_history_light_filename(self):
+        return self.workdir / "optimization_history_light.csv"
 
     @property
     def optimized_modes_filename(self):
@@ -2238,6 +2247,7 @@ class BSplineSU2Driver:
                     ),
                 }
             )
+        self.write_optimization_history()
 
     def _next_paths(self, objective_adjoint=None):
         objective_adjoint = (
@@ -2839,9 +2849,9 @@ class BSplineSU2Driver:
             return None
         return min(ok_records, key=lambda record: float(record["objective"]))
 
-    def write_optimization_history(self):
+    def write_optimization_information(self):
         fieldnames = self._history_fieldnames()
-        with open(self.optimization_history_filename, "w", newline="") as fp:
+        with open(self.optimization_information_filename, "w", newline="") as fp:
             writer = csv.DictWriter(fp, fieldnames=fieldnames)
             writer.writeheader()
             for record in self._history_records:
@@ -2851,6 +2861,189 @@ class BSplineSU2Driver:
                         for field in fieldnames
                     }
                 )
+
+    def _primal_history_candidates_for_record(self, record):
+        eval_dir = record.get("eval_dir", "")
+        if not eval_dir:
+            return []
+        eval_dir = Path(eval_dir)
+        return [
+            eval_dir / "history_primal.csv",
+            eval_dir / "direct" / "history_primal.csv",
+        ]
+
+    def _final_primal_history_row_for_record(self, record):
+        for filename in self._primal_history_candidates_for_record(record):
+            try:
+                headers, values = read_last_history_row(filename)
+            except (OSError, BSplineSU2DriverError):
+                continue
+            row = {}
+            for index, header in enumerate(headers):
+                row[str(header)] = values[index] if index < len(values) else ""
+            return row
+        return None
+
+    def _iter_primal_history_records(self):
+        for record in self._history_records:
+            primal_row = self._final_primal_history_row_for_record(record)
+            if primal_row is not None:
+                yield record, primal_row
+
+    def write_primal_optimization_history(self):
+        base_fields = ["eval_id", "eval_index", "status"]
+        primal_fields = []
+        rows = []
+        for record, primal_row in self._iter_primal_history_records():
+            row = {
+                "eval_id": record.get("eval_id", ""),
+                "eval_index": record.get("eval_index", ""),
+                "status": record.get("status", ""),
+            }
+            for field, value in primal_row.items():
+                if field not in base_fields and field not in primal_fields:
+                    primal_fields.append(field)
+                row[field] = value
+            rows.append(row)
+
+        fieldnames = base_fields + primal_fields
+        with open(self.optimization_history_filename, "w", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        field: _format_config_atom(row.get(field, ""))
+                        for field in fieldnames
+                    }
+                )
+
+    def _light_primal_columns(self):
+        columns = []
+
+        def add_column(column):
+            column = str(column or "").strip()
+            normalized = _normalized_name(column)
+            if column and not any(
+                _normalized_name(item) == normalized for item in columns
+            ):
+                columns.append(column)
+
+        add_column(self.objective_column)
+        for spec in self.native_constraints:
+            if is_geometry_constraint_name(spec.name):
+                continue
+            add_column(history_column_for_function(spec.name))
+        return columns
+
+    def _light_geometry_columns(self):
+        columns = []
+        for spec in self.native_constraints:
+            if not is_geometry_constraint_name(spec.name):
+                continue
+            function_name = normalize_geometry_constraint_name(spec.name)
+            if function_name not in SUPPORTED_BSPLINE_GEOMETRY_CONSTRAINTS:
+                continue
+            if function_name not in columns:
+                columns.append(function_name)
+        return columns
+
+    def _row_value_by_normalized_field(self, row, requested_field):
+        requested = _normalized_name(requested_field)
+        for field, value in row.items():
+            if _normalized_name(field) == requested:
+                return value
+        return ""
+
+    def _geometry_constraint_history_values(self):
+        by_eval_id = {}
+        by_coefficients = {}
+        filename = self.geometry_constraint_history_filename
+        if not filename.exists():
+            return by_eval_id, by_coefficients
+
+        with open(filename, "r", newline="") as fp:
+            reader = csv.DictReader(fp)
+            for row in reader:
+                function_name = normalize_geometry_constraint_name(
+                    row.get("function", "")
+                )
+                if not function_name:
+                    continue
+                value = row.get("value", "")
+                try:
+                    eval_id = int(float(row.get("eval_id", "")))
+                except Exception:
+                    eval_id = None
+                if eval_id is not None:
+                    by_eval_id.setdefault(eval_id, {})[function_name] = value
+
+                try:
+                    coefficients = json.loads(row.get("coefficients", "[]"))
+                    coefficients_key = cache_key(coefficients, self.cache_tol)
+                except Exception:
+                    coefficients_key = None
+                if coefficients_key is not None:
+                    by_coefficients[(coefficients_key, function_name)] = value
+
+        return by_eval_id, by_coefficients
+
+    def _geometry_value_for_history_record(
+        self,
+        record,
+        function_name,
+        by_eval_id,
+        by_coefficients,
+    ):
+        try:
+            eval_id = int(float(record.get("eval_id", "")))
+        except Exception:
+            eval_id = None
+        if eval_id is not None:
+            value = by_eval_id.get(eval_id, {}).get(function_name)
+            if value not in (None, ""):
+                return value
+
+        try:
+            coefficients_key = cache_key(record.get("coefficients", []), self.cache_tol)
+        except Exception:
+            return ""
+        return by_coefficients.get((coefficients_key, function_name), "")
+
+    def write_light_optimization_history(self):
+        primal_columns = self._light_primal_columns()
+        geometry_columns = self._light_geometry_columns()
+        by_eval_id, by_coefficients = self._geometry_constraint_history_values()
+        fieldnames = ["eval_id"] + primal_columns + geometry_columns
+
+        with open(self.optimization_history_light_filename, "w", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=fieldnames)
+            writer.writeheader()
+            for record, primal_row in self._iter_primal_history_records():
+                row = {"eval_id": record.get("eval_id", "")}
+                for column in primal_columns:
+                    row[column] = self._row_value_by_normalized_field(
+                        primal_row,
+                        column,
+                    )
+                for column in geometry_columns:
+                    row[column] = self._geometry_value_for_history_record(
+                        record,
+                        column,
+                        by_eval_id,
+                        by_coefficients,
+                    )
+                writer.writerow(
+                    {
+                        field: _format_config_atom(row.get(field, ""))
+                        for field in fieldnames
+                    }
+                )
+
+    def write_optimization_history(self):
+        self.write_optimization_information()
+        self.write_primal_optimization_history()
+        self.write_light_optimization_history()
 
     def _design_record_for_eval_id(self, eval_id):
         if eval_id is None:
@@ -4108,6 +4301,10 @@ def run_bspline_su2_optimization(
         trigger_resume_state=trigger_resume_state,
     )
     result["optimization_history"] = str(driver.optimization_history_filename)
+    result["optimization_information"] = str(driver.optimization_information_filename)
+    result["optimization_history_light"] = str(
+        driver.optimization_history_light_filename
+    )
     result["optimized_modes"] = str(driver.optimized_modes_filename)
     result["workdir"] = str(driver.workdir)
     return result

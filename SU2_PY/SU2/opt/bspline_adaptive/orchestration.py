@@ -189,7 +189,10 @@ def run_with_gradient_guard_restarts(
         else:
             optimizer_kwargs["trigger_resume_state"] = trigger_resume_state
         result = run_optimizer(**optimizer_kwargs)
-        final_history_filename = result.get("optimization_history", final_history_filename)
+        final_history_filename = result.get(
+            "optimization_information",
+            result.get("optimization_history", final_history_filename),
+        )
         if final_history_filename:
             _append_restart_history_rows(
                 full_level_history_rows,

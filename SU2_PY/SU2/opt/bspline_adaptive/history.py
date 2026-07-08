@@ -22,6 +22,18 @@ SAFE_OPTIMIZATION_STATUSES = {
     "accepted_clipped_restart",
 }
 
+OPTIMIZATION_INFORMATION_BASENAME = "optimization_information.csv"
+LEGACY_OPTIMIZATION_HISTORY_BASENAME = "optimization_history.csv"
+
+
+def optimization_information_file(opt_run_dir):
+    opt_run_dir = Path(opt_run_dir)
+    filename = opt_run_dir / OPTIMIZATION_INFORMATION_BASENAME
+    if filename.exists():
+        return filename
+    return opt_run_dir / LEGACY_OPTIMIZATION_HISTORY_BASENAME
+
+
 def _csv_value(value):
     if isinstance(value, bool):
         return "1" if value else "0"
@@ -56,7 +68,7 @@ def write_selected_knot_refinement_json(level_id, selected_data, score_rows, fil
 
 def find_best_eval_dir(opt_run_dir, objective_column="objective"):
     opt_run_dir = Path(opt_run_dir)
-    history_file = opt_run_dir / "optimization_history.csv"
+    history_file = optimization_information_file(opt_run_dir)
     valid_rows = []
     with open(history_file, "r", newline="") as fp:
         reader = csv.DictReader(fp)
@@ -102,7 +114,7 @@ def find_eval_dir_for_mode_coefficients(
     tolerance=1.0e-10,
 ):
     opt_run_dir = Path(opt_run_dir)
-    history_file = opt_run_dir / "optimization_history.csv"
+    history_file = optimization_information_file(opt_run_dir)
     mode_ids = active_mode_ids(optimized_modes)
     coefficients = active_coefficient_vector(optimized_modes)
     matched_rows = []
@@ -155,7 +167,7 @@ def find_eval_dir_for_mode_coefficients(
     return find_best_eval_dir(opt_run_dir)
 
 def _read_optimization_history(opt_run_dir):
-    history_file = Path(opt_run_dir) / "optimization_history.csv"
+    history_file = optimization_information_file(opt_run_dir)
     rows = []
     with open(history_file, "r", newline="") as fp:
         reader = csv.DictReader(fp)

@@ -1496,7 +1496,7 @@ def test_history_keeps_full_coefficients_and_adds_reduced_coefficients_when_coup
         "ok",
     )
 
-    with open(driver.optimization_history_filename, "r", newline="") as fp:
+    with open(driver.optimization_information_filename, "r", newline="") as fp:
         row = next(csv.DictReader(fp))
     assert row["coeff__upper_0"] == "0.02"
     assert row["coeff__lower_0"] == "0.02"
@@ -1792,7 +1792,7 @@ def test_history_stores_applied_physical_coefficients_for_scaled_limited_eval(
 
     assert result["coefficients"] == pytest.approx([0.25, 0.0])
     assert info["line_search_beta"] == pytest.approx(0.25)
-    with open(driver.optimization_history_filename, "r", newline="") as fp:
+    with open(driver.optimization_information_filename, "r", newline="") as fp:
         rows = list(csv.DictReader(fp))
     assert len(rows) == 1
     assert float(rows[0]["coeff__upper_a"]) == pytest.approx(0.25)
@@ -2870,7 +2870,7 @@ def test_reused_workdir_eval_id_is_independent_from_run_eval_index(tmp_path):
         eval_index=driver._run_eval_count,
     )
 
-    with open(driver.optimization_history_filename, "r", newline="") as fp:
+    with open(driver.optimization_information_filename, "r", newline="") as fp:
         row = next(csv.DictReader(fp))
     assert row["eval_id"] == "9"
     assert row["eval_index"] == "1"
@@ -2899,7 +2899,7 @@ def test_optimization_history_includes_counter_and_limiter_columns(tmp_path):
         eval_index=1,
     )
 
-    with open(driver.optimization_history_filename, "r", newline="") as fp:
+    with open(driver.optimization_information_filename, "r", newline="") as fp:
         reader = csv.DictReader(fp)
         row = next(reader)
     for field in (
@@ -2932,6 +2932,71 @@ def test_optimization_history_includes_counter_and_limiter_columns(tmp_path):
     assert row["eval_index"] == "1"
     assert row["line_search_beta"] == "0.5"
     assert row["local_step_beta"] == "0.75"
+
+
+def test_optimization_history_files_split_information_primal_and_light(tmp_path):
+    driver = _make_driver(
+        tmp_path,
+        objective_column="CD",
+        native_constraints=(
+            "( MOMENT_Z < 0.092 ); "
+            "( LIFT = 0.824 ); "
+            "( AIRFOIL_AREA > 0.0778 )"
+        ),
+    )
+    eval_dir = driver.workdir / "eval_0000"
+    direct_dir = eval_dir / "direct"
+    direct_dir.mkdir(parents=True)
+    (direct_dir / "history_primal.csv").write_text(
+        '"Time_Iter","Outer_Iter","Inner_Iter","CD","CL","CMz","Buffet"\n'
+        "0,0,0,0.58,0.31,0.076,0.0011\n"
+        "0,0,3,0.23,0.824,0.091,0.0012\n"
+    )
+
+    coefficients = list(driver.initial_coefficients)
+    driver._append_history_record(
+        0,
+        0.23,
+        coefficients,
+        [0.0] * len(driver.mode_ids),
+        "ok",
+        eval_dir=eval_dir,
+        eval_index=1,
+    )
+    driver._append_geometry_constraint_record(
+        {
+            "function": "AIRFOIL_AREA",
+            "source": "ANALYTIC",
+            "value": 0.0781,
+            "gradient": [],
+            "coefficients": coefficients,
+        }
+    )
+
+    with open(driver.optimization_information_filename, "r", newline="") as fp:
+        information_row = next(csv.DictReader(fp))
+    assert "coeff__upper_a" in information_row
+
+    with open(driver.optimization_history_filename, "r", newline="") as fp:
+        history_reader = csv.DictReader(fp)
+        history_row = next(history_reader)
+    assert "eval_dir" not in history_reader.fieldnames
+    assert history_row["eval_id"] == "0"
+    assert history_row["CD"] == "0.23"
+    assert history_row["CL"] == "0.824"
+    assert history_row["CMz"] == "0.091"
+
+    with open(driver.optimization_history_light_filename, "r", newline="") as fp:
+        light_reader = csv.DictReader(fp)
+        light_row = next(light_reader)
+    assert light_reader.fieldnames == ["eval_id", "CD", "CMz", "CL", "AIRFOIL_AREA"]
+    assert light_row == {
+        "eval_id": "0",
+        "CD": "0.23",
+        "CMz": "0.091",
+        "CL": "0.824",
+        "AIRFOIL_AREA": "0.0781",
+    }
 
 
 def test_dsn_eval_aliases_symlink_or_copy_root_compatibility_files(tmp_path):
@@ -3461,7 +3526,7 @@ def test_geometry_bound_scaling_cli_and_history_integration(tmp_path, monkeypatc
 
     assert result["coefficients"] == [0.2, -0.1]
     assert (tmp_path / "run" / "bounds_scaling.json").exists()
-    history_text = (tmp_path / "run" / "optimization_history.csv").read_text()
+    history_text = (tmp_path / "run" / "optimization_information.csv").read_text()
     assert "coeff__upper_a" in history_text
     assert "0.2" in history_text
 

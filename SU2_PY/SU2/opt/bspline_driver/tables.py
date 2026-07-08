@@ -95,6 +95,12 @@ def read_objective_from_history(history_filename, objective_column):
         )
     return _as_float(value, f"{history_filename} {objective_column}")
 
+
+def read_last_history_row(history_filename):
+    headers, rows = _read_table(history_filename)
+    return list(headers), list(rows[-1])
+
+
 def read_bspline_gradients(gradients_filename, allow_nonfinite=False):
     with open(gradients_filename, "r", newline="") as fp:
         reader = csv.DictReader(fp)

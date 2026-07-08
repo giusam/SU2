@@ -579,7 +579,9 @@ def main(argv=None):
     print("Optimizer: {}".format(result["optimizer"]))
     print("Success: {}".format(result["success"]))
     print("Objective: {:.15g}".format(float(result["objective"])))
+    print("Wrote {}".format(result["optimization_information"]))
     print("Wrote {}".format(result["optimization_history"]))
+    print("Wrote {}".format(result["optimization_history_light"]))
     print("Wrote {}".format(result["optimized_modes"]))
     return 0
 

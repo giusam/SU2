@@ -32,6 +32,17 @@ from SU2.opt.progressive_ffd import (
 )
 
 
+HH_TE_BOUND_SCALE_KEYS = (
+    "OPT_HH_TE_BOUND_SCALE",
+    "PROGRESSIVE_HH_TE_BOUND_SCALE",
+)
+HH_TE_BOUND_X_MIN_KEYS = (
+    "OPT_HH_TE_BOUND_X_MIN",
+    "PROGRESSIVE_HH_TE_BOUND_X_MIN",
+)
+HH_TE_BOUND_KEYS = HH_TE_BOUND_SCALE_KEYS + HH_TE_BOUND_X_MIN_KEYS
+
+
 def _is_final_progressive_hh_level(hh_opts, ilevel, current_ndv=None):
     nfinal = hh_opts.get("nfinal", None)
     if nfinal is not None and current_ndv is not None:
@@ -64,6 +75,190 @@ def _build_online_trigger_opts(hh_opts, ilevel, current_ndv=None):
         stagnation_band=hh_opts["stag_band"],
         stagnation_window=hh_opts["stag_window"],
     )
+
+
+def _config_option(config, keys, default):
+    for key in keys:
+        if key in config:
+            return config[key], True
+    return default, False
+
+
+def _remove_hh_te_bound_config_options(config):
+    for key in HH_TE_BOUND_KEYS:
+        if key in config:
+            del config[key]
+
+
+def _is_sequence(value):
+    return isinstance(value, (list, tuple))
+
+
+def _is_param_entry(value):
+    return isinstance(value, str) or _is_sequence(value)
+
+
+def _definition_blocks(value, n_blocks):
+    if n_blocks <= 0:
+        return []
+    if not _is_sequence(value):
+        return [value] * n_blocks
+
+    values = list(value)
+    if len(values) == n_blocks:
+        return values
+    if len(values) == 1:
+        return values * n_blocks
+    if len(values) < n_blocks:
+        return values + [None] * (n_blocks - len(values))
+    return values[:n_blocks]
+
+
+def _definition_param_blocks(value, n_blocks):
+    if n_blocks <= 0:
+        return []
+    if value is None:
+        return [None] * n_blocks
+    if isinstance(value, str) or not _is_sequence(value):
+        return [value] * n_blocks
+
+    values = list(value)
+    if len(values) == n_blocks and all(_is_param_entry(v) for v in values):
+        return values
+    if len(values) == 1:
+        return values * n_blocks
+    if not all(_is_param_entry(v) for v in values):
+        return [values] * n_blocks
+    if len(values) < n_blocks:
+        return values + [None] * (n_blocks - len(values))
+    return values[:n_blocks]
+
+
+def _definition_param_values(param, size):
+    if size <= 0:
+        return []
+    if isinstance(param, str) or not _is_sequence(param):
+        return [param] * size
+
+    values = list(param)
+    if size > 1 and len(values) == size and all(_is_param_entry(v) for v in values):
+        return values
+    return [param] * size
+
+
+def _expand_definition_dv_metadata(def_dv, n_dv):
+    sizes = [int(size) for size in def_dv["SIZE"]]
+    n_blocks = len(sizes)
+    kinds = _definition_blocks(def_dv.get("KIND", None), n_blocks)
+    params = _definition_param_blocks(def_dv.get("PARAM", None), n_blocks)
+
+    metadata = []
+    for i_block, size in enumerate(sizes):
+        kind = kinds[i_block] if i_block < len(kinds) else None
+        param = params[i_block] if i_block < len(params) else None
+        for param_i in _definition_param_values(param, size):
+            metadata.append((kind, param_i))
+
+    if len(metadata) != n_dv:
+        raise ValueError(
+            "Expanded DEFINITION_DV metadata length "
+            f"{len(metadata)} does not match n_dv={n_dv}"
+        )
+    return metadata
+
+
+def _safe_float(value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if result != result:
+        return None
+    return result
+
+
+def _parse_hicks_henne_xc(param):
+    if param is None:
+        return None
+
+    if isinstance(param, str):
+        tokens = param.strip().strip("()").replace(",", " ").split()
+        if len(tokens) < 2:
+            return None
+        return _safe_float(tokens[1])
+
+    if not _is_sequence(param) or len(param) < 2:
+        return None
+
+    return _safe_float(param[1])
+
+
+def _build_optimizer_bounds(config, def_dv, n_dv, bound_lower, bound_upper, relax_factor):
+    base_lower = float(bound_lower) / float(relax_factor)
+    base_upper = float(bound_upper) / float(relax_factor)
+
+    scale_value, scale_explicit = _config_option(
+        config,
+        HH_TE_BOUND_SCALE_KEYS,
+        1.0,
+    )
+    x_min_value, _ = _config_option(
+        config,
+        HH_TE_BOUND_X_MIN_KEYS,
+        0.85,
+    )
+
+    try:
+        scale = float(scale_value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "OPT_HH_TE_BOUND_SCALE/PROGRESSIVE_HH_TE_BOUND_SCALE "
+            "must be a positive number"
+        )
+    try:
+        x_min = float(x_min_value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "OPT_HH_TE_BOUND_X_MIN/PROGRESSIVE_HH_TE_BOUND_X_MIN "
+            "must be in the range [0, 1]"
+        )
+
+    if not scale > 0.0:
+        raise ValueError(
+            "OPT_HH_TE_BOUND_SCALE/PROGRESSIVE_HH_TE_BOUND_SCALE must be > 0"
+        )
+    if not 0.0 <= x_min <= 1.0:
+        raise ValueError(
+            "OPT_HH_TE_BOUND_X_MIN/PROGRESSIVE_HH_TE_BOUND_X_MIN "
+            "must be in the range [0, 1]"
+        )
+
+    bounds = list(zip([base_lower] * n_dv, [base_upper] * n_dv))
+    scaled_indices = []
+
+    if scale_explicit or scale != 1.0:
+        metadata = _expand_definition_dv_metadata(def_dv, n_dv)
+        for i_dv, (kind, param) in enumerate(metadata):
+            if str(kind).upper() != "HICKS_HENNE":
+                continue
+            xc = _parse_hicks_henne_xc(param)
+            if xc is None or xc <= x_min:
+                continue
+            bounds[i_dv] = (scale * base_lower, scale * base_upper)
+            scaled_indices.append(i_dv)
+
+        sys.stdout.write(
+            "[OPT_BOUNDS] Hicks-Henne TE scaling | "
+            f"x/c>{x_min:.6f} scale={scale:.6e} "
+            f"scaled_dv={len(scaled_indices)}/{n_dv} indices={scaled_indices}\n"
+        )
+
+    if len(bounds) != n_dv:
+        raise ValueError(
+            f"Generated optimizer bounds length {len(bounds)} does not match n_dv={n_dv}"
+        )
+
+    return bounds
 
 
 def main():
@@ -178,9 +373,15 @@ def run_single_level(
     accu = float(config.OPT_ACCURACY) * gradient_factor
 
     x0 = [0.0] * n_dv
-    xb_low = [float(bound_lower) / float(relax_factor)] * n_dv
-    xb_up = [float(bound_upper) / float(relax_factor)] * n_dv
-    xb = list(zip(xb_low, xb_up))
+    xb = _build_optimizer_bounds(
+        config,
+        def_dv,
+        n_dv,
+        bound_lower,
+        bound_upper,
+        relax_factor,
+    )
+    _remove_hh_te_bound_config_options(config)
 
     state = SU2.io.State()
     state.find_files(config)

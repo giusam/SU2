@@ -6,7 +6,9 @@ from SU2.opt.progressive_ffd_core import (
     get_progressive_ffd_options,
     initial_ffd_columns_from_config,
     make_ffd_config_dump_compatible,
+    make_dual_ffd_definition,
     make_ffd_definition,
+    ordered_dual_ffd_records,
     validate_active_ffd_columns,
     refine_ffd_columns,
     select_ffd_candidates_by_nadd_mode,
@@ -25,6 +27,15 @@ from SU2.opt.progressive_ffd_mesh import (
     read_ffd_box_columns,
     rewrite_ffd_box_with_columns_and_reembed,
     validate_mesh_ffd_columns,
+)
+
+from SU2.opt.progressive_ffd_prepare import (
+    FFDPreparationError,
+    prepare_progressive_ffd_input,
+)
+
+from SU2.opt.progressive_ffd_split import (
+    rewrite_dual_ffd_boxes_with_columns_and_reembed,
 )
 
 from SU2.opt.progressive_ffd_projection import (

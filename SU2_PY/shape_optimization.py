@@ -28,6 +28,7 @@ from SU2.opt.progressive_ffd import (
     build_initial_ffd_level,
     build_next_ffd_level,
     build_ffd_spring_reallocated_level,
+    prepare_progressive_ffd_input,
     write_ffd_level_config,
 )
 
@@ -294,7 +295,13 @@ def main():
     sys.stdout.write("-------------------------------------------------------------------------\n")
 
     hh_opts = get_progressive_hh_options(base_config)
-    thickness_constraint = build_thickness_constraint_from_config(base_config)
+    is_progressive_ffd = (
+        hh_opts["enabled"]
+        and str(hh_opts.get("param_kind", "HICKS_HENNE")).upper() == "FFD"
+    )
+    thickness_constraint = None
+    if not is_progressive_ffd:
+        thickness_constraint = build_thickness_constraint_from_config(base_config)
 
     if not hh_opts["enabled"]:
         run_single_level(
@@ -450,8 +457,6 @@ def progressive_hh_shape_optimization(
 ):
     base_config = SU2.io.Config(filename)
     hh_opts = get_progressive_hh_options(base_config)
-    if thickness_constraint is None:
-        thickness_constraint = build_thickness_constraint_from_config(base_config)
 
     if str(hh_opts.get("param_kind", "HICKS_HENNE")).upper() == "FFD":
         return progressive_ffd_shape_optimization(
@@ -464,6 +469,9 @@ def progressive_hh_shape_optimization(
             nzones,
             thickness_constraint=thickness_constraint,
         )
+
+    if thickness_constraint is None:
+        thickness_constraint = build_thickness_constraint_from_config(base_config)
 
     old_levels = [
         d for d in os.listdir(".")
@@ -630,6 +638,33 @@ def progressive_ffd_shape_optimization(
     base_config = SU2.io.Config(filename)
     hh_opts = get_progressive_hh_options(base_config)
     ffd_opts = get_progressive_ffd_options(base_config, hh_opts)
+
+    preparation = prepare_progressive_ffd_input(
+        base_config,
+        ffd_opts,
+        partitions=partitions,
+    )
+    if ffd_opts.get("ffd_prepare_only", False):
+        sys.stdout.write(
+            "\n[PROGRESSIVE_FFD_PREP] PREPARE_ONLY completed successfully\n"
+        )
+        if preparation is not None:
+            sys.stdout.write(
+                "[PROGRESSIVE_FFD_PREP] Mesh: "
+                f"{preparation.get('prepared_mesh')}\n"
+            )
+            if preparation.get("diagnostics_csv"):
+                sys.stdout.write(
+                    "[PROGRESSIVE_FFD_PREP] Diagnostics: "
+                    f"{preparation.get('diagnostics_csv')}\n"
+                )
+            if preparation.get("manifest"):
+                sys.stdout.write(
+                    "[PROGRESSIVE_FFD_PREP] Manifest: "
+                    f"{preparation.get('manifest')}\n"
+                )
+        return preparation
+
     if thickness_constraint is None:
         thickness_constraint = build_thickness_constraint_from_config(base_config)
 
@@ -658,9 +693,23 @@ def progressive_ffd_shape_optimization(
 
         sys.stdout.write(f"\n[PROGRESSIVE_FFD] Level {ilevel} | NDV = {level.ndv}\n")
         sys.stdout.write(f"[PROGRESSIVE_FFD] FFD DV kind: {level.ffd_dv_kind}\n")
-        sys.stdout.write(f"[PROGRESSIVE_FFD] Box tag: {level.ffd_box_tag}\n")
         sys.stdout.write(f"[PROGRESSIVE_FFD] Domain mode: {level.domain_mode}\n")
-        sys.stdout.write(f"[PROGRESSIVE_FFD] Active columns: {level.columns}\n")
+        if getattr(level, "dual_box", False):
+            sys.stdout.write(
+                "[PROGRESSIVE_FFD_DUAL] Box tags: "
+                f"{level.upper_box_tag}, {level.lower_box_tag}\n"
+            )
+            sys.stdout.write(
+                "[PROGRESSIVE_FFD_DUAL] Upper columns "
+                f"({len(level.upper_columns)}): {level.upper_columns}\n"
+            )
+            sys.stdout.write(
+                "[PROGRESSIVE_FFD_DUAL] Lower columns "
+                f"({len(level.lower_columns)}): {level.lower_columns}\n"
+            )
+        else:
+            sys.stdout.write(f"[PROGRESSIVE_FFD] Box tag: {level.ffd_box_tag}\n")
+            sys.stdout.write(f"[PROGRESSIVE_FFD] Active columns: {level.columns}\n")
         sys.stdout.write(f"[PROGRESSIVE_FFD] Mesh source: {level.mesh_source}\n")
 
         trigger_opts = _build_online_trigger_opts(
@@ -744,6 +793,15 @@ def progressive_ffd_shape_optimization(
             refine_now = bool(getattr(project, "refinement_triggered", False))
 
         if not refine_now:
+            if (
+                ffd_opts.get("ffd_dual_box", False)
+                and ffd_opts.get("nfinal", None) is not None
+                and level.ndv < int(ffd_opts["nfinal"])
+            ):
+                raise RuntimeError(
+                    "Progressive dual FFD stopped before reaching "
+                    f"NFINAL={ffd_opts['nfinal']} (current NDV={level.ndv})"
+                )
             sys.stdout.write(f"[PROGRESSIVE_FFD] Stop after level {ilevel}\n")
             break
 
@@ -759,10 +817,13 @@ def progressive_ffd_shape_optimization(
             result,
         )
         if ffd_opts.get("nfinal", None) is not None and level.ndv <= ndv_before_refine:
-            sys.stdout.write(
-                "[PROGRESSIVE_FFD] Stop: refinement did not increase NDV "
-                f"before reaching NFINAL={ffd_opts['nfinal']}\n"
+            message = (
+                "Progressive FFD refinement did not increase NDV before "
+                f"reaching NFINAL={ffd_opts['nfinal']}"
             )
+            if ffd_opts.get("ffd_dual_box", False):
+                raise RuntimeError(message)
+            sys.stdout.write(f"[PROGRESSIVE_FFD] Stop: {message}\n")
             break
         ilevel += 1
 

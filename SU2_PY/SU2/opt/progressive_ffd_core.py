@@ -30,17 +30,45 @@ class FFDLevel:
         active_xmin=0.0,
         active_xmax=1.0,
         active_include_bounds=False,
+        dual_box=False,
+        upper_columns=None,
+        lower_columns=None,
+        upper_box_tag="UPPER_BOX",
+        lower_box_tag="LOWER_BOX",
     ):
         self.level_id = int(level_id)
         self.active_xmin = float(active_xmin)
         self.active_xmax = float(active_xmax)
         self.active_include_bounds = bool(active_include_bounds)
-        self.columns = validate_active_ffd_columns(
-            columns,
-            xmin=self.active_xmin,
-            xmax=self.active_xmax,
-            include_bounds=self.active_include_bounds,
-        )
+        self.dual_box = bool(dual_box)
+        if self.dual_box:
+            if upper_columns is None:
+                upper_columns = columns
+            if lower_columns is None:
+                lower_columns = columns
+            self.upper_columns = validate_active_ffd_columns(
+                upper_columns,
+                xmin=self.active_xmin,
+                xmax=self.active_xmax,
+                include_bounds=self.active_include_bounds,
+            )
+            self.lower_columns = validate_active_ffd_columns(
+                lower_columns,
+                xmin=self.active_xmin,
+                xmax=self.active_xmax,
+                include_bounds=self.active_include_bounds,
+            )
+            # Stable optimizer ordering: all upper DVs, then all lower DVs.
+            self.columns = list(self.upper_columns) + list(self.lower_columns)
+        else:
+            self.columns = validate_active_ffd_columns(
+                columns,
+                xmin=self.active_xmin,
+                xmax=self.active_xmax,
+                include_bounds=self.active_include_bounds,
+            )
+            self.upper_columns = list(self.columns)
+            self.lower_columns = []
         self.workdir = workdir
         self.config_filename = config_filename
         self.project_filename = project_filename
@@ -53,6 +81,8 @@ class FFDLevel:
         self.post_opt_spring_pending = bool(post_opt_spring_pending)
         self.spring_reallocated = bool(spring_reallocated)
         self.ffd_box_tag = str(ffd_box_tag)
+        self.upper_box_tag = str(upper_box_tag)
+        self.lower_box_tag = str(lower_box_tag)
         self.ffd_dv_kind = str(ffd_dv_kind).upper()
         self.marker = str(marker)
         self.domain_mode = str(domain_mode).upper()
@@ -61,7 +91,28 @@ class FFDLevel:
 
     @property
     def ndv(self):
+        if self.dual_box:
+            return len(self.upper_columns) + len(self.lower_columns)
         return len(self.columns)
+
+    @property
+    def columns_by_side(self):
+        if self.dual_box:
+            return {
+                "UPPER": list(self.upper_columns),
+                "LOWER": list(self.lower_columns),
+            }
+        return {"FFD": list(self.columns)}
+
+    @property
+    def dv_records(self):
+        if self.dual_box:
+            return [
+                ("UPPER", float(x)) for x in self.upper_columns
+            ] + [
+                ("LOWER", float(x)) for x in self.lower_columns
+            ]
+        return [("FFD", float(x)) for x in self.columns]
 
 
 def _parse_ffd_initial_columns(
@@ -88,6 +139,24 @@ def _parse_ffd_initial_columns(
         xmax=xmax,
         include_bounds=include_bounds,
     )
+
+
+def _parse_ffd_initial_columns_unbounded(value):
+    if value is None:
+        return None
+    raw = str(value).strip().strip("()[]")
+    if not raw:
+        return []
+    values = [float(token.strip()) for token in raw.split(",") if token.strip()]
+    if len(values) < 2:
+        raise ValueError("Progressive dual FFD requires at least two initial columns")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Progressive FFD columns must be finite")
+    values = sorted(values)
+    for left, right in zip(values[:-1], values[1:]):
+        if abs(right - left) <= 1.0e-10:
+            raise ValueError("Progressive FFD columns must be unique")
+    return values
 
 
 def _count_ffd_initial_columns(
@@ -157,6 +226,11 @@ def _ffd_allow_external_columns_from_opts(opts):
 
 
 def ffd_active_range_from_opts(opts):
+    if opts is not None and _as_bool(opts.get("ffd_dual_box", False)):
+        return (
+            float(opts.get("ffd_active_xmin", 0.0)),
+            float(opts.get("ffd_active_xmax", 1.0)),
+        )
     if _ffd_allow_external_columns_from_opts(opts):
         return (
             float(opts.get("ffd_active_xmin", 0.0)),
@@ -166,6 +240,8 @@ def ffd_active_range_from_opts(opts):
 
 
 def ffd_active_include_bounds_from_opts(opts):
+    if opts is not None and _as_bool(opts.get("ffd_dual_box", False)):
+        return False
     return _ffd_allow_external_columns_from_opts(opts)
 
 
@@ -253,6 +329,42 @@ def get_progressive_ffd_options(config, hh_opts):
     opts = dict(hh_opts)
     opts["param_kind"] = "FFD"
 
+    dual_box = _as_bool(config.get("PROGRESSIVE_FFD_DUAL_BOX", "NO"))
+    auto_prepare = _as_bool(
+        config.get("PROGRESSIVE_FFD_AUTO_PREPARE", "YES" if dual_box else "NO")
+    )
+    prepare_only = _as_bool(config.get("PROGRESSIVE_FFD_PREPARE_ONLY", "NO"))
+    prepared_mesh = str(
+        config.get("PROGRESSIVE_FFD_PREPARED_MESH", "") or ""
+    ).strip()
+    prepare_overwrite = _as_bool(
+        config.get("PROGRESSIVE_FFD_PREPARE_OVERWRITE", "NO")
+    )
+    prepare_smoke_test = _as_bool(
+        config.get("PROGRESSIVE_FFD_PREPARE_SMOKE_TEST", "YES")
+    )
+    bootstrap_tag = str(
+        config.get("PROGRESSIVE_FFD_BOOTSTRAP_TAG", "AIRFOIL_BOX")
+    ).strip()
+    bootstrap_y_padding_chord = float(
+        config.get("PROGRESSIVE_FFD_BOOTSTRAP_Y_PADDING_CHORD", 0.04)
+    )
+    upper_box_tag = str(
+        config.get("PROGRESSIVE_FFD_UPPER_BOX_TAG", "UPPER_BOX")
+    ).strip()
+    lower_box_tag = str(
+        config.get("PROGRESSIVE_FFD_LOWER_BOX_TAG", "LOWER_BOX")
+    ).strip()
+    upper_offset_chord = float(
+        config.get("PROGRESSIVE_FFD_UPPER_OFFSET_CHORD", 0.05)
+    )
+    lower_offset_chord = float(
+        config.get("PROGRESSIVE_FFD_LOWER_OFFSET_CHORD", 0.05)
+    )
+    refinement_coupling = str(
+        config.get("PROGRESSIVE_FFD_REFINEMENT_COUPLING", "INDEPENDENT")
+    ).strip().upper()
+
     ffd_dv_kind = str(
         config.get("PROGRESSIVE_FFD_DV_KIND", "FFD_CONTROL_POINT_2D")
     ).strip().upper()
@@ -265,12 +377,12 @@ def get_progressive_ffd_options(config, hh_opts):
     )
     active_xmin = float(config.get("PROGRESSIVE_FFD_ACTIVE_XMIN", 0.0))
     active_xmax = float(config.get("PROGRESSIVE_FFD_ACTIVE_XMAX", 1.0))
-    if not active_xmin < active_xmax:
+    if not dual_box and not active_xmin < active_xmax:
         raise ValueError(
             "PROGRESSIVE_FFD_ACTIVE_XMIN must be less than "
             "PROGRESSIVE_FFD_ACTIVE_XMAX"
         )
-    initial_include_bounds = bool(allow_external_columns)
+    initial_include_bounds = bool(allow_external_columns) if not dual_box else False
 
     control_row_value = config.get("PROGRESSIVE_FFD_CONTROL_ROW", None)
     control_row = None
@@ -290,21 +402,83 @@ def get_progressive_ffd_options(config, hh_opts):
             f"got {domain_mode!r}"
         )
 
+    if dual_box:
+        forbidden = [
+            key
+            for key in (
+                "PROGRESSIVE_FFD_BOX_TAG",
+                "PROGRESSIVE_FFD_CONTROL_ROW",
+                "PROGRESSIVE_FFD_DIRECTION",
+                "PROGRESSIVE_FFD_ALLOW_EXTERNAL_COLUMNS",
+                "PROGRESSIVE_FFD_ACTIVE_XMIN",
+                "PROGRESSIVE_FFD_ACTIVE_XMAX",
+            )
+            if key in config
+        ]
+        if forbidden:
+            raise ValueError(
+                "Legacy single-box options are not allowed with "
+                "PROGRESSIVE_FFD_DUAL_BOX=YES: " + ", ".join(forbidden)
+            )
+        if ffd_dv_kind != "FFD_CONTROL_POINT_2D":
+            raise NotImplementedError(
+                "Progressive dual FFD supports only FFD_CONTROL_POINT_2D"
+            )
+        if domain_mode != "FULL":
+            raise NotImplementedError(
+                "Progressive dual FFD currently requires "
+                "PROGRESSIVE_FFD_DOMAIN_MODE=FULL"
+            )
+        if not marker:
+            raise ValueError("PROGRESSIVE_FFD_MARKER must be non-empty")
+        if not bootstrap_tag or not upper_box_tag or not lower_box_tag:
+            raise ValueError("Progressive dual FFD box tags must be non-empty")
+        if len({bootstrap_tag, upper_box_tag, lower_box_tag}) != 3:
+            raise ValueError(
+                "Bootstrap, upper, and lower FFD box tags must be distinct"
+            )
+        if not math.isfinite(bootstrap_y_padding_chord) or bootstrap_y_padding_chord <= 0.0:
+            raise ValueError(
+                "PROGRESSIVE_FFD_BOOTSTRAP_Y_PADDING_CHORD must be positive"
+            )
+        if not math.isfinite(upper_offset_chord) or upper_offset_chord <= 0.0:
+            raise ValueError("PROGRESSIVE_FFD_UPPER_OFFSET_CHORD must be positive")
+        if not math.isfinite(lower_offset_chord) or lower_offset_chord <= 0.0:
+            raise ValueError("PROGRESSIVE_FFD_LOWER_OFFSET_CHORD must be positive")
+        if refinement_coupling != "INDEPENDENT":
+            raise NotImplementedError(
+                "PROGRESSIVE_FFD_REFINEMENT_COUPLING currently supports only "
+                "INDEPENDENT"
+            )
+        if prepare_only and not auto_prepare:
+            raise ValueError(
+                "PROGRESSIVE_FFD_PREPARE_ONLY=YES requires "
+                "PROGRESSIVE_FFD_AUTO_PREPARE=YES"
+            )
+        if bool(opts.get("spring_enabled", False)):
+            raise NotImplementedError(
+                "PROGRESSIVE_HH_SPRING=YES is not supported in dual FFD mode"
+            )
+
     if ffd_dv_kind == "FFD_THICKNESS_2D" and domain_mode == "HALF_UPPER":
         raise NotImplementedError(
             "PROGRESSIVE_FFD_DOMAIN_MODE=HALF_UPPER is not validated for "
             "FFD_THICKNESS_2D"
         )
 
-    if ffd_dv_kind == "FFD_CONTROL_POINT_2D" and control_row is None:
+    if (
+        not dual_box
+        and ffd_dv_kind == "FFD_CONTROL_POINT_2D"
+        and control_row is None
+    ):
         raise ValueError(
             "PROGRESSIVE_FFD_CONTROL_ROW is required for FFD_CONTROL_POINT_2D"
         )
 
-    if control_row is not None and control_row < 0:
+    if not dual_box and control_row is not None and control_row < 0:
         raise ValueError("PROGRESSIVE_FFD_CONTROL_ROW must be >= 0")
 
-    if direction not in ("X", "Y"):
+    if not dual_box and direction not in ("X", "Y"):
         raise ValueError("PROGRESSIVE_FFD_DIRECTION must be X or Y")
 
     refine_state_mode = str(
@@ -322,21 +496,32 @@ def get_progressive_ffd_options(config, hh_opts):
             "supported for PROGRESSIVE_PARAM_KIND=FFD"
         )
 
-    initial_columns_count = _count_ffd_initial_columns(
-        config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None),
-        xmin=active_xmin if allow_external_columns else 0.0,
-        xmax=active_xmax if allow_external_columns else 1.0,
-        include_bounds=initial_include_bounds,
-    )
-    if initial_columns_count is None:
+    if dual_box:
+        initial_columns = _parse_ffd_initial_columns_unbounded(
+            config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None)
+        )
+        if initial_columns is None:
+            raise ValueError(
+                "PROGRESSIVE_FFD_INITIAL_COLUMNS is required in dual FFD mode"
+            )
+        initial_columns_count = 2 * len(initial_columns)
+    else:
+        initial_columns = None
         initial_columns_count = _count_ffd_initial_columns(
-            config.get("PROGRESSIVE_HH_INITIAL_UPPER", None),
+            config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None),
             xmin=active_xmin if allow_external_columns else 0.0,
             xmax=active_xmax if allow_external_columns else 1.0,
             include_bounds=initial_include_bounds,
         )
-    if initial_columns_count is None:
-        initial_columns_count = int(opts.get("n0", 3))
+        if initial_columns_count is None:
+            initial_columns_count = _count_ffd_initial_columns(
+                config.get("PROGRESSIVE_HH_INITIAL_UPPER", None),
+                xmin=active_xmin if allow_external_columns else 0.0,
+                xmax=active_xmax if allow_external_columns else 1.0,
+                include_bounds=initial_include_bounds,
+            )
+        if initial_columns_count is None:
+            initial_columns_count = int(opts.get("n0", 3))
 
     nfinal = opts.get("nfinal", None)
     if nfinal is not None and int(nfinal) < int(initial_columns_count):
@@ -357,26 +542,56 @@ def get_progressive_ffd_options(config, hh_opts):
             "ffd_active_xmin": active_xmin,
             "ffd_active_xmax": active_xmax,
             "ffd_active_include_bounds": initial_include_bounds,
+            "ffd_dual_box": dual_box,
+            "ffd_auto_prepare": auto_prepare,
+            "ffd_prepare_only": prepare_only,
+            "ffd_prepared_mesh": prepared_mesh,
+            "ffd_prepare_overwrite": prepare_overwrite,
+            "ffd_prepare_smoke_test": prepare_smoke_test,
+            "ffd_bootstrap_tag": bootstrap_tag,
+            "ffd_bootstrap_y_padding_chord": bootstrap_y_padding_chord,
+            "ffd_upper_box_tag": upper_box_tag,
+            "ffd_lower_box_tag": lower_box_tag,
+            "ffd_upper_offset_chord": upper_offset_chord,
+            "ffd_lower_offset_chord": lower_offset_chord,
+            "ffd_refinement_coupling": refinement_coupling,
+            "ffd_initial_columns": initial_columns,
             "marker": marker,
         }
     )
 
     if opts.get("enabled", False):
         print(f"[PROGRESSIVE_FFD] FFD DV kind = {ffd_dv_kind}")
-        print(f"[PROGRESSIVE_FFD] box tag = {box_tag}")
         print(f"[PROGRESSIVE_FFD] marker = {marker}")
         print(f"[PROGRESSIVE_FFD] domain mode = {domain_mode}")
-        if control_row is not None:
-            print(f"[PROGRESSIVE_FFD] control row = {control_row}")
-        print(f"[PROGRESSIVE_FFD] direction = {direction}")
-        print(
-            "[PROGRESSIVE_FFD] external active columns = "
-            f"{'YES' if allow_external_columns else 'NO'}"
-        )
-        print(
-            "[PROGRESSIVE_FFD] configured active candidate x-range = "
-            f"[{active_xmin}, {active_xmax}]"
-        )
+        if dual_box:
+            print("[PROGRESSIVE_FFD_DUAL] enabled = YES")
+            print(
+                "[PROGRESSIVE_FFD_DUAL] box tags = "
+                f"{upper_box_tag}, {lower_box_tag}"
+            )
+            print(
+                "[PROGRESSIVE_FFD_DUAL] initial stations = "
+                f"{initial_columns} | initial_ndv={initial_columns_count}"
+            )
+            print(
+                "[PROGRESSIVE_FFD_PREP] auto_prepare="
+                f"{'YES' if auto_prepare else 'NO'} "
+                f"prepare_only={'YES' if prepare_only else 'NO'}"
+            )
+        else:
+            print(f"[PROGRESSIVE_FFD] box tag = {box_tag}")
+            if control_row is not None:
+                print(f"[PROGRESSIVE_FFD] control row = {control_row}")
+            print(f"[PROGRESSIVE_FFD] direction = {direction}")
+            print(
+                "[PROGRESSIVE_FFD] external active columns = "
+                f"{'YES' if allow_external_columns else 'NO'}"
+            )
+            print(
+                "[PROGRESSIVE_FFD] configured active candidate x-range = "
+                f"[{active_xmin}, {active_xmax}]"
+            )
 
     return opts
 
@@ -422,6 +637,63 @@ def make_ffd_definition(columns, opts, column_index_by_x):
         "PARAM": params,
         "SIZE": sizes,
     }
+
+
+def make_dual_ffd_definition(records, opts, column_index_by_side):
+    """Build independent outward-positive upper/lower FFD control-point DVs."""
+
+    if not _as_bool(opts.get("ffd_dual_box", False)):
+        raise ValueError("Dual FFD definition requested while dual mode is disabled")
+    marker = str(opts.get("ffd_marker", opts.get("marker", "AIRFOIL")))
+    scale = float(opts.get("scale", 1.0))
+    upper_tag = str(opts.get("ffd_upper_box_tag", "UPPER_BOX"))
+    lower_tag = str(opts.get("ffd_lower_box_tag", "LOWER_BOX"))
+
+    kinds = []
+    scales = []
+    markers = []
+    ffdtags = []
+    params = []
+    sizes = []
+
+    for side, x in records:
+        side = str(side).upper()
+        if side not in ("UPPER", "LOWER"):
+            raise ValueError(f"Unknown dual FFD side: {side!r}")
+        mapping = column_index_by_side[side]
+        i_index = _lookup_column_index(float(x), mapping)
+        if side == "UPPER":
+            tag = upper_tag
+            control_row = 1
+            dy = 1.0
+        else:
+            tag = lower_tag
+            control_row = 0
+            dy = -1.0
+
+        kinds.append("FFD_CONTROL_POINT_2D")
+        scales.append(scale)
+        markers.append([marker])
+        ffdtags.append(tag)
+        params.append([int(i_index), control_row, 0.0, dy])
+        sizes.append(1)
+
+    return {
+        "KIND": kinds,
+        "SCALE": scales,
+        "MARKER": markers,
+        "FFDTAG": ffdtags,
+        "PARAM": params,
+        "SIZE": sizes,
+    }
+
+
+def ordered_dual_ffd_records(upper_columns, lower_columns):
+    return [
+        ("UPPER", float(x)) for x in sorted(upper_columns)
+    ] + [
+        ("LOWER", float(x)) for x in sorted(lower_columns)
+    ]
 
 
 def _ffd_dump_padded_params(kind, params):
@@ -553,7 +825,15 @@ def select_ffd_candidates_by_nadd_mode(
             return []
 
     mode = str(opts.get("nadd_mode", "GROWTH_RATIO")).upper()
-    ranked = sorted(candidates, key=lambda c: (-float(c["indicator"]), float(c["x"])))
+    side_rank = {"UPPER": 0, "LOWER": 1, "FFD": 2}
+    ranked = sorted(
+        candidates,
+        key=lambda c: (
+            -float(c["indicator"]),
+            side_rank.get(str(c.get("side", "FFD")).upper(), 99),
+            float(c["x"]),
+        ),
+    )
 
     if mode == "GROWTH_RATIO":
         nadd = _compute_adaptive_nadd(
@@ -577,6 +857,7 @@ def select_ffd_candidates_by_nadd_mode(
             max_batch_size = min(max_batch_size, n_remaining)
         score_rel_tol = float(opts.get("batch_score_rel_tol", 0.85))
         min_separation = float(opts.get("batch_min_separation", 0.04))
+        max_per_side = opts.get("batch_max_per_side", None)
         selected = []
         best_indicator = float(ranked[0]["indicator"])
         threshold = score_rel_tol * best_indicator
@@ -592,8 +873,18 @@ def select_ffd_candidates_by_nadd_mode(
                 opts,
             ):
                 continue
+            side = str(candidate.get("side", "FFD"))
+            if max_per_side is not None:
+                side_count = sum(
+                    1
+                    for previous in selected
+                    if str(previous.get("side", "FFD")) == side
+                )
+                if side_count >= int(max_per_side):
+                    continue
             if any(
-                abs(float(candidate["x"]) - float(prev["x"])) < min_separation
+                str(prev.get("side", "FFD")) == side
+                and abs(float(candidate["x"]) - float(prev["x"])) < min_separation
                 for prev in selected
             ):
                 continue
@@ -654,6 +945,103 @@ def _uniform_ffd_refinement(prev_level, opts):
     return _cap_ffd_refinement(prev_level, columns, opts)
 
 
+def _uniform_dual_ffd_refinement(prev_level, opts):
+    active_xmin = float(prev_level.active_xmin)
+    active_xmax = float(prev_level.active_xmax)
+    candidates = []
+    side_rank = {"UPPER": 0, "LOWER": 1}
+    for side, columns in (
+        ("UPPER", prev_level.upper_columns),
+        ("LOWER", prev_level.lower_columns),
+    ):
+        extended = _sorted_unique_with_tolerance(
+            [active_xmin] + list(columns) + [active_xmax]
+        )
+        for interval_id in range(len(extended) - 1):
+            left = float(extended[interval_id])
+            right = float(extended[interval_id + 1])
+            if right <= left:
+                continue
+            candidates.append(
+                {
+                    "side": side,
+                    "x": 0.5 * (left + right),
+                    "width": right - left,
+                    "interval_id": interval_id,
+                    "interval_left": left,
+                    "interval_right": right,
+                }
+            )
+
+    candidates.sort(
+        key=lambda item: (
+            -float(item["width"]),
+            side_rank[item["side"]],
+            float(item["interval_left"]),
+        )
+    )
+    nfinal = opts.get("nfinal", None)
+    if nfinal is None:
+        nadd = len(candidates)
+    else:
+        nadd = max(0, min(len(candidates), int(nfinal) - prev_level.ndv))
+    selected = candidates[:nadd]
+
+    upper = list(prev_level.upper_columns)
+    lower = list(prev_level.lower_columns)
+    for candidate in selected:
+        if candidate["side"] == "UPPER":
+            upper.append(float(candidate["x"]))
+        else:
+            lower.append(float(candidate["x"]))
+    upper = validate_active_ffd_columns(
+        sorted(set(upper)),
+        xmin=active_xmin,
+        xmax=active_xmax,
+        include_bounds=False,
+    )
+    lower = validate_active_ffd_columns(
+        sorted(set(lower)),
+        xmin=active_xmin,
+        xmax=active_xmax,
+        include_bounds=False,
+    )
+
+    opts["_last_selection_metadata"] = {
+        "level_id": prev_level.level_id,
+        "ndv_before": prev_level.ndv,
+        "ndv_after": len(upper) + len(lower),
+        "n_added": len(selected),
+        "nadd_mode": "UNIFORM_WIDEST_INTERVAL",
+        "trigger_mode": opts.get("trigger", "MAX_ITER"),
+        "refinement": "UNIFORM",
+        "spring_enabled": False,
+        "upper_before": sorted(prev_level.upper_columns),
+        "lower_before": sorted(prev_level.lower_columns),
+        "upper_after": sorted(upper),
+        "lower_after": sorted(lower),
+        "selected": [
+            {
+                "side": candidate["side"],
+                "x": float(candidate["x"]),
+                "indicator": float(candidate["width"]),
+                "indicator_ratio_to_best": (
+                    float(candidate["width"]) / float(selected[0]["width"])
+                    if selected and float(selected[0]["width"]) > 0.0
+                    else 0.0
+                ),
+                "interval_id": candidate["interval_id"],
+                "interval_left": candidate["interval_left"],
+                "interval_right": candidate["interval_right"],
+                "sample_index": 1,
+                "sample_fraction": 0.5,
+            }
+            for candidate in selected
+        ],
+    }
+    return upper, lower
+
+
 def _spring_redistribute_ffd_columns(columns, scores, opts):
     xmin, xmax = ffd_active_range_from_opts(opts)
     span = float(xmax) - float(xmin)
@@ -676,11 +1064,145 @@ def _spring_redistribute_ffd_columns(columns, scores, opts):
 
 
 def refine_ffd_columns(prev_level, result, opts):
+    if getattr(prev_level, "dual_box", False):
+        if str(opts.get("refinement", "UNIFORM")).upper() != "ADAPTIVE":
+            return _uniform_dual_ffd_refinement(prev_level, opts)
+        return _refine_ffd_adaptive_dual(prev_level, result, opts)
+
     if str(opts.get("refinement", "UNIFORM")).upper() != "ADAPTIVE":
         opts["_last_selection_metadata"] = None
         return _uniform_ffd_refinement(prev_level, opts)
 
     return _refine_ffd_adaptive(prev_level, result, opts)
+
+
+def _refine_ffd_adaptive_dual(prev_level, result, opts):
+    from SU2.opt.progressive_ffd_projection import _compute_ffd_dot_candidate_scores
+
+    current_ndv = prev_level.ndv
+    opts["_last_selection_metadata"] = None
+    try:
+        scoring = _compute_ffd_dot_candidate_scores(prev_level, opts)
+        candidates = scoring.get("candidates", [])
+    except Exception as err:
+        print(
+            "[PROGRESSIVE_FFD_DUAL] WARNING: ADAPTIVE refine failed -> "
+            f"fallback to UNIFORM | {err}"
+        )
+        return _uniform_dual_ffd_refinement(prev_level, opts)
+
+    if not candidates:
+        if scoring.get("spacing_filtered_empty", False):
+            print(
+                "[PROGRESSIVE_FFD_DUAL] No candidates remain after "
+                "side-local spacing filtering"
+            )
+            return (
+                sorted(prev_level.upper_columns),
+                sorted(prev_level.lower_columns),
+            )
+        print(
+            "[PROGRESSIVE_FFD_DUAL] No scored candidates -> fallback to UNIFORM"
+        )
+        return _uniform_dual_ffd_refinement(prev_level, opts)
+
+    chosen = select_ffd_candidates_by_nadd_mode(
+        candidates,
+        current_ndv,
+        opts,
+        active_centers_by_side={
+            "UPPER": sorted(prev_level.upper_columns),
+            "LOWER": sorted(prev_level.lower_columns),
+        },
+    )
+    if not chosen:
+        return (
+            sorted(prev_level.upper_columns),
+            sorted(prev_level.lower_columns),
+        )
+
+    upper = list(prev_level.upper_columns)
+    lower = list(prev_level.lower_columns)
+    for candidate in chosen:
+        if str(candidate["side"]).upper() == "UPPER":
+            upper.append(float(candidate["x"]))
+        elif str(candidate["side"]).upper() == "LOWER":
+            lower.append(float(candidate["x"]))
+        else:
+            raise ValueError(f"Unexpected dual FFD candidate side {candidate['side']!r}")
+    upper = validate_active_ffd_columns(
+        sorted(set(upper)),
+        xmin=prev_level.active_xmin,
+        xmax=prev_level.active_xmax,
+        include_bounds=False,
+    )
+    lower = validate_active_ffd_columns(
+        sorted(set(lower)),
+        xmin=prev_level.active_xmin,
+        xmax=prev_level.active_xmax,
+        include_bounds=False,
+    )
+    ndv_after = len(upper) + len(lower)
+    nfinal = opts.get("nfinal", None)
+    if nfinal is not None and ndv_after > int(nfinal):
+        raise RuntimeError(
+            f"Dual FFD refinement exceeded NFINAL: {ndv_after} > {nfinal}"
+        )
+
+    best_indicator = max(float(candidate["indicator"]) for candidate in chosen)
+    ratios = [
+        float(candidate["indicator"]) / best_indicator
+        if best_indicator != 0.0
+        else 0.0
+        for candidate in chosen
+    ]
+    print(
+        "[PROGRESSIVE_FFD_DUAL] ADAPTIVE batch | "
+        f"ndv_before={current_ndv} ndv_after={ndv_after} "
+        f"upper={len(upper)} lower={len(lower)}"
+    )
+    for candidate in chosen:
+        print(
+            "[PROGRESSIVE_FFD_DUAL] selected | "
+            f"side={candidate['side']} x={float(candidate['x']):.6f} "
+            f"I={float(candidate['indicator']):.6e}"
+        )
+
+    opts["_last_selection_metadata"] = {
+        "level_id": prev_level.level_id,
+        "ndv_before": current_ndv,
+        "ndv_after": ndv_after,
+        "n_added": ndv_after - current_ndv,
+        "nadd_mode": opts.get("nadd_mode", "GROWTH_RATIO"),
+        "trigger_mode": opts.get("trigger", "MAX_ITER"),
+        "refinement": "ADAPTIVE",
+        "spring_enabled": False,
+        "upper_before": sorted(prev_level.upper_columns),
+        "lower_before": sorted(prev_level.lower_columns),
+        "upper_after": sorted(upper),
+        "lower_after": sorted(lower),
+        "selected": [
+            {
+                "side": candidate["side"],
+                "x": float(candidate["x"]),
+                "indicator": float(candidate["indicator"]),
+                "indicator_ratio_to_best": ratios[index],
+                "interval_id": candidate.get("interval_id"),
+                "interval_left": candidate.get("interval_left"),
+                "interval_right": candidate.get("interval_right"),
+                "sample_index": candidate.get("sample_index"),
+                "sample_fraction": candidate.get("sample_fraction"),
+                "rejected_reason": candidate.get("rejected_reason", ""),
+                "nearest_center_or_boundary": candidate.get(
+                    "nearest_center_or_boundary", ""
+                ),
+                "nearest_distance": candidate.get("nearest_distance", ""),
+                "required_spacing": candidate.get("required_spacing", ""),
+            }
+            for index, candidate in enumerate(chosen)
+        ],
+    }
+    return upper, lower
 
 
 def _refine_ffd_adaptive(prev_level, result, opts):
@@ -838,6 +1360,8 @@ def _refine_ffd_adaptive(prev_level, result, opts):
 
 
 def apply_post_opt_ffd_spring(level, result, opts):
+    if getattr(level, "dual_box", False):
+        raise NotImplementedError("Spring redistribution is unavailable in dual FFD mode")
     dv_values = result.get("dv_values", None)
     if dv_values is None:
         print(
@@ -878,6 +1402,23 @@ def apply_post_opt_ffd_spring(level, result, opts):
 def initial_ffd_columns_from_config(base_config, opts):
     active_xmin, active_xmax = ffd_active_range_from_opts(opts)
     include_bounds = ffd_active_include_bounds_from_opts(opts)
+    if _as_bool(opts.get("ffd_dual_box", False)):
+        columns = opts.get("ffd_initial_columns", None)
+        if columns is None:
+            columns = _parse_ffd_initial_columns_unbounded(
+                base_config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None)
+            )
+        if columns is None:
+            raise ValueError(
+                "PROGRESSIVE_FFD_INITIAL_COLUMNS is required in dual FFD mode"
+            )
+        return validate_active_ffd_columns(
+            columns,
+            xmin=active_xmin,
+            xmax=active_xmax,
+            include_bounds=False,
+        )
+
     columns = _parse_ffd_initial_columns(
         base_config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None),
         xmin=active_xmin,

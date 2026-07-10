@@ -337,7 +337,10 @@ def get_progressive_hh_options(config):
             ffd_initial_count = upper_count
         if ffd_initial_count is None:
             ffd_initial_count = n0
-        initial_ndv = ffd_initial_count
+        if _as_bool(config.get("PROGRESSIVE_FFD_DUAL_BOX", "NO")):
+            initial_ndv = 2 * ffd_initial_count
+        else:
+            initial_ndv = ffd_initial_count
     elif symmetry_mode == "REDUCED":
         if surface_mode != "BOTH":
             raise ValueError(

@@ -13,9 +13,14 @@ from SU2.opt.progressive_ffd_core import (
     build_ffd_mesh_columns,
     ffd_active_range_from_opts,
     make_ffd_config_dump_compatible,
+    make_dual_ffd_definition,
     make_ffd_definition,
+    ordered_dual_ffd_records,
 )
 from SU2.opt.progressive_ffd_mesh import rewrite_ffd_box_with_columns_and_reembed
+from SU2.opt.progressive_ffd_split import (
+    rewrite_dual_ffd_boxes_with_columns_and_reembed,
+)
 from SU2.opt.progressive_hh_projection import (
     _compute_ikkt_residual_vector,
     _dot_problem_kind,
@@ -176,6 +181,7 @@ def _filter_candidates_by_min_spacing(
     min_spacing,
     xmin,
     xmax,
+    side="FFD",
 ):
     if float(min_spacing) <= 0.0:
         return candidates
@@ -200,7 +206,7 @@ def _filter_candidates_by_min_spacing(
         candidate["required_spacing"] = min_spacing
         print(
             "[PROGRESSIVE_FFD] Candidate rejected by min spacing | "
-            f"side=FFD x={float(candidate['x']):.6f} "
+            f"side={side} x={float(candidate['x']):.6f} "
             f"nearest={float(nearest):.6f} dist={float(nearest_distance):.6f} "
             f"required={float(min_spacing):.6f}"
         )
@@ -297,11 +303,22 @@ def _build_extended_ffd_dot_config(
     if "MULTIPOINT_MESH_FILENAME" in cfg_dot and cfg_dot["MULTIPOINT_MESH_FILENAME"]:
         cfg_dot["MULTIPOINT_MESH_FILENAME"] = f"({mesh_name})"
 
-    cfg_dot["DEFINITION_DV"] = make_ffd_definition(
-        ordered_columns,
-        opts,
-        column_index_by_x,
-    )
+    if opts.get("ffd_dual_box", False):
+        cfg_dot["DEFINITION_DV"] = make_dual_ffd_definition(
+            ordered_columns,
+            opts,
+            column_index_by_x,
+        )
+        cfg_dot["FFD_CONTINUITY"] = "USER_INPUT"
+        for key in ("FFD_FIX_I", "FFD_FIX_J", "FFD_FIX_K"):
+            if key in cfg_dot:
+                del cfg_dot[key]
+    else:
+        cfg_dot["DEFINITION_DV"] = make_ffd_definition(
+            ordered_columns,
+            opts,
+            column_index_by_x,
+        )
     cfg_dot["DV_MARKER"] = str(opts["ffd_marker"])
     cfg_dot["DV_KIND"] = str(opts["ffd_dv_kind"])
     cfg_dot["DV_VALUE_NEW"] = [0.0] * len(ordered_columns)
@@ -442,6 +459,9 @@ def _run_ffd_geo_gradient_for_function(level_dir, cfg_dot, func_name):
 
 
 def _compute_ffd_dot_candidate_scores(level, opts):
+    if getattr(level, "dual_box", False):
+        return _compute_dual_ffd_dot_candidate_scores(level, opts)
+
     cfg_path = os.path.join(level.workdir, level.config_filename)
     cfg_level = SU2.io.Config(cfg_path)
 
@@ -647,4 +667,241 @@ def _compute_ffd_dot_candidate_scores(level, opts):
         "candidates": reduced_candidates,
         "raw_candidates": candidates,
         "active_scores": active_indicator,
+    }
+
+
+def _compute_dual_ffd_dot_candidate_scores(level, opts):
+    cfg_path = os.path.join(level.workdir, level.config_filename)
+    cfg_level = SU2.io.Config(cfg_path)
+
+    nsamples = int(opts.get("candidate_samples", 1))
+    min_spacing = float(opts.get("min_center_spacing", 0.0))
+    candidate_xmin, candidate_xmax = ffd_active_range_from_opts(opts)
+    active_by_side = {
+        "UPPER": sorted(float(x) for x in level.upper_columns),
+        "LOWER": sorted(float(x) for x in level.lower_columns),
+    }
+
+    raw_candidates = []
+    for side in ("UPPER", "LOWER"):
+        side_candidates = get_ffd_interval_candidates(
+            active_by_side[side],
+            xmin=candidate_xmin,
+            xmax=candidate_xmax,
+            nsamples=nsamples,
+        )
+        for candidate in side_candidates:
+            candidate["side"] = side
+        side_candidates = _filter_candidates_by_min_spacing(
+            side_candidates,
+            active_by_side[side],
+            min_spacing,
+            candidate_xmin,
+            candidate_xmax,
+            side=side,
+        )
+        raw_candidates.extend(side_candidates)
+
+    if not raw_candidates:
+        return {
+            "candidates": [],
+            "spacing_filtered_empty": min_spacing > 0.0,
+            "active_scores": [],
+            "active_upper_scores": [],
+            "active_lower_scores": [],
+        }
+
+    active_records = ordered_dual_ffd_records(
+        level.upper_columns,
+        level.lower_columns,
+    )
+    candidate_records = [
+        (str(candidate["side"]).upper(), float(candidate["x"]))
+        for candidate in raw_candidates
+    ]
+    ordered_records = active_records + candidate_records
+
+    obj_name = str(cfg_level.get("OBJECTIVE_FUNCTION", "DRAG")).upper()
+    obj_adj_dir, design_dir = _find_real_adjoint_assets(level.workdir, obj_name)
+    real_dot_cfg_path, dot_kind = _select_dot_config_path(obj_adj_dir, cfg_level)
+    print(
+        "[PROGRESSIVE_FFD_DUAL] Using DOT config: "
+        f"{real_dot_cfg_path} | kind={dot_kind}"
+    )
+
+    real_dot_cfg = SU2.io.Config(real_dot_cfg_path)
+    real_mesh_name = str(real_dot_cfg["MESH_FILENAME"])
+    mesh_src = _find_projection_mesh_source(
+        real_mesh_name,
+        obj_adj_dir,
+        design_dir,
+        level.workdir,
+    )
+
+    candidate_by_side = {"UPPER": [], "LOWER": []}
+    for side, x in candidate_records:
+        candidate_by_side[side].append(float(x))
+    upper_extended_active = sorted(
+        set(active_by_side["UPPER"] + candidate_by_side["UPPER"])
+    )
+    lower_extended_active = sorted(
+        set(active_by_side["LOWER"] + candidate_by_side["LOWER"])
+    )
+    upper_mesh_columns, _ = build_ffd_mesh_columns(
+        mesh_src,
+        opts["ffd_upper_box_tag"],
+        active_columns=upper_extended_active,
+        opts=opts,
+    )
+    lower_mesh_columns, _ = build_ffd_mesh_columns(
+        mesh_src,
+        opts["ffd_lower_box_tag"],
+        active_columns=lower_extended_active,
+        opts=opts,
+    )
+
+    extended_mesh_basename = f"ffd_projection_level{level.level_id}.su2"
+    extended_mesh_path = os.path.join(level.workdir, extended_mesh_basename)
+    mesh_info = rewrite_dual_ffd_boxes_with_columns_and_reembed(
+        mesh_src,
+        extended_mesh_path,
+        marker=opts["ffd_marker"],
+        upper_tag=opts["ffd_upper_box_tag"],
+        lower_tag=opts["ffd_lower_box_tag"],
+        upper_columns=upper_mesh_columns,
+        lower_columns=lower_mesh_columns,
+        upper_offset_chord=opts["ffd_upper_offset_chord"],
+        lower_offset_chord=opts["ffd_lower_offset_chord"],
+        diagnostics_csv=False,
+        overwrite=True,
+    )
+    column_index_by_side = {
+        "UPPER": mesh_info["upper_column_index_by_x"],
+        "LOWER": mesh_info["lower_column_index_by_x"],
+    }
+    cfg_dot = _build_extended_ffd_dot_config(
+        cfg_level,
+        real_dot_cfg,
+        extended_mesh_basename,
+        ordered_records,
+        opts,
+        column_index_by_side,
+    )
+    state = _make_projection_state(extended_mesh_basename)
+    grad_obj = _run_ffd_dot_for_function(
+        level.workdir,
+        cfg_dot,
+        state,
+        obj_name,
+    )
+
+    n_active = len(active_records)
+    n_candidate = len(candidate_records)
+    if len(grad_obj) != n_active + n_candidate:
+        raise RuntimeError(
+            "DOT dual FFD gradient size mismatch: "
+            f"got {len(grad_obj)}, expected {n_active + n_candidate}"
+        )
+    grad_active = list(grad_obj[:n_active])
+    grad_candidate = list(grad_obj[n_active:])
+    indicator_mode = str(opts.get("adaptive_indicator", "ABS_GRAD")).upper()
+
+    if indicator_mode == "IKKT":
+        constraint_names = _extract_constraint_names(cfg_level)
+        lambda_bounds = _extract_constraint_signs(cfg_level, constraint_names)
+        constraint_grads_full = []
+        for constraint_name in constraint_names:
+            constraint_name = constraint_name.upper()
+            try:
+                grad_constraint = _run_ffd_dot_for_function(
+                    level.workdir,
+                    cfg_dot,
+                    state,
+                    constraint_name,
+                )
+                print(
+                    f"[PROGRESSIVE_FFD_DUAL] IKKT | {constraint_name} via DOT"
+                )
+            except Exception:
+                try:
+                    grad_constraint = _run_ffd_geo_gradient_for_function(
+                        level.workdir,
+                        cfg_dot,
+                        constraint_name,
+                    )
+                    print(
+                        "[PROGRESSIVE_FFD_DUAL] IKKT | "
+                        f"{constraint_name} via GEOMETRY"
+                    )
+                except Exception:
+                    print(
+                        "[PROGRESSIVE_FFD_DUAL] IKKT warning | "
+                        f"{constraint_name} gradient unavailable -> skipped"
+                    )
+                    continue
+            if len(grad_constraint) != len(grad_obj):
+                raise RuntimeError(
+                    f"{constraint_name} full gradient size mismatch: "
+                    f"got {len(grad_constraint)}, expected {len(grad_obj)}"
+                )
+            constraint_grads_full.append(grad_constraint)
+
+        residual_full, _ = _compute_ikkt_residual_vector(
+            grad_obj,
+            constraint_grads_full,
+            lambda_bounds=lambda_bounds,
+        )
+        active_indicator = np.abs(
+            np.asarray(residual_full[:n_active], dtype=float)
+        ).tolist()
+        candidate_indicator = np.abs(
+            np.asarray(residual_full[n_active:], dtype=float)
+        ).tolist()
+    else:
+        active_indicator = _indicator_from_gradient(
+            grad_active,
+            cfg_level,
+            indicator_mode,
+        )
+        candidate_indicator = _indicator_from_gradient(
+            grad_candidate,
+            cfg_level,
+            indicator_mode,
+        )
+
+    candidates = []
+    for index, raw in enumerate(raw_candidates):
+        candidates.append(
+            {
+                "side": str(raw["side"]).upper(),
+                "x": float(raw["x"]),
+                "grad": float(grad_candidate[index]),
+                "indicator": float(candidate_indicator[index]),
+                "interval_id": raw["interval_id"],
+                "interval_left": float(raw["interval_left"]),
+                "interval_right": float(raw["interval_right"]),
+                "sample_index": int(raw["sample_index"]),
+                "sample_fraction": float(raw["sample_fraction"]),
+                "rejected_reason": raw.get("rejected_reason", ""),
+                "nearest_center_or_boundary": raw.get(
+                    "nearest_center_or_boundary", ""
+                ),
+                "nearest_distance": raw.get("nearest_distance", ""),
+                "required_spacing": raw.get("required_spacing", ""),
+            }
+        )
+
+    print(
+        "[PROGRESSIVE_FFD_DUAL] Candidate scoring | "
+        f"mode={indicator_mode} active_ndv={n_active} "
+        f"candidate_ndv={n_candidate}"
+    )
+    reduced_candidates = _reduce_candidates_to_interval_best(candidates)
+    n_upper_active = len(level.upper_columns)
+    return {
+        "candidates": reduced_candidates,
+        "raw_candidates": candidates,
+        "active_scores": active_indicator,
+        "active_upper_scores": active_indicator[:n_upper_active],
+        "active_lower_scores": active_indicator[n_upper_active:],
     }

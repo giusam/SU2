@@ -18,9 +18,11 @@ from SU2.opt.progressive_ffd_mesh import (
     _parse_control_points,
     _parse_count_block,
     _parse_degree,
+    _parse_blending_spec,
     _parse_int_value,
     _split_tokens,
 )
+from SU2.opt.progressive_ffd_blending import evaluate_curve
 from SU2.opt.progressive_ffd_split import (
     FFDBoxSplitError,
     rewrite_dual_ffd_boxes_with_columns_and_reembed,
@@ -191,6 +193,13 @@ def _read_box(path, tag):
         "control_format": control_format,
         "surface": surface_rows,
         "surface_count": surface_block["count"],
+        "blending_spec": _parse_blending_spec(
+            lines,
+            start,
+            end,
+            control_counts=(degree["i"] + 1, degree["j"] + 1, 2),
+            dual_2d=True,
+        ),
     }
 
 
@@ -215,10 +224,11 @@ def _assert_surface_reconstruction(box, mesh_points, tol=1.0e-10):
     for record in box["surface"]:
         u = record["u"]
         v = record["v"]
-        x = _bezier_1d(columns, u)
-        y0 = _bezier_1d(row0, u)
-        y1 = _bezier_1d(row1, u)
-        y = (1.0 - v) * y0 + v * y1
+        spec = box["blending_spec"]
+        x = evaluate_curve(columns, u, spec, axis=0)
+        y0 = evaluate_curve(row0, u, spec, axis=0)
+        y1 = evaluate_curve(row1, u, spec, axis=0)
+        y = evaluate_curve([y0, y1], v, spec, axis=1)
         expected = mesh_points[record["point_id"]]
         assert math.hypot(x - expected[0], y - expected[1]) <= tol
 
@@ -238,6 +248,8 @@ def test_symmetric_split_builds_disjoint_boxes_and_reembeds_exactly(tmp_path):
 
     output_text = mesh_out.read_text()
     assert "FFD_NBOX= 2\n" in output_text
+
+
     assert "FFD_TAG= UPPER_BOX\n" in output_text
     assert "FFD_TAG= LOWER_BOX\n" in output_text
     assert "% NON_FFD_SENTINEL: preserve this trailing mesh content\n" in output_text
@@ -298,6 +310,51 @@ def test_symmetric_split_builds_disjoint_boxes_and_reembeds_exactly(tmp_path):
         for row in diagnostics
         if row["status"] == "EMBEDDED"
     )
+
+
+def test_bspline_split_and_rewrite_preserve_surface_and_fixed_order(tmp_path):
+    bootstrap = _write_bootstrap_mesh(tmp_path / "bootstrap.su2")
+    dual = tmp_path / "dual_bspline.su2"
+    summary = _split(
+        bootstrap,
+        dual,
+        output_blending="BSPLINE_UNIFORM",
+        bspline_orders=(4, 2, 2),
+    )
+    assert summary["blending"] == "BSPLINE_UNIFORM"
+    assert summary["bspline_orders"] == [4, 2, 2]
+    text = dual.read_text()
+    assert text.count("FFD_BLENDING= BSPLINE_UNIFORM") == 2
+    assert text.count("BSPLINE_ORDER_I= 4") == 2
+
+    mesh_points = read_su2_mesh(dual)["points"]
+    _assert_surface_reconstruction(_read_box(dual, "UPPER_BOX"), mesh_points)
+    _assert_surface_reconstruction(_read_box(dual, "LOWER_BOX"), mesh_points)
+
+    rewritten = tmp_path / "rewritten.su2"
+    rewrite_summary = rewrite_dual_ffd_boxes_with_columns_and_reembed(
+        dual,
+        rewritten,
+        marker="AIRFOIL",
+        upper_tag="UPPER_BOX",
+        lower_tag="LOWER_BOX",
+        upper_columns=[-0.1, 0.15, 0.35, 0.55, 0.75, 0.9, 1.1],
+        lower_columns=[-0.1, 0.2, 0.5, 0.8, 1.1],
+        upper_offset_chord=0.04,
+        lower_offset_chord=0.06,
+        diagnostics_csv=False,
+        overwrite=False,
+    )
+    assert rewrite_summary["blending"] == "BSPLINE_UNIFORM"
+    upper = _read_box(rewritten, "UPPER_BOX")
+    lower = _read_box(rewritten, "LOWER_BOX")
+    assert upper["degree"]["i"] == 6
+    assert lower["degree"]["i"] == 4
+    assert upper["blending_spec"].orders == (4, 2, 2)
+    assert lower["blending_spec"].orders == (4, 2, 2)
+    rewritten_points = read_su2_mesh(rewritten)["points"]
+    _assert_surface_reconstruction(upper, rewritten_points)
+    _assert_surface_reconstruction(lower, rewritten_points)
 
 
 def test_cambered_lower_branch_above_chord_is_still_classified_topologically(tmp_path):

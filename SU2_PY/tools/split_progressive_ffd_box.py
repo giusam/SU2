@@ -30,6 +30,14 @@ def build_parser():
     parser.add_argument("--x-le", type=float, default=None)
     parser.add_argument("--x-te", type=float, default=None)
     parser.add_argument("--diagnostics-csv", default=None)
+    parser.add_argument(
+        "--output-blending",
+        choices=("BEZIER", "BSPLINE_UNIFORM"),
+        default="BEZIER",
+    )
+    parser.add_argument("--bspline-order-i", type=int, default=2)
+    parser.add_argument("--bspline-order-j", type=int, default=2)
+    parser.add_argument("--bspline-order-k", type=int, default=2)
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -49,6 +57,12 @@ def main(argv=None):
         x_te=args.x_te,
         diagnostics_csv=args.diagnostics_csv,
         overwrite=args.overwrite,
+        output_blending=args.output_blending,
+        bspline_orders=(
+            args.bspline_order_i,
+            args.bspline_order_j,
+            args.bspline_order_k,
+        ),
     )
 
 

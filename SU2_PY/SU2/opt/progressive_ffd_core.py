@@ -5,6 +5,13 @@ import math
 
 from SU2.opt.hh_spring import spring_redistribute_centers
 from SU2.opt.progressive_hh_core import _as_bool, initial_centers
+from SU2.opt.progressive_ffd_blending import (
+    BEZIER,
+    BSPLINE_UNIFORM,
+    make_blending_spec,
+    parse_bspline_orders,
+    validate_blending_spec,
+)
 
 
 class FFDLevel:
@@ -364,6 +371,13 @@ def get_progressive_ffd_options(config, hh_opts):
     refinement_coupling = str(
         config.get("PROGRESSIVE_FFD_REFINEMENT_COUPLING", "INDEPENDENT")
     ).strip().upper()
+    try:
+        blending_spec = make_blending_spec(
+            config.get("FFD_BLENDING", BEZIER),
+            parse_bspline_orders(config.get("FFD_BSPLINE_ORDER", None)),
+        )
+    except ValueError as exc:
+        raise ValueError(f"Invalid progressive FFD blending configuration: {exc}") from exc
 
     ffd_dv_kind = str(
         config.get("PROGRESSIVE_FFD_DV_KIND", "FFD_CONTROL_POINT_2D")
@@ -505,7 +519,29 @@ def get_progressive_ffd_options(config, hh_opts):
                 "PROGRESSIVE_FFD_INITIAL_COLUMNS is required in dual FFD mode"
             )
         initial_columns_count = 2 * len(initial_columns)
+        try:
+            validate_blending_spec(
+                blending_spec,
+                control_counts=(len(initial_columns) + 2, 2, 2),
+                dual_2d=True,
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if blending_spec.kind == BSPLINE_UNIFORM:
+            if ffd_dv_kind != "FFD_CONTROL_POINT_2D":
+                raise NotImplementedError(
+                    "BSPLINE_UNIFORM progressive FFD currently supports only "
+                    "FFD_CONTROL_POINT_2D"
+                )
+            if domain_mode != "FULL":
+                raise NotImplementedError(
+                    "BSPLINE_UNIFORM dual FFD currently supports only FULL domain mode"
+                )
     else:
+        if blending_spec.kind != BEZIER:
+            raise NotImplementedError(
+                "BSPLINE_UNIFORM progressive FFD is currently available only in dual-box mode"
+            )
         initial_columns = None
         initial_columns_count = _count_ffd_initial_columns(
             config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None),
@@ -556,6 +592,9 @@ def get_progressive_ffd_options(config, hh_opts):
             "ffd_lower_offset_chord": lower_offset_chord,
             "ffd_refinement_coupling": refinement_coupling,
             "ffd_initial_columns": initial_columns,
+            "ffd_blending": blending_spec.kind,
+            "ffd_bspline_orders": tuple(blending_spec.orders),
+            "ffd_blending_spec": blending_spec,
             "marker": marker,
         }
     )
@@ -564,6 +603,12 @@ def get_progressive_ffd_options(config, hh_opts):
         print(f"[PROGRESSIVE_FFD] FFD DV kind = {ffd_dv_kind}")
         print(f"[PROGRESSIVE_FFD] marker = {marker}")
         print(f"[PROGRESSIVE_FFD] domain mode = {domain_mode}")
+        print(f"[PROGRESSIVE_FFD] blending = {blending_spec.kind}")
+        if blending_spec.kind == BSPLINE_UNIFORM:
+            print(
+                "[PROGRESSIVE_FFD] B-spline orders = "
+                f"{list(blending_spec.orders)}"
+            )
         if dual_box:
             print("[PROGRESSIVE_FFD_DUAL] enabled = YES")
             print(

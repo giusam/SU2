@@ -23,6 +23,7 @@ from SU2.opt.progressive_ffd_mesh import (
     rewrite_ffd_box_with_columns_and_reembed,
 )
 from SU2.opt.progressive_ffd_split import split_bootstrap_ffd_box
+from SU2.opt.progressive_ffd_blending import BEZIER
 
 
 class FFDPreparationError(RuntimeError):
@@ -177,6 +178,7 @@ def _write_bootstrap_config(
                 f"{x_le:.16g}, {y_top:.16g}, 0.0 )"
             ),
             "FFD_DEGREE= ( 1, 1, 0 )",
+            "FFD_BLENDING= BEZIER",
             "FFD_TOLERANCE= 1E-10",
             "FFD_ITERATIONS= 500",
             "",
@@ -193,6 +195,8 @@ def _write_zero_smoke_config(
     marker,
     other_markers,
     upper_tag,
+    blending=BEZIER,
+    bspline_orders=(2, 2, 2),
 ):
     lines = [
         "SOLVER= EULER",
@@ -223,6 +227,11 @@ def _write_zero_smoke_config(
             "FFD_TOLERANCE= 1E-10",
             "FFD_ITERATIONS= 500",
             "FFD_CONTINUITY= USER_INPUT",
+            f"FFD_BLENDING= {blending}",
+            (
+                "FFD_BSPLINE_ORDER= "
+                + ", ".join(str(int(value)) for value in bspline_orders)
+            ),
             "OUTPUT_FILES= ( PARAVIEW, SURFACE_PARAVIEW )",
             "",
         ]
@@ -316,6 +325,8 @@ def _run_zero_smoke_test(
     upper_tag,
     partitions,
     tolerance,
+    blending=BEZIER,
+    bspline_orders=(2, 2, 2),
 ):
     smoke_base = os.path.join(run_dir, "dual_zero_smoke")
     smoke_mesh = smoke_base + ".su2"
@@ -337,6 +348,8 @@ def _run_zero_smoke_test(
         marker=marker,
         other_markers=other_markers,
         upper_tag=upper_tag,
+        blending=blending,
+        bspline_orders=bspline_orders,
     )
     _run_su2_def(smoke_cfg, partitions, smoke_log)
     if not os.path.isfile(smoke_mesh):
@@ -384,6 +397,8 @@ def _persist_smoke_artifacts(
     marker,
     other_markers,
     upper_tag,
+    blending=BEZIER,
+    bspline_orders=(2, 2, 2),
 ):
     os.makedirs(prep_dir, exist_ok=True)
     persistent_cfg = os.path.abspath(os.path.join(prep_dir, "dual_zero_smoke.cfg"))
@@ -395,6 +410,8 @@ def _persist_smoke_artifacts(
         marker=marker,
         other_markers=other_markers,
         upper_tag=upper_tag,
+        blending=blending,
+        bspline_orders=bspline_orders,
     )
     shutil.copy2(smoke_run["log"], persistent_log)
 
@@ -516,6 +533,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
         "lower_offset_chord": float(opts["ffd_lower_offset_chord"]),
         "prepared_mesh": prepared_mesh,
         "smoke_test": bool(opts.get("ffd_prepare_smoke_test", True)),
+        "ffd_blending": opts.get("ffd_blending", BEZIER),
+        "bspline_orders": [int(value) for value in opts.get("ffd_bspline_orders", (2, 2, 2))],
     }
 
     manifest = None
@@ -561,6 +580,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                         upper_tag=opts["ffd_upper_box_tag"],
                         partitions=partitions,
                         tolerance=1.0e-10 * max(1.0, geometry["chord"]),
+                        blending=opts.get("ffd_blending", BEZIER),
+                        bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
                     )
                     smoke_artifacts = _persist_smoke_artifacts(
                         smoke_run,
@@ -569,6 +590,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                         marker=geometry["marker_tag"],
                         other_markers=other_markers,
                         upper_tag=opts["ffd_upper_box_tag"],
+                        blending=opts.get("ffd_blending", BEZIER),
+                        bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
                     )
                     manifest.setdefault("artifacts", {}).update(smoke_artifacts)
                     manifest.setdefault("result", {})[
@@ -679,6 +702,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
             x_te=geometry["x_te"],
             diagnostics_csv=staged_diagnostics,
             overwrite=False,
+            output_blending=opts.get("ffd_blending", BEZIER),
+            bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
         )
 
         coordinate_error, coordinate_point = _max_mesh_coordinate_difference(
@@ -706,6 +731,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                 upper_tag=opts["ffd_upper_box_tag"],
                 partitions=partitions,
                 tolerance=tolerance,
+                blending=opts.get("ffd_blending", BEZIER),
+                bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
             )
             smoke_error = smoke_run["coordinate_error"]
 
@@ -727,6 +754,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                 marker=geometry["marker_tag"],
                 other_markers=other_markers,
                 upper_tag=opts["ffd_upper_box_tag"],
+                blending=opts.get("ffd_blending", BEZIER),
+                bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
             )
 
         os.replace(staged_dual, prepared_mesh)
@@ -750,6 +779,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
             "lower_max_error": split_summary["lower_max_reembedding_error"],
             "physical_coordinate_error": coordinate_error,
             "smoke_coordinate_error": smoke_error,
+            "ffd_blending": opts.get("ffd_blending", BEZIER),
+            "bspline_orders": [int(value) for value in opts.get("ffd_bspline_orders", (2, 2, 2))],
         }
         manifest_payload = {
             "request": request,

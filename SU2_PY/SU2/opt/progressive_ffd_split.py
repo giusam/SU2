@@ -38,7 +38,16 @@ from SU2.opt.progressive_ffd_mesh import (
     _parse_count_block,
     _parse_degree,
     _parse_int_value,
+    _parse_blending_spec,
     _split_tokens,
+)
+from SU2.opt.progressive_ffd_blending import (
+    BEZIER,
+    FFDBlendingSpec,
+    evaluate_curve,
+    invert_monotone_curve,
+    make_blending_spec,
+    validate_blending_spec,
 )
 
 
@@ -566,6 +575,7 @@ def _infer_curved_surface_param_location(
     columns,
     control_y,
     z_planes,
+    blending_spec,
 ):
     best = None
     candidate_point_indices = []
@@ -591,6 +601,7 @@ def _infer_curved_surface_param_location(
                     control_y,
                     z_planes,
                     uvw,
+                    blending_spec,
                 )
                 error = math.hypot(
                     mapped[0] - float(point_coords[0]),
@@ -616,6 +627,7 @@ def _parse_curved_surface_lines(
     z_planes,
     marker_tag,
     reconstruction_tol,
+    blending_spec,
 ):
     parsed = {}
     for line in surface_block["data"]:
@@ -640,6 +652,7 @@ def _parse_curved_surface_lines(
                 columns,
                 control_y,
                 z_planes,
+                blending_spec,
             )
             if candidate is None or candidate["point_id"] != point_id:
                 continue
@@ -698,13 +711,14 @@ def _checked_unit_parameter(value, point_id, box_tag, name, tol=1.0e-8):
     return value
 
 
-def _eval_curved_two_row_ffd(columns, control_y, z_planes, uvw):
+def _eval_curved_two_row_ffd(columns, control_y, z_planes, uvw, blending_spec=None):
     u, v, w = [float(value) for value in uvw]
-    x = _bezier_1d(columns, u)
-    y0 = _bezier_1d(control_y[0], u)
-    y1 = _bezier_1d(control_y[1], u)
-    y = (1.0 - v) * y0 + v * y1
-    z = _bezier_1d(z_planes, w) if z_planes else 0.0
+    spec = blending_spec or FFDBlendingSpec(BEZIER)
+    x = evaluate_curve(columns, u, spec, axis=0)
+    y0 = evaluate_curve(control_y[0], u, spec, axis=0)
+    y1 = evaluate_curve(control_y[1], u, spec, axis=0)
+    y = evaluate_curve([y0, y1], v, spec, axis=1)
+    z = evaluate_curve(z_planes, w, spec, axis=2) if z_planes else 0.0
     return [x, y, z]
 
 
@@ -720,6 +734,7 @@ def _reembed_side(
     control_y,
     z_planes,
     chord,
+    blending_spec=None,
 ):
     uv_tol = 1.0e-8
     x_tol = uv_tol * max(1.0, float(chord))
@@ -744,11 +759,16 @@ def _reembed_side(
                 f"x={x:.16g}, box=[{x_min:.16g},{x_max:.16g}]"
             )
 
+        spec = blending_spec or FFDBlendingSpec(BEZIER)
         u = _checked_unit_parameter(
-            _invert_monotone_bezier(columns, x), point_id, box_tag, "u", uv_tol
+            invert_monotone_curve(columns, x, spec, axis=0),
+            point_id,
+            box_tag,
+            "u",
+            uv_tol,
         )
-        y0 = _bezier_1d(control_y[0], u)
-        y1 = _bezier_1d(control_y[1], u)
+        y0 = evaluate_curve(control_y[0], u, spec, axis=0)
+        y1 = evaluate_curve(control_y[1], u, spec, axis=0)
         denominator = y1 - y0
         if denominator <= 1.0e-14 * max(1.0, float(chord)):
             raise FFDBoxSplitError(
@@ -766,7 +786,9 @@ def _reembed_side(
         else:
             w = 0.0
         uvw = [u, v, w]
-        mapped = _eval_curved_two_row_ffd(columns, control_y, z_planes, uvw)
+        mapped = _eval_curved_two_row_ffd(
+            columns, control_y, z_planes, uvw, spec
+        )
         error = math.hypot(mapped[0] - x, mapped[1] - y)
         if error > reconstruction_tol:
             raise FFDBoxSplitError(
@@ -811,7 +833,9 @@ def _build_box_block(
     coord_dim,
     control_format,
     surface_lines,
+    blending_spec=None,
 ):
+    spec = blending_spec or FFDBlendingSpec(BEZIER)
     control_lines = _build_curved_control_point_lines(
         columns,
         control_y,
@@ -831,12 +855,21 @@ def _build_box_block(
         lines.append(_format_key_value("FFD_DEGREE_K", degree_k))
     lines.extend(
         [
-            _format_key_value("FFD_BLENDING", "BEZIER"),
+            _format_key_value("FFD_BLENDING", spec.kind),
             _format_key_value("FFD_PARENTS", 0),
             _format_key_value("FFD_CHILDREN", 0),
             _format_key_value("FFD_CORNER_POINTS", len(corner_lines)),
         ]
     )
+    if spec.kind != BEZIER:
+        insert_at = 6 if degree_k is not None else 5
+        order_lines = [
+            _format_key_value("BSPLINE_ORDER_I", spec.orders[0]),
+            _format_key_value("BSPLINE_ORDER_J", spec.orders[1]),
+        ]
+        if degree_k is not None:
+            order_lines.append(_format_key_value("BSPLINE_ORDER_K", spec.orders[2]))
+        lines[insert_at:insert_at] = order_lines
     lines.extend(corner_lines)
     lines.append(_format_key_value("FFD_CONTROL_POINTS", len(control_lines)))
     lines.extend(control_lines)
@@ -856,15 +889,6 @@ def _parse_existing_dual_box(lines, tag):
         raise FFDBoxSplitError(f"FFD box {tag!r} must have FFD_LEVEL=0")
     _parse_zero_relation_count(lines, block_start, block_end, "FFD_PARENTS")
     _parse_zero_relation_count(lines, block_start, block_end, "FFD_CHILDREN")
-
-    blending_line = _find_key_line(lines, block_start, block_end, "FFD_BLENDING")
-    if blending_line is None:
-        raise FFDBoxSplitError(f"FFD box {tag!r} is missing FFD_BLENDING")
-    blending = _normalize_tag(_line_value(lines[blending_line])).upper()
-    if blending != "BEZIER":
-        raise FFDBoxSplitError(
-            f"Progressive dual FFD supports only BEZIER blending, got {blending!r}"
-        )
 
     degree = _parse_degree(lines, block_start, block_end)
     if degree["i"] is None or degree["j"] != 1:
@@ -904,6 +928,16 @@ def _parse_existing_dual_box(lines, tag):
         degree,
         control_format,
     )
+    try:
+        blending_spec = _parse_blending_spec(
+            lines,
+            block_start,
+            block_end,
+            control_counts=(len(columns), len(control_y), len(z_planes)),
+            dual_2d=True,
+        )
+    except ValueError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
     return {
         "tag": _normalize_tag(tag),
         "block_start": block_start,
@@ -917,6 +951,7 @@ def _parse_existing_dual_box(lines, tag):
         "z_planes": z_planes,
         "coord_dim": coord_dim,
         "control_format": control_format,
+        "blending_spec": blending_spec,
     }
 
 
@@ -986,6 +1021,22 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
     lower_box = _parse_existing_dual_box(lines, lower_tag)
     if {upper_box["block_start"], lower_box["block_start"]} != set(tag_lines):
         raise FFDBoxSplitError("Unexpected FFD box tag found in dual mesh")
+    if upper_box["blending_spec"] != lower_box["blending_spec"]:
+        raise FFDBoxSplitError("Upper and lower FFD boxes must use the same blending")
+    blending_spec = upper_box["blending_spec"]
+    try:
+        validate_blending_spec(
+            blending_spec,
+            control_counts=(len(upper_columns), 2, len(upper_box["z_planes"])),
+            dual_2d=True,
+        )
+        validate_blending_spec(
+            blending_spec,
+            control_counts=(len(lower_columns), 2, len(lower_box["z_planes"])),
+            dual_2d=True,
+        )
+    except ValueError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
 
     try:
         mesh = read_su2_mesh(mesh_in)
@@ -1104,6 +1155,7 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
         upper_box["z_planes"],
         marker_tag,
         reconstruction_tol,
+        upper_box["blending_spec"],
     )
     lower_templates = _parse_curved_surface_lines(
         lower_box["surface_block"],
@@ -1113,6 +1165,7 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
         lower_box["z_planes"],
         marker_tag,
         reconstruction_tol,
+        lower_box["blending_spec"],
     )
 
     expected_upper = {
@@ -1146,6 +1199,7 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
         upper_control_y,
         upper_box["z_planes"],
         chord,
+        upper_box["blending_spec"],
     )
     lower_surface_lines, lower_diagnostics, lower_max_error = _reembed_side(
         "lower",
@@ -1159,6 +1213,7 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
         lower_control_y,
         lower_box["z_planes"],
         chord,
+        lower_box["blending_spec"],
     )
 
     upper_block = _build_box_block(
@@ -1171,6 +1226,7 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
         upper_box["coord_dim"],
         upper_box["control_format"],
         upper_surface_lines,
+        blending_spec,
     )
     lower_block = _build_box_block(
         lower_tag,
@@ -1182,6 +1238,7 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
         lower_box["coord_dim"],
         lower_box["control_format"],
         lower_surface_lines,
+        blending_spec,
     )
 
     first_start = min(upper_box["block_start"], lower_box["block_start"])
@@ -1271,6 +1328,8 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
         "fixed_edge_points": len(edge_node_ids),
         "upper_max_reembedding_error": upper_max_error,
         "lower_max_reembedding_error": lower_max_error,
+        "blending": blending_spec.kind,
+        "bspline_orders": list(blending_spec.orders),
     }
     print(
         "[PROGRESSIVE_FFD_DUAL] Rewritten | "
@@ -1295,6 +1354,8 @@ def split_bootstrap_ffd_box(
     x_te=None,
     diagnostics_csv=None,
     overwrite=False,
+    output_blending=BEZIER,
+    bspline_orders=(2, 2, 2),
 ):
     """Replace one bootstrap FFD box with independent curved upper/lower boxes."""
 
@@ -1316,6 +1377,10 @@ def split_bootstrap_ffd_box(
         raise FFDBoxSplitError("Upper and lower FFD tags must be different")
     if (x_le is None) != (x_te is None):
         raise FFDBoxSplitError("x_le and x_te must be provided together")
+    try:
+        output_spec = make_blending_spec(output_blending, bspline_orders)
+    except ValueError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
 
     with open(mesh_in, "r") as fp:
         lines = fp.readlines()
@@ -1406,6 +1471,14 @@ def split_bootstrap_ffd_box(
             raise FFDBoxSplitError("Bootstrap FFD x-columns must be strictly increasing")
     if len(old_y_rows) != 2:
         raise FFDBoxSplitError("Bootstrap FFD box must contain exactly two y rows")
+    try:
+        validate_blending_spec(
+            output_spec,
+            control_counts=(len(columns), 2, len(z_planes)),
+            dual_2d=True,
+        )
+    except ValueError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
     _validate_bootstrap_control_lattice(
         control_points,
         degree,
@@ -1569,6 +1642,7 @@ def split_bootstrap_ffd_box(
         upper_control_y,
         z_planes,
         chord,
+        output_spec,
     )
     lower_surface_lines, lower_diagnostics, lower_max_error = _reembed_side(
         "lower",
@@ -1582,6 +1656,7 @@ def split_bootstrap_ffd_box(
         lower_control_y,
         z_planes,
         chord,
+        output_spec,
     )
     if not upper_surface_lines or not lower_surface_lines:
         raise FFDBoxSplitError("Both output boxes must contain surface points")
@@ -1596,6 +1671,7 @@ def split_bootstrap_ffd_box(
         coord_dim,
         control_format,
         upper_surface_lines,
+        output_spec,
     )
     lower_block = _build_box_block(
         lower_tag,
@@ -1607,6 +1683,7 @@ def split_bootstrap_ffd_box(
         coord_dim,
         control_format,
         lower_surface_lines,
+        output_spec,
     )
 
     output_lines = list(lines[:block_start])
@@ -1685,6 +1762,8 @@ def split_bootstrap_ffd_box(
         "fixed_edge_points": len(edge_node_ids),
         "upper_max_reembedding_error": upper_max_error,
         "lower_max_reembedding_error": lower_max_error,
+        "blending": output_spec.kind,
+        "bspline_orders": list(output_spec.orders),
     }
     print(
         "[PROGRESSIVE_FFD_SPLIT] Completed | "

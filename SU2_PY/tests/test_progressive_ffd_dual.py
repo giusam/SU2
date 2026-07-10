@@ -95,6 +95,32 @@ def test_dual_nfinal_counts_upper_and_lower_dvs():
     assert opts["ffd_initial_columns"] == pytest.approx([0.25, 0.5, 0.75])
 
 
+def test_dual_bspline_options_are_native_and_validated():
+    config = _dual_config(
+        FFD_BLENDING="BSPLINE_UNIFORM",
+        FFD_BSPLINE_ORDER="( 4, 2, 2 )",
+    )
+    opts = _dual_opts(config)
+    assert opts["ffd_blending"] == "BSPLINE_UNIFORM"
+    assert opts["ffd_bspline_orders"] == (4, 2, 2)
+
+    with pytest.raises(ValueError, match="exceeds control-point count"):
+        _dual_opts(
+            _dual_config(
+                FFD_BLENDING="BSPLINE_UNIFORM",
+                FFD_BSPLINE_ORDER="( 6, 2, 2 )",
+            )
+        )
+
+    with pytest.raises(NotImplementedError, match="only in dual-box mode"):
+        _dual_opts(
+            _legacy_config(
+                FFD_BLENDING="BSPLINE_UNIFORM",
+                FFD_BSPLINE_ORDER="( 3, 2, 2 )",
+            )
+        )
+
+
 def test_dual_mode_rejects_legacy_single_box_options_and_spring():
     config = _dual_config(PROGRESSIVE_FFD_CONTROL_ROW=1)
     hh_opts = get_progressive_hh_options(config)
@@ -296,6 +322,37 @@ def test_level_config_contains_two_independent_boxes_and_user_continuity(
     assert ordered_dual_ffd_records(level.upper_columns, level.lower_columns) == (
         level.dv_records
     )
+
+
+def test_bspline_level_config_preserves_native_blending_and_order(tmp_path, monkeypatch):
+    bootstrap = _write_bootstrap_mesh(tmp_path / "bootstrap.su2")
+    dual = tmp_path / "dual_bspline.su2"
+    _split(
+        bootstrap,
+        dual,
+        output_blending="BSPLINE_UNIFORM",
+        bspline_orders=(4, 2, 2),
+    )
+    config = _dual_config(
+        MESH_FILENAME=str(dual),
+        MESH_OUT_FILENAME="mesh_out",
+        FFD_BLENDING="BSPLINE_UNIFORM",
+        FFD_BSPLINE_ORDER="( 4, 2, 2 )",
+    )
+    config._filename = str(tmp_path / "Config_FFD.cfg")
+    opts = _dual_opts(config)
+    opts["ffd_active_xmin"] = 0.0
+    opts["ffd_active_xmax"] = 1.0
+    level = build_initial_ffd_level(config, opts)
+
+    monkeypatch.chdir(tmp_path)
+    cfg_path = Path(write_ffd_level_config(config, level, opts))
+    cfg_text = cfg_path.read_text()
+    assert "FFD_BLENDING= BSPLINE_UNIFORM" in cfg_text
+    assert "FFD_BSPLINE_ORDER= 4, 2, 2" in cfg_text
+    mesh_text = (tmp_path / "LEVEL_0" / "ffd_level0.su2").read_text()
+    assert mesh_text.count("FFD_BLENDING= BSPLINE_UNIFORM") == 2
+    assert mesh_text.count("BSPLINE_ORDER_I= 4") == 2
 
 
 def test_legacy_single_box_level_remains_unchanged(tmp_path, monkeypatch):

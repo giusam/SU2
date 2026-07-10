@@ -413,6 +413,10 @@ def write_ffd_level_config(base_config, level, opts):
         )
     cfg["DV_MARKER"] = str(opts["ffd_marker"])
     cfg["DV_KIND"] = str(opts["ffd_dv_kind"])
+    cfg["FFD_BLENDING"] = str(opts.get("ffd_blending", "BEZIER"))
+    cfg["FFD_BSPLINE_ORDER"] = ", ".join(
+        str(int(value)) for value in opts.get("ffd_bspline_orders", (2, 2, 2))
+    )
 
     dv_values = getattr(level, "dv_values", None)
     if dv_values is None or len(dv_values) != level.ndv:

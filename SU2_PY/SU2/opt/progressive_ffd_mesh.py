@@ -4,6 +4,15 @@ import math
 import os
 import re
 
+from SU2.opt.progressive_ffd_blending import (
+    BEZIER,
+    FFDBlendingSpec,
+    evaluate_curve,
+    invert_monotone_curve,
+    make_blending_spec,
+    validate_blending_spec,
+)
+
 
 _KEY_VALUE_RE = re.compile(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*(?:%.*)?$")
 
@@ -398,16 +407,22 @@ def _infer_axes_from_control_points(control_points, degree):
     return x_columns, y_rows, z_planes
 
 
-def _check_bezier_blending(lines, start, end):
+def _parse_blending_spec(lines, start, end, control_counts=None, dual_2d=False):
     line_id = _find_key_line(lines, start, end, "FFD_BLENDING")
-    if line_id is None:
-        return
-    value = _normalize_tag(_line_value(lines[line_id])).upper()
-    if value and value != "BEZIER":
-        raise NotImplementedError(
-            "Progressive FFD mesh re-embedding currently supports only "
-            f"Bezier FFD blending, got FFD_BLENDING={value}"
-        )
+    kind = BEZIER if line_id is None else _normalize_tag(_line_value(lines[line_id]))
+    orders = [2, 2, 2]
+    for axis, key in enumerate(
+        ("BSPLINE_ORDER_I", "BSPLINE_ORDER_J", "BSPLINE_ORDER_K")
+    ):
+        order_line = _find_key_line(lines, start, end, key)
+        if order_line is not None:
+            orders[axis] = _parse_int_value(lines[order_line])
+    spec = make_blending_spec(kind, orders)
+    return validate_blending_spec(
+        spec,
+        control_counts=control_counts,
+        dual_2d=dual_2d,
+    )
 
 
 def _binomial(n, i):
@@ -415,51 +430,19 @@ def _binomial(n, i):
 
 
 def _bezier_1d(values, t):
-    values = [float(v) for v in values]
-    n = len(values) - 1
-    if n <= 0:
-        return values[0] if values else 0.0
-    t = max(0.0, min(1.0, float(t)))
-    omt = 1.0 - t
-    total = 0.0
-    for i, value in enumerate(values):
-        total += _binomial(n, i) * (t ** i) * (omt ** (n - i)) * value
-    return total
+    return evaluate_curve(values, t, FFDBlendingSpec(BEZIER), axis=0)
 
 
 def _invert_monotone_bezier(values, target):
-    values = [float(v) for v in values]
-    if len(values) <= 1:
-        return 0.0
-
-    increasing = values[-1] >= values[0]
-    lo_value = min(values[0], values[-1])
-    hi_value = max(values[0], values[-1])
-    target = max(lo_value, min(hi_value, float(target)))
-
-    lo = 0.0
-    hi = 1.0
-    for _ in range(80):
-        mid = 0.5 * (lo + hi)
-        value = _bezier_1d(values, mid)
-        if increasing:
-            if value < target:
-                lo = mid
-            else:
-                hi = mid
-        else:
-            if value > target:
-                lo = mid
-            else:
-                hi = mid
-    return 0.5 * (lo + hi)
+    return invert_monotone_curve(values, target, FFDBlendingSpec(BEZIER), axis=0)
 
 
 def _eval_rectangular_ffd(axes, uvw):
     u, v, w = uvw
-    x = _bezier_1d(axes["columns"], u)
-    y = _bezier_1d(axes["y_rows"], v)
-    z = _bezier_1d(axes["z_planes"], w) if axes["z_planes"] else 0.0
+    spec = axes.get("blending_spec", FFDBlendingSpec(BEZIER))
+    x = evaluate_curve(axes["columns"], u, spec, axis=0)
+    y = evaluate_curve(axes["y_rows"], v, spec, axis=1)
+    z = evaluate_curve(axes["z_planes"], w, spec, axis=2) if axes["z_planes"] else 0.0
     return [x, y, z]
 
 
@@ -557,10 +540,11 @@ def _reembed_surface_lines(surface_lines, mesh_points, old_axes, new_axes, ndime
             )
 
         point = mesh_points[best["point_id"]]
-        u = _invert_monotone_bezier(new_axes["columns"], point[0])
-        v = _invert_monotone_bezier(new_axes["y_rows"], point[1])
+        spec = new_axes.get("blending_spec", FFDBlendingSpec(BEZIER))
+        u = invert_monotone_curve(new_axes["columns"], point[0], spec, axis=0)
+        v = invert_monotone_curve(new_axes["y_rows"], point[1], spec, axis=1)
         if best["param_count"] >= 3 and len(new_axes["z_planes"]) > 1:
-            w = _invert_monotone_bezier(new_axes["z_planes"], point[2])
+            w = invert_monotone_curve(new_axes["z_planes"], point[2], spec, axis=2)
         elif best["param_count"] >= 3:
             try:
                 w = float(tokens[best["param_start"] + 2])
@@ -741,8 +725,6 @@ def rewrite_ffd_box_with_columns_and_reembed(
 
     ndime, mesh_points = _parse_mesh_points(lines)
     block_start, block_end = _find_tagged_ffd_block(lines, box_tag)
-    _check_bezier_blending(lines, block_start, block_end)
-
     degree = _parse_degree(lines, block_start, block_end)
     control_block = _parse_count_block(
         lines, block_start, block_end, "FFD_CONTROL_POINTS"
@@ -772,16 +754,28 @@ def rewrite_ffd_box_with_columns_and_reembed(
         z_planes = [0.0]
 
     coord_dim = max(coord_dim, 3 if len(z_planes) > 1 else coord_dim)
+    blending_spec = _parse_blending_spec(
+        lines,
+        block_start,
+        block_end,
+        control_counts=(len(old_columns), len(y_rows), len(z_planes)),
+    )
+    validate_blending_spec(
+        blending_spec,
+        control_counts=(len(new_columns), len(y_rows), len(z_planes)),
+    )
 
     old_axes = {
         "columns": old_columns,
         "y_rows": y_rows,
         "z_planes": z_planes,
+        "blending_spec": blending_spec,
     }
     new_axes = {
         "columns": new_columns,
         "y_rows": y_rows,
         "z_planes": z_planes,
+        "blending_spec": blending_spec,
     }
 
     new_control_lines = _build_control_point_lines(
@@ -904,4 +898,6 @@ def rewrite_ffd_box_with_columns_and_reembed(
         "control_points": control_count,
         "surface_points": surface_block["count"],
         "reembedding_max_error": max_error,
+        "blending": blending_spec.kind,
+        "bspline_orders": list(blending_spec.orders),
     }

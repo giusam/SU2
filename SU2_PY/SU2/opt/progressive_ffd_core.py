@@ -332,6 +332,40 @@ def build_ffd_mesh_columns(mesh_in, box_tag, active_columns, opts=None):
     return mesh_columns, active_columns
 
 
+def validate_ffd_mesh_blending(mesh_info, opts, context="FFD mesh"):
+    """Require a rewritten/prepared mesh to match the requested blending."""
+
+    expected = opts.get("ffd_blending_spec")
+    if expected is None:
+        expected = make_blending_spec(
+            opts.get("ffd_blending", BEZIER),
+            opts.get("ffd_bspline_orders", (2, 2, 2)),
+        )
+
+    actual_kind = mesh_info.get("blending", None)
+    if actual_kind is None:
+        raise RuntimeError(f"{context} did not report FFD blending metadata")
+    actual = make_blending_spec(
+        actual_kind,
+        mesh_info.get("bspline_orders", (2, 2, 2)),
+    )
+
+    if actual.kind != expected.kind:
+        raise RuntimeError(
+            f"{context} blending mismatch: mesh={actual.kind}, "
+            f"requested={expected.kind}"
+        )
+    if (
+        expected.kind == BSPLINE_UNIFORM
+        and tuple(actual.orders) != tuple(expected.orders)
+    ):
+        raise RuntimeError(
+            f"{context} B-spline order mismatch: mesh={tuple(actual.orders)}, "
+            f"requested={tuple(expected.orders)}"
+        )
+    return actual
+
+
 def get_progressive_ffd_options(config, hh_opts):
     opts = dict(hh_opts)
     opts["param_kind"] = "FFD"

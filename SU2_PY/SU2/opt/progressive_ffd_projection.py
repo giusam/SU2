@@ -16,6 +16,7 @@ from SU2.opt.progressive_ffd_core import (
     make_dual_ffd_definition,
     make_ffd_definition,
     ordered_dual_ffd_records,
+    validate_ffd_mesh_blending,
 )
 from SU2.opt.progressive_ffd_mesh import rewrite_ffd_box_with_columns_and_reembed
 from SU2.opt.progressive_ffd_split import (
@@ -321,6 +322,10 @@ def _build_extended_ffd_dot_config(
         )
     cfg_dot["DV_MARKER"] = str(opts["ffd_marker"])
     cfg_dot["DV_KIND"] = str(opts["ffd_dv_kind"])
+    cfg_dot["FFD_BLENDING"] = str(opts.get("ffd_blending", "BEZIER"))
+    cfg_dot["FFD_BSPLINE_ORDER"] = ", ".join(
+        str(int(value)) for value in opts.get("ffd_bspline_orders", (2, 2, 2))
+    )
     cfg_dot["DV_VALUE_NEW"] = [0.0] * len(ordered_columns)
     cfg_dot["DV_VALUE_OLD"] = [0.0] * len(ordered_columns)
 
@@ -541,6 +546,11 @@ def _compute_ffd_dot_candidate_scores(level, opts):
         new_columns=mesh_columns,
         marker_name=opts["ffd_marker"],
         domain_mode=opts["ffd_domain_mode"],
+    )
+    validate_ffd_mesh_blending(
+        mesh_info,
+        opts,
+        context=f"FFD DOT candidate mesh for level {level.level_id}",
     )
 
     cfg_dot = _build_extended_ffd_dot_config(
@@ -774,6 +784,11 @@ def _compute_dual_ffd_dot_candidate_scores(level, opts):
         lower_offset_chord=opts["ffd_lower_offset_chord"],
         diagnostics_csv=False,
         overwrite=True,
+    )
+    validate_ffd_mesh_blending(
+        mesh_info,
+        opts,
+        context=f"Dual FFD DOT candidate mesh for level {level.level_id}",
     )
     column_index_by_side = {
         "UPPER": mesh_info["upper_column_index_by_x"],

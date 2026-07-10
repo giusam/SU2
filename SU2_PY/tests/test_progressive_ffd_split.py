@@ -519,7 +519,11 @@ def test_native_endpoint_roundoff_at_embedding_tolerance_is_accepted(tmp_path):
     assert summary["fixed_edge_points"] == 2
 
 
-def test_surface_outside_direct_bezier_rows_is_reported_with_point_and_box(tmp_path):
+@pytest.mark.parametrize("output_blending", ["BEZIER", "BSPLINE_UNIFORM"])
+def test_surface_outside_direct_rows_is_reported_with_point_and_box(
+    tmp_path,
+    output_blending,
+):
     sharp_points = [
         (1.0, 0.0),
         (0.75, 0.15),
@@ -541,6 +545,18 @@ def test_surface_outside_direct_bezier_rows_is_reported_with_point_and_box(tmp_p
             tmp_path / "dual.su2",
             upper_offset_chord=0.01,
             lower_offset_chord=0.01,
+            output_blending=output_blending,
+            bspline_orders=(2, 2, 2),
+        )
+
+
+def test_split_rejects_unsupported_output_blending(tmp_path):
+    mesh_in = _write_bootstrap_mesh(tmp_path / "bootstrap.su2")
+    with pytest.raises(FFDBoxSplitError, match="FFD_BLENDING"):
+        _split(
+            mesh_in,
+            tmp_path / "dual.su2",
+            output_blending="CATMULL_ROM",
         )
 
 
@@ -611,10 +627,26 @@ def test_dual_rewrite_supports_independent_upper_lower_columns(tmp_path):
     or os.environ.get("RUN_SU2_DEF_SMOKE", "NO").upper() != "YES",
     reason="set RUN_SU2_DEF_SMOKE=YES to enable the native SU2_DEF smoke test",
 )
-def test_su2_def_reads_both_boxes_at_zero_deformation(tmp_path):
+@pytest.mark.parametrize(
+    "blending,bspline_orders",
+    [
+        ("BEZIER", (2, 2, 2)),
+        ("BSPLINE_UNIFORM", (4, 2, 2)),
+    ],
+)
+def test_su2_def_reads_both_boxes_at_zero_deformation(
+    tmp_path,
+    blending,
+    bspline_orders,
+):
     mesh_in = _write_bootstrap_mesh(tmp_path / "bootstrap.su2")
     mesh_out = tmp_path / "dual.su2"
-    _split(mesh_in, mesh_out)
+    _split(
+        mesh_in,
+        mesh_out,
+        output_blending=blending,
+        bspline_orders=bspline_orders,
+    )
 
     config = tmp_path / "zero_deformation.cfg"
     config.write_text(
@@ -641,6 +673,11 @@ def test_su2_def_reads_both_boxes_at_zero_deformation(tmp_path):
                 "DEFORM_STIFFNESS_TYPE= INVERSE_VOLUME",
                 "FFD_TOLERANCE= 1E-12",
                 "FFD_ITERATIONS= 200",
+                f"FFD_BLENDING= {blending}",
+                (
+                    "FFD_BSPLINE_ORDER= "
+                    + ", ".join(str(value) for value in bspline_orders)
+                ),
                 "OUTPUT_FILES= ( PARAVIEW_ASCII )",
                 "",
             ]
@@ -662,6 +699,10 @@ def test_su2_def_reads_both_boxes_at_zero_deformation(tmp_path):
     assert "2 Free Form Deformation boxes" in combined_output
     assert "FFD box tag: UPPER_BOX" in combined_output
     assert "FFD box tag: LOWER_BOX" in combined_output
+    if blending == "BSPLINE_UNIFORM":
+        assert "FFD Blending using B-Splines. Order: 4, 2" in combined_output
+    else:
+        assert "FFD Blending using Bezier Curves" in combined_output
 
     deformed_mesh = tmp_path / "zero_deformation_out.su2"
     assert deformed_mesh.exists()

@@ -17,12 +17,17 @@ from SU2.opt.bspline_def import (
     infer_chord,
     read_su2_mesh,
 )
-from SU2.opt.progressive_ffd_core import validate_active_ffd_columns
+from SU2.opt.progressive_ffd_core import (
+    validate_active_ffd_columns,
+    validate_ffd_mesh_blending,
+)
 from SU2.opt.progressive_ffd_mesh import (
-    read_ffd_box_columns,
     rewrite_ffd_box_with_columns_and_reembed,
 )
-from SU2.opt.progressive_ffd_split import split_bootstrap_ffd_box
+from SU2.opt.progressive_ffd_split import (
+    read_dual_ffd_box_specs,
+    split_bootstrap_ffd_box,
+)
 from SU2.opt.progressive_ffd_blending import BEZIER
 
 
@@ -428,18 +433,23 @@ def _persist_smoke_artifacts(
 
 def _validate_dual_mesh(mesh_path, geometry, opts):
     try:
-        upper_columns = read_ffd_box_columns(
+        mesh_info = read_dual_ffd_box_specs(
             mesh_path,
             opts["ffd_upper_box_tag"],
-        )
-        lower_columns = read_ffd_box_columns(
-            mesh_path,
             opts["ffd_lower_box_tag"],
+        )
+        validate_ffd_mesh_blending(
+            mesh_info,
+            opts,
+            context=f"Prepared dual FFD mesh {mesh_path}",
         )
     except Exception as exc:
         raise FFDPreparationError(
             f"Prepared mesh does not contain valid dual FFD boxes: {exc}"
         ) from exc
+
+    upper_columns = mesh_info["upper_columns"]
+    lower_columns = mesh_info["lower_columns"]
 
     tolerance = 1.0e-10 * max(1.0, geometry["chord"])
     for side, columns in (("upper", upper_columns), ("lower", lower_columns)):
@@ -465,6 +475,30 @@ def _update_runtime_options(base_config, opts, prepared_mesh, geometry):
         include_bounds=False,
     )
     base_config["MESH_FILENAME"] = os.path.abspath(prepared_mesh)
+
+
+def _build_prepare_request(source_mesh, prepared_mesh, geometry, opts):
+    return {
+        "schema_version": 1,
+        "raw_mesh": os.path.abspath(source_mesh),
+        "raw_mesh_sha256": _sha256_file(source_mesh),
+        "marker": geometry["marker_tag"],
+        "initial_columns": [float(x) for x in opts["ffd_initial_columns"]],
+        "bootstrap_tag": opts["ffd_bootstrap_tag"],
+        "bootstrap_y_padding_chord": float(
+            opts["ffd_bootstrap_y_padding_chord"]
+        ),
+        "upper_tag": opts["ffd_upper_box_tag"],
+        "lower_tag": opts["ffd_lower_box_tag"],
+        "upper_offset_chord": float(opts["ffd_upper_offset_chord"]),
+        "lower_offset_chord": float(opts["ffd_lower_offset_chord"]),
+        "prepared_mesh": os.path.abspath(prepared_mesh),
+        "smoke_test": bool(opts.get("ffd_prepare_smoke_test", True)),
+        "ffd_blending": opts.get("ffd_blending", BEZIER),
+        "bspline_orders": [
+            int(value) for value in opts.get("ffd_bspline_orders", (2, 2, 2))
+        ],
+    }
 
 
 def prepare_progressive_ffd_input(base_config, opts, partitions=1):
@@ -517,25 +551,12 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
     manifest_path = os.path.join(prep_dir, "prepare_manifest.json")
     os.makedirs(prep_dir, exist_ok=True)
 
-    request = {
-        "schema_version": 1,
-        "raw_mesh": os.path.abspath(source_mesh),
-        "raw_mesh_sha256": _sha256_file(source_mesh),
-        "marker": geometry["marker_tag"],
-        "initial_columns": [float(x) for x in opts["ffd_initial_columns"]],
-        "bootstrap_tag": opts["ffd_bootstrap_tag"],
-        "bootstrap_y_padding_chord": float(
-            opts["ffd_bootstrap_y_padding_chord"]
-        ),
-        "upper_tag": opts["ffd_upper_box_tag"],
-        "lower_tag": opts["ffd_lower_box_tag"],
-        "upper_offset_chord": float(opts["ffd_upper_offset_chord"]),
-        "lower_offset_chord": float(opts["ffd_lower_offset_chord"]),
-        "prepared_mesh": prepared_mesh,
-        "smoke_test": bool(opts.get("ffd_prepare_smoke_test", True)),
-        "ffd_blending": opts.get("ffd_blending", BEZIER),
-        "bspline_orders": [int(value) for value in opts.get("ffd_bspline_orders", (2, 2, 2))],
-    }
+    request = _build_prepare_request(
+        source_mesh,
+        prepared_mesh,
+        geometry,
+        opts,
+    )
 
     manifest = None
     if os.path.isfile(manifest_path):
@@ -704,6 +725,11 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
             overwrite=False,
             output_blending=opts.get("ffd_blending", BEZIER),
             bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
+        )
+        validate_ffd_mesh_blending(
+            split_summary,
+            opts,
+            context="Newly prepared dual FFD mesh",
         )
 
         coordinate_error, coordinate_point = _max_mesh_coordinate_difference(

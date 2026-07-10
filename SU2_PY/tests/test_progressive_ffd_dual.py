@@ -10,15 +10,21 @@ from SU2.opt.progressive_ffd_core import (
     ordered_dual_ffd_records,
     refine_ffd_columns,
     select_ffd_candidates_by_nadd_mode,
+    validate_ffd_mesh_blending,
 )
 from SU2.opt.progressive_ffd_levels import (
     build_initial_ffd_level,
     write_ffd_level_config,
 )
 from SU2.opt.progressive_ffd_prepare import (
+    FFDPreparationError,
     _SMOKE_VISUALIZATION_FILENAMES,
+    _build_prepare_request,
+    _mesh_geometry,
     _persist_smoke_artifacts,
+    _validate_dual_mesh,
 )
+from SU2.opt.progressive_ffd_projection import _build_extended_ffd_dot_config
 from SU2.opt.progressive_hh_core import get_progressive_hh_options
 from tests.test_progressive_ffd_split import _split, _write_bootstrap_mesh
 
@@ -111,7 +117,6 @@ def test_dual_bspline_options_are_native_and_validated():
                 FFD_BSPLINE_ORDER="( 6, 2, 2 )",
             )
         )
-
     with pytest.raises(NotImplementedError, match="only in dual-box mode"):
         _dual_opts(
             _legacy_config(
@@ -119,6 +124,117 @@ def test_dual_bspline_options_are_native_and_validated():
                 FFD_BSPLINE_ORDER="( 3, 2, 2 )",
             )
         )
+
+
+def test_mesh_blending_metadata_must_match_requested_options():
+    bspline_opts = _dual_opts(
+        _dual_config(
+            FFD_BLENDING="BSPLINE_UNIFORM",
+            FFD_BSPLINE_ORDER="( 4, 2, 2 )",
+        )
+    )
+    validate_ffd_mesh_blending(
+        {"blending": "BSPLINE_UNIFORM", "bspline_orders": [4, 2, 2]},
+        bspline_opts,
+    )
+    with pytest.raises(RuntimeError, match="blending mismatch"):
+        validate_ffd_mesh_blending(
+            {"blending": "BEZIER", "bspline_orders": [2, 2, 2]},
+            bspline_opts,
+        )
+    with pytest.raises(RuntimeError, match="order mismatch"):
+        validate_ffd_mesh_blending(
+            {"blending": "BSPLINE_UNIFORM", "bspline_orders": [3, 2, 2]},
+            bspline_opts,
+        )
+
+    bezier_opts = _dual_opts(
+        _dual_config(
+            FFD_BLENDING="BEZIER",
+            FFD_BSPLINE_ORDER="( 4, 2, 2 )",
+        )
+    )
+    validate_ffd_mesh_blending(
+        {"blending": "BEZIER", "bspline_orders": [2, 2, 2]},
+        bezier_opts,
+    )
+
+
+@pytest.mark.parametrize(
+    "real_values",
+    [
+        {"MATH_PROBLEM": "DISCRETE_ADJOINT"},
+        {
+            "MATH_PROBLEM": "DISCRETE_ADJOINT",
+            "FFD_BLENDING": "BEZIER",
+            "FFD_BSPLINE_ORDER": "2, 2, 2",
+        },
+    ],
+)
+def test_extended_dot_config_forces_requested_blending(real_values):
+    opts = _dual_opts(
+        _dual_config(
+            FFD_BLENDING="BSPLINE_UNIFORM",
+            FFD_BSPLINE_ORDER="( 4, 2, 2 )",
+        )
+    )
+    cfg_dot = _build_extended_ffd_dot_config(
+        SU2.io.Config({"NUMBER_PART": 1}),
+        SU2.io.Config(real_values),
+        "candidate.su2",
+        [("UPPER", 0.25), ("LOWER", 0.25)],
+        opts,
+        {"UPPER": {0.25: 1}, "LOWER": {0.25: 1}},
+    )
+    assert cfg_dot["FFD_BLENDING"] == "BSPLINE_UNIFORM"
+    assert cfg_dot["FFD_BSPLINE_ORDER"] == "4, 2, 2"
+
+
+def test_prepared_dual_mesh_rejects_cfg_blending_mismatch(tmp_path):
+    bootstrap = _write_bootstrap_mesh(tmp_path / "bootstrap.su2")
+    dual = tmp_path / "dual_bezier.su2"
+    _split(bootstrap, dual)
+    config = _dual_config(
+        MESH_FILENAME=str(dual),
+        FFD_BLENDING="BSPLINE_UNIFORM",
+        FFD_BSPLINE_ORDER="( 4, 2, 2 )",
+    )
+    opts = _dual_opts(config)
+    geometry = _mesh_geometry(str(dual), "AIRFOIL")
+    with pytest.raises(FFDPreparationError, match="blending mismatch"):
+        _validate_dual_mesh(str(dual), geometry, opts)
+
+
+def test_prepare_cache_request_changes_with_bspline_order(tmp_path):
+    raw_mesh = _write_bootstrap_mesh(tmp_path / "raw.su2")
+    geometry = _mesh_geometry(str(raw_mesh), "AIRFOIL")
+    opts_o4 = _dual_opts(
+        _dual_config(
+            FFD_BLENDING="BSPLINE_UNIFORM",
+            FFD_BSPLINE_ORDER="( 4, 2, 2 )",
+        )
+    )
+    opts_o3 = _dual_opts(
+        _dual_config(
+            FFD_BLENDING="BSPLINE_UNIFORM",
+            FFD_BSPLINE_ORDER="( 3, 2, 2 )",
+        )
+    )
+    request_o4 = _build_prepare_request(
+        str(raw_mesh),
+        str(tmp_path / "prepared.su2"),
+        geometry,
+        opts_o4,
+    )
+    request_o3 = _build_prepare_request(
+        str(raw_mesh),
+        str(tmp_path / "prepared.su2"),
+        geometry,
+        opts_o3,
+    )
+    assert request_o4["bspline_orders"] == [4, 2, 2]
+    assert request_o3["bspline_orders"] == [3, 2, 2]
+    assert request_o4 != request_o3
 
 
 def test_dual_mode_rejects_legacy_single_box_options_and_spring():

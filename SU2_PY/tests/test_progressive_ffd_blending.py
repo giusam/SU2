@@ -1,6 +1,7 @@
 import pytest
 
 from SU2.opt.progressive_ffd_blending import (
+    BEZIER,
     BSPLINE_UNIFORM,
     basis_values,
     evaluate_curve,
@@ -49,3 +50,42 @@ def test_bspline_order_parser_and_dual_validation():
             control_counts=(9, 2, 2),
             dual_2d=True,
         )
+
+
+def test_blending_and_order_validation_reject_invalid_inputs():
+    with pytest.raises(ValueError, match="FFD_BLENDING"):
+        make_blending_spec("UNKNOWN", (2, 2, 2))
+    with pytest.raises(ValueError, match="finite integers"):
+        parse_bspline_orders("( 4.5, 2, 2 )")
+    with pytest.raises(ValueError, match=">= 2"):
+        parse_bspline_orders("( 4, 1, 2 )")
+    with pytest.raises(ValueError, match="requires FFD_BSPLINE_ORDER"):
+        validate_blending_spec(
+            make_blending_spec(BSPLINE_UNIFORM, (4, 2, 3)),
+            control_counts=(9, 2, 3),
+            dual_2d=True,
+        )
+
+
+@pytest.mark.parametrize("kind", [BEZIER, BSPLINE_UNIFORM])
+@pytest.mark.parametrize("parameter", [-1.0e-15, 1.0 + 1.0e-15])
+def test_basis_evaluation_rejects_parameters_outside_unit_interval(
+    kind,
+    parameter,
+):
+    spec = make_blending_spec(kind, (4, 2, 2))
+    with pytest.raises(ValueError, match=r"\[0,1\]"):
+        basis_values(9, parameter, spec, axis=0)
+
+
+def test_curve_inversion_has_no_target_clamp_and_requires_monotonicity():
+    spec = make_blending_spec(BSPLINE_UNIFORM, (3, 2, 2))
+    controls = [0.0, 0.2, 0.6, 1.0]
+    assert invert_monotone_curve(controls, 0.0, spec) == 0.0
+    assert invert_monotone_curve(controls, 1.0, spec) == 1.0
+    with pytest.raises(ValueError, match="outside the endpoint range"):
+        invert_monotone_curve(controls, -1.0e-15, spec)
+    with pytest.raises(ValueError, match="outside the endpoint range"):
+        invert_monotone_curve(controls, 1.0 + 1.0e-15, spec)
+    with pytest.raises(ValueError, match="must be monotone"):
+        invert_monotone_curve([0.0, 0.7, 0.4, 1.0], 0.5, spec)

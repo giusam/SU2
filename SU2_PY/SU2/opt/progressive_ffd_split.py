@@ -43,6 +43,7 @@ from SU2.opt.progressive_ffd_mesh import (
 )
 from SU2.opt.progressive_ffd_blending import (
     BEZIER,
+    BSPLINE_UNIFORM,
     FFDBlendingSpec,
     evaluate_curve,
     invert_monotone_curve,
@@ -593,7 +594,7 @@ def _infer_curved_surface_param_location(
                     params = [float(value) for value in tokens[start:start + count]]
                 except Exception:
                     continue
-                if any(value < -1.0e-8 or value > 1.0 + 1.0e-8 for value in params):
+                if any(value < 0.0 or value > 1.0 for value in params):
                     continue
                 uvw = [params[0], params[1], params[2] if count >= 3 else 0.0]
                 mapped = _eval_curved_two_row_ffd(
@@ -697,17 +698,17 @@ def _parse_curved_surface_lines(
     return parsed
 
 
-def _checked_unit_parameter(value, point_id, box_tag, name, tol=1.0e-8):
+def _checked_unit_parameter(value, point_id, box_tag, name):
     value = float(value)
-    if value < -tol or value > 1.0 + tol:
+    if not math.isfinite(value):
+        raise FFDBoxSplitError(
+            f"Point {point_id} has non-finite {name} in {box_tag}"
+        )
+    if value < 0.0 or value > 1.0:
         raise FFDBoxSplitError(
             f"Point {point_id} has {name}={value:.16g} outside {box_tag} "
-            f"beyond tolerance {tol:.3g}"
+            "parameter range [0,1]"
         )
-    if value < 0.0:
-        return 0.0
-    if value > 1.0:
-        return 1.0
     return value
 
 
@@ -736,8 +737,6 @@ def _reembed_side(
     chord,
     blending_spec=None,
 ):
-    uv_tol = 1.0e-8
-    x_tol = uv_tol * max(1.0, float(chord))
     reconstruction_tol = 1.0e-10 * max(1.0, float(chord))
     lines = []
     diagnostics = []
@@ -753,20 +752,20 @@ def _reembed_side(
         point = points[point_id]
         x = float(point[0])
         y = float(point[1])
-        if x < x_min - x_tol or x > x_max + x_tol:
+        if x < x_min or x > x_max:
             raise FFDBoxSplitError(
                 f"Point {point_id} lies outside {box_tag} in x: "
                 f"x={x:.16g}, box=[{x_min:.16g},{x_max:.16g}]"
             )
 
         spec = blending_spec or FFDBlendingSpec(BEZIER)
-        u = _checked_unit_parameter(
-            invert_monotone_curve(columns, x, spec, axis=0),
-            point_id,
-            box_tag,
-            "u",
-            uv_tol,
-        )
+        try:
+            u_raw = invert_monotone_curve(columns, x, spec, axis=0)
+        except ValueError as exc:
+            raise FFDBoxSplitError(
+                f"Could not invert x for point {point_id} in {box_tag}: {exc}"
+            ) from exc
+        u = _checked_unit_parameter(u_raw, point_id, box_tag, "u")
         y0 = evaluate_curve(control_y[0], u, spec, axis=0)
         y1 = evaluate_curve(control_y[1], u, spec, axis=0)
         denominator = y1 - y0
@@ -777,11 +776,11 @@ def _reembed_side(
             )
 
         v = (y - y0) / denominator
-        v = _checked_unit_parameter(v, point_id, box_tag, "v", uv_tol)
+        v = _checked_unit_parameter(v, point_id, box_tag, "v")
 
         if template["param_count"] >= 3:
             w = _checked_unit_parameter(
-                template["old_uvw"][2], point_id, box_tag, "w", uv_tol
+                template["old_uvw"][2], point_id, box_tag, "w"
             )
         else:
             w = 0.0
@@ -955,6 +954,51 @@ def _parse_existing_dual_box(lines, tag):
     }
 
 
+def read_dual_ffd_box_specs(mesh_in, upper_tag, lower_tag):
+    """Read and validate the blending metadata of an existing dual FFD mesh."""
+
+    with open(mesh_in, "r") as fp:
+        lines = fp.readlines()
+
+    nbox_line = _find_key_line(lines, 0, len(lines), "FFD_NBOX")
+    if nbox_line is None or _parse_int_value(lines[nbox_line]) != 2:
+        raise FFDBoxSplitError("Progressive dual mesh requires FFD_NBOX=2")
+    nlevel_line = _find_key_line(lines, 0, len(lines), "FFD_NLEVEL")
+    if nlevel_line is None or _parse_int_value(lines[nlevel_line]) != 1:
+        raise FFDBoxSplitError("Progressive dual mesh requires FFD_NLEVEL=1")
+
+    tag_lines = [
+        index for index, line in enumerate(lines) if _line_key(line) == "FFD_TAG"
+    ]
+    if len(tag_lines) != 2:
+        raise FFDBoxSplitError(
+            f"Progressive dual mesh requires exactly two boxes, found {len(tag_lines)}"
+        )
+
+    upper_box = _parse_existing_dual_box(lines, upper_tag)
+    lower_box = _parse_existing_dual_box(lines, lower_tag)
+    if {upper_box["block_start"], lower_box["block_start"]} != set(tag_lines):
+        raise FFDBoxSplitError("Unexpected FFD box tag found in dual mesh")
+    upper_spec = upper_box["blending_spec"]
+    lower_spec = lower_box["blending_spec"]
+    if upper_spec.kind != lower_spec.kind:
+        raise FFDBoxSplitError(
+            "Upper and lower FFD boxes must use the same blending"
+        )
+    if upper_spec.kind == BSPLINE_UNIFORM and upper_spec.orders != lower_spec.orders:
+        raise FFDBoxSplitError(
+            "Upper and lower B-spline FFD boxes must use the same order"
+        )
+
+    spec = upper_spec
+    return {
+        "upper_columns": list(upper_box["columns"]),
+        "lower_columns": list(lower_box["columns"]),
+        "blending": spec.kind,
+        "bspline_orders": list(spec.orders),
+    }
+
+
 def rewrite_dual_ffd_boxes_with_columns_and_reembed(
     mesh_in,
     mesh_out,
@@ -1021,9 +1065,15 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
     lower_box = _parse_existing_dual_box(lines, lower_tag)
     if {upper_box["block_start"], lower_box["block_start"]} != set(tag_lines):
         raise FFDBoxSplitError("Unexpected FFD box tag found in dual mesh")
-    if upper_box["blending_spec"] != lower_box["blending_spec"]:
+    upper_spec = upper_box["blending_spec"]
+    lower_spec = lower_box["blending_spec"]
+    if upper_spec.kind != lower_spec.kind:
         raise FFDBoxSplitError("Upper and lower FFD boxes must use the same blending")
-    blending_spec = upper_box["blending_spec"]
+    if upper_spec.kind == BSPLINE_UNIFORM and upper_spec.orders != lower_spec.orders:
+        raise FFDBoxSplitError(
+            "Upper and lower B-spline FFD boxes must use the same order"
+        )
+    blending_spec = upper_spec
     try:
         validate_blending_spec(
             blending_spec,

@@ -21,6 +21,15 @@ class FFDBlendingSpec:
         return int(self.orders[int(axis)])
 
 
+def _validated_unit_parameter(value, name="parameter"):
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{name} must lie in [0,1], got {value:.16g}")
+    return value
+
+
 def normalize_ffd_blending(value):
     kind = str(value or BEZIER).strip().upper()
     if kind not in SUPPORTED_FFD_BLENDINGS:
@@ -117,7 +126,7 @@ def bezier_basis_values(ncontrol, t):
     if ncontrol <= 0:
         return []
     degree = ncontrol - 1
-    t = max(0.0, min(1.0, float(t)))
+    t = _validated_unit_parameter(t, "Bezier parameter")
     omt = 1.0 - t
     return [
         _binomial(degree, index)
@@ -131,7 +140,7 @@ def bspline_basis_values(ncontrol, order, t):
     ncontrol = int(ncontrol)
     order = int(order)
     knots = open_uniform_knot_vector(ncontrol, order)
-    t = max(0.0, min(1.0, float(t)))
+    t = _validated_unit_parameter(t, "B-spline parameter")
     if t >= 1.0:
         values = [0.0] * ncontrol
         values[-1] = 1.0
@@ -183,13 +192,46 @@ def evaluate_curve(values, t, spec, axis=0):
 
 def invert_monotone_curve(values, target, spec, axis=0, iterations=80):
     values = [float(value) for value in values]
-    if len(values) <= 1:
+    if not values:
+        raise ValueError("Cannot invert an empty curve")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Curve control values must be finite")
+
+    target = float(target)
+    if not math.isfinite(target):
+        raise ValueError("Curve inversion target must be finite")
+
+    nondecreasing = all(right >= left for left, right in zip(values[:-1], values[1:]))
+    nonincreasing = all(right <= left for left, right in zip(values[:-1], values[1:]))
+    if not nondecreasing and not nonincreasing:
+        raise ValueError("Curve control values must be monotone")
+
+    lower = min(values[0], values[-1])
+    upper = max(values[0], values[-1])
+    if target < lower or target > upper:
+        raise ValueError(
+            "Curve inversion target lies outside the endpoint range: "
+            f"target={target:.16g}, range=[{lower:.16g},{upper:.16g}]"
+        )
+
+    if len(values) == 1 or values[0] == values[-1]:
+        if target != values[0]:
+            raise ValueError("A constant curve can only be inverted at its value")
         return 0.0
+
+    if target == values[0]:
+        return 0.0
+    if target == values[-1]:
+        return 1.0
+
+    iterations = int(iterations)
+    if iterations <= 0:
+        raise ValueError("Curve inversion iterations must be positive")
+
     increasing = values[-1] >= values[0]
-    target = max(min(values[0], values[-1]), min(max(values[0], values[-1]), float(target)))
     lo = 0.0
     hi = 1.0
-    for _ in range(int(iterations)):
+    for _ in range(iterations):
         mid = 0.5 * (lo + hi)
         value = evaluate_curve(values, mid, spec, axis=axis)
         if (increasing and value < target) or (not increasing and value > target):

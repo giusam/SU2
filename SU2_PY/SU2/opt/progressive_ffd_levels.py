@@ -17,6 +17,7 @@ from SU2.opt.progressive_ffd_core import (
     make_ffd_definition,
     ordered_dual_ffd_records,
     refine_ffd_columns,
+    validate_ffd_mesh_blending,
 )
 from SU2.opt.progressive_ffd_mesh import rewrite_ffd_box_with_columns_and_reembed
 from SU2.opt.progressive_ffd_split import (
@@ -310,6 +311,11 @@ def _prepare_ffd_mesh(cfg, level, opts):
             diagnostics_csv=False,
             overwrite=True,
         )
+        validate_ffd_mesh_blending(
+            mesh_info,
+            opts,
+            context=f"Progressive FFD level {level.level_id} mesh",
+        )
         mesh_info["active_columns_by_side"] = {
             "UPPER": upper_active,
             "LOWER": lower_active,
@@ -336,6 +342,11 @@ def _prepare_ffd_mesh(cfg, level, opts):
         new_columns=mesh_columns,
         marker_name=opts["ffd_marker"],
         domain_mode=opts["ffd_domain_mode"],
+    )
+    validate_ffd_mesh_blending(
+        mesh_info,
+        opts,
+        context=f"Progressive FFD level {level.level_id} mesh",
     )
     mesh_info["active_columns"] = active_columns
 

@@ -464,7 +464,7 @@ def _infer_surface_param_location(tokens, point_coords, old_axes, ndime):
                     params = [float(v) for v in tokens[start:start + count]]
                 except Exception:
                     continue
-                if any(v < -1.0e-8 or v > 1.0 + 1.0e-8 for v in params):
+                if any(v < 0.0 or v > 1.0 for v in params):
                     continue
                 uvw = [params[0], params[1], params[2] if count >= 3 else 0.0]
                 mapped = _eval_rectangular_ffd(old_axes, uvw)
@@ -541,17 +541,24 @@ def _reembed_surface_lines(surface_lines, mesh_points, old_axes, new_axes, ndime
 
         point = mesh_points[best["point_id"]]
         spec = new_axes.get("blending_spec", FFDBlendingSpec(BEZIER))
-        u = invert_monotone_curve(new_axes["columns"], point[0], spec, axis=0)
-        v = invert_monotone_curve(new_axes["y_rows"], point[1], spec, axis=1)
-        if best["param_count"] >= 3 and len(new_axes["z_planes"]) > 1:
-            w = invert_monotone_curve(new_axes["z_planes"], point[2], spec, axis=2)
-        elif best["param_count"] >= 3:
-            try:
-                w = float(tokens[best["param_start"] + 2])
-            except Exception:
+        try:
+            u = invert_monotone_curve(new_axes["columns"], point[0], spec, axis=0)
+            v = invert_monotone_curve(new_axes["y_rows"], point[1], spec, axis=1)
+            if best["param_count"] >= 3 and len(new_axes["z_planes"]) > 1:
+                w = invert_monotone_curve(
+                    new_axes["z_planes"], point[2], spec, axis=2
+                )
+            elif best["param_count"] >= 3:
+                try:
+                    w = float(tokens[best["param_start"] + 2])
+                except Exception:
+                    w = 0.0
+            else:
                 w = 0.0
-        else:
-            w = 0.0
+        except ValueError as exc:
+            raise FFDMeshError(
+                f"Point {best['point_id']} lies outside the rewritten FFD box: {exc}"
+            ) from exc
 
         uvw = [u, v, w]
         mapped = _eval_rectangular_ffd(new_axes, uvw)

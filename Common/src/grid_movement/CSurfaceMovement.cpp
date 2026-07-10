@@ -2846,7 +2846,7 @@ void CSurfaceMovement::SetHicksHenne(CGeometry* boundary, CConfig* config, unsig
 
   su2double Ampl = config->GetDV_Value(iDV) * Scale;
   su2double xk = config->GetParamDV(iDV, 1);
-  const su2double t2 = 6.0;
+  const su2double t2 = 3.0;
 
   if (config->GetParamDV(iDV, 0) == NO) {
     upper = false;
@@ -2935,7 +2935,7 @@ void CSurfaceMovement::SetSurface_Bump(CGeometry* boundary, CConfig* config, uns
   su2double BumpSize = x_end - x_start;
   su2double BumpLoc = x_start;
   su2double xk = config->GetParamDV(iDV, 2);
-  const su2double t2 = 6.0;
+  const su2double t2 = 3.0;
 
   for (iMarker = 0; iMarker < config->GetnMarker_All(); iMarker++) {
     for (iVertex = 0; iVertex < boundary->nVertex[iMarker]; iVertex++) {

@@ -493,6 +493,7 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH_CANDIDATE_SAMPLES",
         "PROGRESSIVE_HH_MIN_CENTER_SPACING",
         "PROGRESSIVE_HH_ADAPTIVE_INDICATOR",
+        "PROGRESSIVE_HH_IKKT_ACTIVE_TOL",
         "PROGRESSIVE_HH_SPRING",
         "PROGRESSIVE_HH_SPRING_A",
         "PROGRESSIVE_HH_SPRING_TIMING",
@@ -706,6 +707,13 @@ def append_selection_history_csv(
         "interval_right",
         "sample_index",
         "sample_fraction",
+        "candidate_dv_index",
+        "control_point_i",
+        "scoring_basis",
+        "temporary_mesh",
+        "insertion_step",
+        "insertion_target",
+        "artifact_directory",
         "rejected_reason",
         "nearest_center_or_boundary",
         "nearest_distance",
@@ -755,6 +763,13 @@ def append_selection_history_csv(
                     "sample_fraction": ""
                     if c.get("sample_fraction") is None
                     else f"{float(c.get('sample_fraction')):.12g}",
+                    "candidate_dv_index": c.get("candidate_dv_index", ""),
+                    "control_point_i": c.get("control_point_i", ""),
+                    "scoring_basis": c.get("scoring_basis", ""),
+                    "temporary_mesh": c.get("temporary_mesh", ""),
+                    "insertion_step": c.get("insertion_step", ""),
+                    "insertion_target": c.get("insertion_target", ""),
+                    "artifact_directory": c.get("artifact_directory", ""),
                     "rejected_reason": c.get("rejected_reason", ""),
                     "nearest_center_or_boundary": ""
                     if c.get("nearest_center_or_boundary") in (None, "")

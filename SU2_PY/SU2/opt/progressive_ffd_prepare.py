@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-"""Automatic raw-mesh preparation for progressive dual FFD."""
+"""Automatic raw-mesh preparation for progressive full/half FFD."""
 
 import hashlib
 import json
@@ -25,23 +25,49 @@ from SU2.opt.progressive_ffd_mesh import (
     rewrite_ffd_box_with_columns_and_reembed,
 )
 from SU2.opt.progressive_ffd_split import (
+    build_single_surface_ffd_box,
     read_dual_ffd_box_specs,
+    read_single_ffd_box_spec,
     split_bootstrap_ffd_box,
 )
 from SU2.opt.progressive_ffd_blending import BEZIER
 
 
 class FFDPreparationError(RuntimeError):
-    """Raised when automatic dual-FFD preparation cannot be completed safely."""
+    """Raised when automatic FFD preparation cannot be completed safely."""
 
 
-_SMOKE_VISUALIZATION_FILENAMES = {
+_COMMON_SMOKE_VISUALIZATION_FILENAMES = {
+    "surface_vtu": "surface_deformed.vtu",
+}
+
+_DUAL_SMOKE_VISUALIZATION_FILENAMES = {
     "upper_box_vtk": "ffd_boxes_0.vtk",
     "lower_box_vtk": "ffd_boxes_1.vtk",
     "upper_box_deformed_vtk": "ffd_boxes_def_0.vtk",
     "lower_box_deformed_vtk": "ffd_boxes_def_1.vtk",
-    "surface_vtu": "surface_deformed.vtu",
 }
+
+_SINGLE_SMOKE_VISUALIZATION_FILENAMES = {
+    "box_vtk": "ffd_boxes_0.vtk",
+    "box_deformed_vtk": "ffd_boxes_def_0.vtk",
+}
+
+# Backward-compatible name retained for callers that expect the dual artifact set.
+_SMOKE_VISUALIZATION_FILENAMES = {
+    **_COMMON_SMOKE_VISUALIZATION_FILENAMES,
+    **_DUAL_SMOKE_VISUALIZATION_FILENAMES,
+}
+
+
+def _smoke_visualization_filenames(box_count):
+    result = dict(_COMMON_SMOKE_VISUALIZATION_FILENAMES)
+    result.update(
+        _DUAL_SMOKE_VISUALIZATION_FILENAMES
+        if int(box_count) == 2
+        else _SINGLE_SMOKE_VISUALIZATION_FILENAMES
+    )
+    return result
 
 
 def _config_directory(base_config):
@@ -90,7 +116,8 @@ def _format_marker_list(markers):
     return "( " + ", ".join(str(marker) for marker in markers) + " )"
 
 
-def _mesh_geometry(mesh_path, marker):
+def _mesh_geometry(mesh_path, marker, domain_mode="FULL"):
+    domain_mode = str(domain_mode).strip().upper()
     try:
         mesh = read_su2_mesh(mesh_path)
         marker_tag, node_ids, closed = extract_marker_nodes(mesh, marker)
@@ -102,9 +129,13 @@ def _mesh_geometry(mesh_path, marker):
     except BSplineDefError as exc:
         raise FFDPreparationError(str(exc)) from exc
     if mesh["ndime"] != 2:
-        raise FFDPreparationError("Progressive dual FFD preparation requires NDIME=2")
-    if not closed:
-        raise FFDPreparationError("Progressive dual FFD requires a closed marker")
+        raise FFDPreparationError("Progressive FFD preparation requires NDIME=2")
+    if domain_mode == "FULL" and not closed:
+        raise FFDPreparationError("FULL progressive FFD requires a closed marker")
+    if domain_mode in ("HALF_UPPER", "HALF_LOWER") and closed:
+        raise FFDPreparationError(
+            f"{domain_mode} progressive FFD requires an open marker"
+        )
     if not math.isfinite(chord) or chord <= 0.0:
         raise FFDPreparationError("The airfoil chord must be finite and positive")
 
@@ -115,6 +146,7 @@ def _mesh_geometry(mesh_path, marker):
         "mesh": mesh,
         "marker_tag": marker_tag,
         "node_ids": node_ids,
+        "closed": bool(closed),
         "x_le": float(x_le),
         "x_te": float(x_te),
         "chord": float(chord),
@@ -155,6 +187,7 @@ def _write_bootstrap_config(
     mesh_out_base,
     marker,
     other_markers,
+    symmetry_markers,
     bootstrap_tag,
     x_le,
     x_te,
@@ -169,6 +202,8 @@ def _write_bootstrap_config(
     ]
     if other_markers:
         lines.append(f"MARKER_FAR= {_format_marker_list(other_markers)}")
+    if symmetry_markers:
+        lines.append(f"MARKER_SYM= {_format_marker_list(symmetry_markers)}")
     lines.extend(
         [
             "DV_KIND= FFD_SETTING",
@@ -199,7 +234,10 @@ def _write_zero_smoke_config(
     mesh_out_base,
     marker,
     other_markers,
-    upper_tag,
+    symmetry_markers,
+    box_tag,
+    control_row,
+    direction_y,
     blending=BEZIER,
     bspline_orders=(2, 2, 2),
 ):
@@ -213,13 +251,18 @@ def _write_zero_smoke_config(
     ]
     if other_markers:
         lines.append(f"MARKER_FAR= {_format_marker_list(other_markers)}")
+    if symmetry_markers:
+        lines.append(f"MARKER_SYM= {_format_marker_list(symmetry_markers)}")
     lines.extend(
         [
             f"MARKER_PLOTTING= {_format_marker_list([marker])}",
             f"MARKER_MONITORING= {_format_marker_list([marker])}",
             "DV_KIND= FFD_CONTROL_POINT_2D",
             f"DV_MARKER= {_format_marker_list([marker])}",
-            f"DV_PARAM= ( {upper_tag}, 1, 1, 0.0, 1.0 )",
+            (
+                f"DV_PARAM= ( {box_tag}, 1, {int(control_row)}, "
+                f"0.0, {float(direction_y):.1f} )"
+            ),
             "DV_VALUE= 0.0",
             "DEFORM_LINEAR_SOLVER= FGMRES",
             "DEFORM_LINEAR_SOLVER_PREC= ILU",
@@ -313,10 +356,10 @@ def _run_su2_def(config_path, partitions, log_path):
         )
 
 
-def _expected_smoke_visualizations(prep_dir):
+def _expected_smoke_visualizations(prep_dir, box_count):
     return {
         key: os.path.abspath(os.path.join(prep_dir, filename))
-        for key, filename in _SMOKE_VISUALIZATION_FILENAMES.items()
+        for key, filename in _smoke_visualization_filenames(box_count).items()
     }
 
 
@@ -327,21 +370,27 @@ def _run_zero_smoke_test(
     source_mesh,
     marker,
     other_markers,
-    upper_tag,
+    symmetry_markers,
+    box_tag,
+    control_row,
+    direction_y,
+    box_count,
     partitions,
     tolerance,
     blending=BEZIER,
     bspline_orders=(2, 2, 2),
 ):
-    smoke_base = os.path.join(run_dir, "dual_zero_smoke")
+    smoke_base = os.path.join(run_dir, "ffd_zero_smoke")
     smoke_mesh = smoke_base + ".su2"
-    smoke_cfg = os.path.join(run_dir, "dual_zero_smoke.cfg")
-    smoke_log = os.path.join(run_dir, "dual_zero_smoke.log")
+    smoke_cfg = os.path.join(run_dir, "ffd_zero_smoke.cfg")
+    smoke_log = os.path.join(run_dir, "ffd_zero_smoke.log")
 
     # A preceding FFD_SETTING call in the same staging directory may have
     # emitted a single bootstrap-box VTK. Remove all expected visualization
     # names so every retained artifact is known to come from the dual-box run.
-    for filename in _SMOKE_VISUALIZATION_FILENAMES.values():
+    for filename in set(
+        _smoke_visualization_filenames(1).values()
+    ) | set(_smoke_visualization_filenames(2).values()):
         path = os.path.join(run_dir, filename)
         if os.path.isfile(path):
             os.remove(path)
@@ -352,7 +401,10 @@ def _run_zero_smoke_test(
         mesh_out_base=smoke_base,
         marker=marker,
         other_markers=other_markers,
-        upper_tag=upper_tag,
+        symmetry_markers=symmetry_markers,
+        box_tag=box_tag,
+        control_row=control_row,
+        direction_y=direction_y,
         blending=blending,
         bspline_orders=bspline_orders,
     )
@@ -373,7 +425,7 @@ def _run_zero_smoke_test(
 
     visualizations = {}
     missing = []
-    for key, filename in _SMOKE_VISUALIZATION_FILENAMES.items():
+    for key, filename in _smoke_visualization_filenames(box_count).items():
         path = os.path.join(run_dir, filename)
         if not os.path.isfile(path):
             missing.append(filename)
@@ -401,20 +453,27 @@ def _persist_smoke_artifacts(
     prepared_mesh,
     marker,
     other_markers,
-    upper_tag,
+    symmetry_markers,
+    box_tag,
+    control_row,
+    direction_y,
+    box_count,
     blending=BEZIER,
     bspline_orders=(2, 2, 2),
 ):
     os.makedirs(prep_dir, exist_ok=True)
-    persistent_cfg = os.path.abspath(os.path.join(prep_dir, "dual_zero_smoke.cfg"))
-    persistent_log = os.path.abspath(os.path.join(prep_dir, "dual_zero_smoke.log"))
+    persistent_cfg = os.path.abspath(os.path.join(prep_dir, "ffd_zero_smoke.cfg"))
+    persistent_log = os.path.abspath(os.path.join(prep_dir, "ffd_zero_smoke.log"))
     _write_zero_smoke_config(
         persistent_cfg,
         mesh_in=os.path.abspath(prepared_mesh),
-        mesh_out_base=os.path.abspath(os.path.join(prep_dir, "dual_zero_smoke")),
+        mesh_out_base=os.path.abspath(os.path.join(prep_dir, "ffd_zero_smoke")),
         marker=marker,
         other_markers=other_markers,
-        upper_tag=upper_tag,
+        symmetry_markers=symmetry_markers,
+        box_tag=box_tag,
+        control_row=control_row,
+        direction_y=direction_y,
         blending=blending,
         bspline_orders=bspline_orders,
     )
@@ -424,7 +483,7 @@ def _persist_smoke_artifacts(
         "smoke_config": persistent_cfg,
         "smoke_log": persistent_log,
     }
-    expected = _expected_smoke_visualizations(prep_dir)
+    expected = _expected_smoke_visualizations(prep_dir, box_count)
     for key, destination in expected.items():
         shutil.copy2(smoke_run["visualizations"][key], destination)
         artifacts[key] = destination
@@ -463,6 +522,72 @@ def _validate_dual_mesh(mesh_path, geometry, opts):
     return upper_columns, lower_columns
 
 
+def _validate_single_mesh(mesh_path, geometry, opts):
+    box_tag = (
+        opts["ffd_upper_box_tag"]
+        if opts["ffd_domain_mode"] == "HALF_UPPER"
+        else opts["ffd_lower_box_tag"]
+    )
+    try:
+        mesh_info = read_single_ffd_box_spec(mesh_path, box_tag)
+        validate_ffd_mesh_blending(
+            mesh_info,
+            opts,
+            context=f"Prepared single FFD mesh {mesh_path}",
+        )
+    except Exception as exc:
+        raise FFDPreparationError(
+            f"Prepared mesh does not contain a valid single FFD box: {exc}"
+        ) from exc
+    columns = mesh_info["columns"]
+    tolerance = 1.0e-10 * max(1.0, geometry["chord"])
+    if (
+        float(columns[0]) > geometry["x_le"] + tolerance
+        or float(columns[-1]) < geometry["x_te"] - tolerance
+    ):
+        raise FFDPreparationError("The prepared single FFD box does not enclose LE/TE")
+    return columns
+
+
+def _validate_prepared_mesh(mesh_path, geometry, opts):
+    if opts.get("ffd_dual_box", False):
+        return _validate_dual_mesh(mesh_path, geometry, opts)
+    return _validate_single_mesh(mesh_path, geometry, opts)
+
+
+def _smoke_box_request(opts):
+    if opts["ffd_domain_mode"] in ("FULL", "HALF_UPPER"):
+        return {
+            "box_tag": opts["ffd_upper_box_tag"],
+            "control_row": 1,
+            "direction_y": 1.0,
+            "box_count": 2 if opts["ffd_domain_mode"] == "FULL" else 1,
+        }
+    return {
+        "box_tag": opts["ffd_lower_box_tag"],
+        "control_row": 0,
+        "direction_y": -1.0,
+        "box_count": 1,
+    }
+
+
+def _marker_groups(geometry):
+    marker_names = list(geometry["mesh"]["markers"].keys())
+    symmetry_markers = [
+        name
+        for name in marker_names
+        if str(name).lower() != str(geometry["marker_tag"]).lower()
+        and "sym" in str(name).lower()
+    ]
+    other_markers = [
+        name
+        for name in marker_names
+        if str(name).lower() != str(geometry["marker_tag"]).lower()
+        and name not in symmetry_markers
+    ]
+    return other_markers, symmetry_markers
+
+
 def _update_runtime_options(base_config, opts, prepared_mesh, geometry):
     opts["ffd_active_xmin"] = float(geometry["x_le"])
     opts["ffd_active_xmax"] = float(geometry["x_te"])
@@ -479,10 +604,12 @@ def _update_runtime_options(base_config, opts, prepared_mesh, geometry):
 
 def _build_prepare_request(source_mesh, prepared_mesh, geometry, opts):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "raw_mesh": os.path.abspath(source_mesh),
         "raw_mesh_sha256": _sha256_file(source_mesh),
         "marker": geometry["marker_tag"],
+        "domain_mode": opts["ffd_domain_mode"],
+        "active_sides": list(opts.get("ffd_active_sides", ())),
         "initial_columns": [float(x) for x in opts["ffd_initial_columns"]],
         "bootstrap_tag": opts["ffd_bootstrap_tag"],
         "bootstrap_y_padding_chord": float(
@@ -504,15 +631,17 @@ def _build_prepare_request(source_mesh, prepared_mesh, geometry, opts):
 def prepare_progressive_ffd_input(base_config, opts, partitions=1):
     """Prepare or validate the input mesh and update runtime config/options."""
 
-    if not opts.get("ffd_dual_box", False):
-        return None
     if "MESH_FILENAME" not in base_config or not base_config["MESH_FILENAME"]:
-        raise FFDPreparationError("Progressive dual FFD requires MESH_FILENAME")
+        raise FFDPreparationError("Progressive FFD requires MESH_FILENAME")
 
     source_mesh = _resolve_from_config(base_config, base_config["MESH_FILENAME"])
     if not os.path.isfile(source_mesh):
         raise FFDPreparationError(f"Input mesh does not exist: {source_mesh}")
-    geometry = _mesh_geometry(source_mesh, opts["ffd_marker"])
+    geometry = _mesh_geometry(
+        source_mesh,
+        opts["ffd_marker"],
+        domain_mode=opts["ffd_domain_mode"],
+    )
     opts["ffd_initial_columns"] = validate_active_ffd_columns(
         opts["ffd_initial_columns"],
         xmin=geometry["x_le"],
@@ -521,7 +650,7 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
     )
 
     if not opts.get("ffd_auto_prepare", False):
-        _validate_dual_mesh(source_mesh, geometry, opts)
+        _validate_prepared_mesh(source_mesh, geometry, opts)
         _update_runtime_options(base_config, opts, source_mesh, geometry)
         return {
             "prepared_mesh": source_mesh,
@@ -537,16 +666,21 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
         prepared_mesh = _resolve_from_config(base_config, configured_output)
     else:
         stem = os.path.splitext(os.path.basename(source_mesh))[0]
+        topology_slug = {
+            "FULL": "dual",
+            "HALF_UPPER": "upper",
+            "HALF_LOWER": "lower",
+        }[opts["ffd_domain_mode"]]
         prepared_mesh = os.path.join(
             _config_directory(base_config),
-            stem + "_dual_ffd.su2",
+            f"{stem}_{topology_slug}_ffd.su2",
         )
     prepared_mesh = os.path.abspath(prepared_mesh)
     if prepared_mesh == os.path.abspath(source_mesh):
         raise FFDPreparationError("Prepared mesh path must differ from the raw mesh")
 
     diagnostics_mesh_stem, _ = os.path.splitext(prepared_mesh)
-    diagnostics_path = diagnostics_mesh_stem + "_dual_ffd_diagnostics.csv"
+    diagnostics_path = diagnostics_mesh_stem + "_ffd_diagnostics.csv"
     prep_dir = os.path.join(_config_directory(base_config), "FFD_PREP")
     manifest_path = os.path.join(prep_dir, "prepare_manifest.json")
     os.makedirs(prep_dir, exist_ok=True)
@@ -571,24 +705,22 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
         and os.path.isfile(prepared_mesh)
         and os.path.isfile(diagnostics_path)
     )
+    smoke_spec = _smoke_box_request(opts)
+    other_markers, symmetry_markers = _marker_groups(geometry)
     if cache_matches:
         if opts.get("ffd_prepare_smoke_test", True):
-            expected_visualizations = _expected_smoke_visualizations(prep_dir)
+            expected_visualizations = _expected_smoke_visualizations(
+                prep_dir,
+                smoke_spec["box_count"],
+            )
             missing_visualizations = [
                 path
                 for path in expected_visualizations.values()
                 if not os.path.isfile(path)
             ]
             if missing_visualizations:
-                marker_names = list(geometry["mesh"]["markers"].keys())
-                other_markers = [
-                    name
-                    for name in marker_names
-                    if str(name).lower()
-                    != str(geometry["marker_tag"]).lower()
-                ]
                 stage_dir = tempfile.mkdtemp(
-                    prefix=".dual_ffd_visualization_",
+                    prefix=".ffd_visualization_",
                     dir=prep_dir,
                 )
                 try:
@@ -598,7 +730,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                         source_mesh=source_mesh,
                         marker=geometry["marker_tag"],
                         other_markers=other_markers,
-                        upper_tag=opts["ffd_upper_box_tag"],
+                        symmetry_markers=symmetry_markers,
+                        **smoke_spec,
                         partitions=partitions,
                         tolerance=1.0e-10 * max(1.0, geometry["chord"]),
                         blending=opts.get("ffd_blending", BEZIER),
@@ -610,7 +743,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                         prepared_mesh=prepared_mesh,
                         marker=geometry["marker_tag"],
                         other_markers=other_markers,
-                        upper_tag=opts["ffd_upper_box_tag"],
+                        symmetry_markers=symmetry_markers,
+                        **smoke_spec,
                         blending=opts.get("ffd_blending", BEZIER),
                         bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
                     )
@@ -630,7 +764,7 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                     expected_visualizations
                 )
                 _atomic_write_json(manifest_path, manifest)
-        _validate_dual_mesh(prepared_mesh, geometry, opts)
+        _validate_prepared_mesh(prepared_mesh, geometry, opts)
         _update_runtime_options(base_config, opts, prepared_mesh, geometry)
         print(f"[PROGRESSIVE_FFD_PREP] Reusing prepared mesh: {prepared_mesh}")
         return {
@@ -656,14 +790,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
             f"Existing artifacts: {existing_artifacts}"
         )
 
-    stage_dir = tempfile.mkdtemp(prefix=".dual_ffd_prepare_", dir=prep_dir)
+    stage_dir = tempfile.mkdtemp(prefix=".ffd_prepare_", dir=prep_dir)
     try:
-        marker_names = list(geometry["mesh"]["markers"].keys())
-        other_markers = [
-            name
-            for name in marker_names
-            if str(name).lower() != str(geometry["marker_tag"]).lower()
-        ]
         padding = float(opts["ffd_bootstrap_y_padding_chord"]) * geometry["chord"]
         y_bottom = geometry["y_min"] - padding
         y_top = geometry["y_max"] + padding
@@ -678,6 +806,7 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
             mesh_out_base=bootstrap_base,
             marker=geometry["marker_tag"],
             other_markers=other_markers,
+            symmetry_markers=symmetry_markers,
             bootstrap_tag=opts["ffd_bootstrap_tag"],
             x_le=geometry["x_le"],
             x_te=geometry["x_te"],
@@ -705,56 +834,83 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
             box_tag=opts["ffd_bootstrap_tag"],
             new_columns=geometric_columns,
             marker_name=geometry["marker_tag"],
-            domain_mode="FULL",
+            domain_mode=opts["ffd_domain_mode"],
         )
 
-        staged_dual = os.path.join(stage_dir, "prepared_dual_ffd.su2")
-        staged_diagnostics = os.path.join(stage_dir, "dual_ffd_diagnostics.csv")
-        split_summary = split_bootstrap_ffd_box(
-            exact_bootstrap,
-            staged_dual,
-            bootstrap_tag=opts["ffd_bootstrap_tag"],
-            marker=geometry["marker_tag"],
-            upper_tag=opts["ffd_upper_box_tag"],
-            lower_tag=opts["ffd_lower_box_tag"],
-            upper_offset_chord=opts["ffd_upper_offset_chord"],
-            lower_offset_chord=opts["ffd_lower_offset_chord"],
-            x_le=geometry["x_le"],
-            x_te=geometry["x_te"],
-            diagnostics_csv=staged_diagnostics,
-            overwrite=False,
-            output_blending=opts.get("ffd_blending", BEZIER),
-            bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
-        )
+        staged_mesh = os.path.join(stage_dir, "prepared_ffd.su2")
+        staged_diagnostics = os.path.join(stage_dir, "ffd_diagnostics.csv")
+        if opts["ffd_domain_mode"] == "FULL":
+            split_summary = split_bootstrap_ffd_box(
+                exact_bootstrap,
+                staged_mesh,
+                bootstrap_tag=opts["ffd_bootstrap_tag"],
+                marker=geometry["marker_tag"],
+                upper_tag=opts["ffd_upper_box_tag"],
+                lower_tag=opts["ffd_lower_box_tag"],
+                upper_offset_chord=opts["ffd_upper_offset_chord"],
+                lower_offset_chord=opts["ffd_lower_offset_chord"],
+                x_le=geometry["x_le"],
+                x_te=geometry["x_te"],
+                diagnostics_csv=staged_diagnostics,
+                overwrite=False,
+                output_blending=opts.get("ffd_blending", BEZIER),
+                bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
+            )
+        else:
+            side = "UPPER" if opts["ffd_domain_mode"] == "HALF_UPPER" else "LOWER"
+            split_summary = build_single_surface_ffd_box(
+                exact_bootstrap,
+                staged_mesh,
+                bootstrap_tag=opts["ffd_bootstrap_tag"],
+                marker=geometry["marker_tag"],
+                side=side,
+                offset_chord=(
+                    opts["ffd_upper_offset_chord"]
+                    if side == "UPPER"
+                    else opts["ffd_lower_offset_chord"]
+                ),
+                box_tag=(
+                    opts["ffd_upper_box_tag"]
+                    if side == "UPPER"
+                    else opts["ffd_lower_box_tag"]
+                ),
+                x_le=geometry["x_le"],
+                x_te=geometry["x_te"],
+                diagnostics_csv=staged_diagnostics,
+                overwrite=False,
+                output_blending=opts.get("ffd_blending", BEZIER),
+                bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
+            )
         validate_ffd_mesh_blending(
             split_summary,
             opts,
-            context="Newly prepared dual FFD mesh",
+            context="Newly prepared FFD mesh",
         )
 
         coordinate_error, coordinate_point = _max_mesh_coordinate_difference(
             source_mesh,
-            staged_dual,
+            staged_mesh,
         )
         tolerance = 1.0e-10 * max(1.0, geometry["chord"])
         if coordinate_error > tolerance:
             raise FFDPreparationError(
-                "Dual FFD preparation changed the physical mesh: "
+                "FFD preparation changed the physical mesh: "
                 f"point={coordinate_point}, error={coordinate_error:.6e}, "
                 f"tolerance={tolerance:.6e}"
             )
-        _validate_dual_mesh(staged_dual, geometry, opts)
+        _validate_prepared_mesh(staged_mesh, geometry, opts)
 
         smoke_error = None
         smoke_run = None
         if opts.get("ffd_prepare_smoke_test", True):
             smoke_run = _run_zero_smoke_test(
                 stage_dir,
-                mesh_in=staged_dual,
+                mesh_in=staged_mesh,
                 source_mesh=source_mesh,
                 marker=geometry["marker_tag"],
                 other_markers=other_markers,
-                upper_tag=opts["ffd_upper_box_tag"],
+                symmetry_markers=symmetry_markers,
+                **smoke_spec,
                 partitions=partitions,
                 tolerance=tolerance,
                 blending=opts.get("ffd_blending", BEZIER),
@@ -779,12 +935,13 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                 prepared_mesh=prepared_mesh,
                 marker=geometry["marker_tag"],
                 other_markers=other_markers,
-                upper_tag=opts["ffd_upper_box_tag"],
+                symmetry_markers=symmetry_markers,
+                **smoke_spec,
                 blending=opts.get("ffd_blending", BEZIER),
                 bspline_orders=opts.get("ffd_bspline_orders", (2, 2, 2)),
             )
 
-        os.replace(staged_dual, prepared_mesh)
+        os.replace(staged_mesh, prepared_mesh)
         os.makedirs(os.path.dirname(diagnostics_path), exist_ok=True)
         os.replace(staged_diagnostics, diagnostics_path)
 
@@ -796,18 +953,34 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
             "y_top": y_top,
             "geometric_columns": geometric_columns,
             "degree_i": len(geometric_columns) - 1,
-            "initial_total_ndv": 2 * len(opts["ffd_initial_columns"]),
-            "upper_surface_points": split_summary["upper_surface_points"],
-            "lower_surface_points": split_summary["lower_surface_points"],
+            "domain_mode": opts["ffd_domain_mode"],
+            "active_sides": list(opts.get("ffd_active_sides", ())),
+            "initial_total_ndv": len(opts.get("ffd_active_sides", ()))
+            * len(opts["ffd_initial_columns"]),
             "fixed_edge_points": split_summary["fixed_edge_points"],
             "rewrite_max_error": rewrite_summary["reembedding_max_error"],
-            "upper_max_error": split_summary["upper_max_reembedding_error"],
-            "lower_max_error": split_summary["lower_max_reembedding_error"],
             "physical_coordinate_error": coordinate_error,
             "smoke_coordinate_error": smoke_error,
             "ffd_blending": opts.get("ffd_blending", BEZIER),
             "bspline_orders": [int(value) for value in opts.get("ffd_bspline_orders", (2, 2, 2))],
         }
+        if opts["ffd_domain_mode"] == "FULL":
+            result_payload.update(
+                {
+                    "upper_surface_points": split_summary["upper_surface_points"],
+                    "lower_surface_points": split_summary["lower_surface_points"],
+                    "upper_max_error": split_summary["upper_max_reembedding_error"],
+                    "lower_max_error": split_summary["lower_max_reembedding_error"],
+                }
+            )
+        else:
+            result_payload.update(
+                {
+                    "surface_points": split_summary["surface_points"],
+                    "max_error": split_summary["max_reembedding_error"],
+                    "side": split_summary["side"],
+                }
+            )
         manifest_payload = {
             "request": request,
             "result": result_payload,

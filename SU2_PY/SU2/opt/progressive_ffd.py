@@ -19,6 +19,7 @@ from SU2.opt.progressive_ffd_levels import (
     build_initial_ffd_level,
     build_next_ffd_level,
     build_ffd_spring_reallocated_level,
+    refresh_ffd_scoring_baseline,
     write_ffd_level_config,
 )
 

@@ -999,6 +999,331 @@ def read_dual_ffd_box_specs(mesh_in, upper_tag, lower_tag):
     }
 
 
+def read_single_ffd_box_spec(mesh_in, box_tag):
+    """Read and validate one curved progressive FFD box."""
+
+    with open(mesh_in, "r") as fp:
+        lines = fp.readlines()
+    nbox_line = _find_key_line(lines, 0, len(lines), "FFD_NBOX")
+    if nbox_line is None or _parse_int_value(lines[nbox_line]) != 1:
+        raise FFDBoxSplitError("Progressive single mesh requires FFD_NBOX=1")
+    nlevel_line = _find_key_line(lines, 0, len(lines), "FFD_NLEVEL")
+    if nlevel_line is None or _parse_int_value(lines[nlevel_line]) != 1:
+        raise FFDBoxSplitError("Progressive single mesh requires FFD_NLEVEL=1")
+    tag_lines = [
+        index for index, line in enumerate(lines) if _line_key(line) == "FFD_TAG"
+    ]
+    if len(tag_lines) != 1:
+        raise FFDBoxSplitError(
+            f"Progressive single mesh requires exactly one box, found {len(tag_lines)}"
+        )
+    box = _parse_existing_dual_box(lines, box_tag)
+    if box["block_start"] != tag_lines[0]:
+        raise FFDBoxSplitError("Unexpected FFD box tag found in single mesh")
+    spec = box["blending_spec"]
+    return {
+        "columns": list(box["columns"]),
+        "box_tag": box["tag"],
+        "surface_points": int(box["surface_block"]["count"]),
+        "blending": spec.kind,
+        "bspline_orders": list(spec.orders),
+    }
+
+
+def rewrite_single_ffd_box_with_columns_and_reembed(
+    mesh_in,
+    mesh_out,
+    *,
+    marker,
+    side,
+    box_tag,
+    columns,
+    offset_chord,
+    diagnostics_csv=None,
+    overwrite=False,
+):
+    """Rewrite one curved half-profile box on the current physical surface."""
+
+    _validate_output_path(mesh_in, mesh_out, overwrite)
+    side = str(side).strip().lower()
+    if side not in ("upper", "lower"):
+        raise FFDBoxSplitError(
+            f"Single FFD side must be 'upper' or 'lower', got {side!r}"
+        )
+    offset_chord = float(offset_chord)
+    if not math.isfinite(offset_chord) or offset_chord <= 0.0:
+        raise FFDBoxSplitError("Single FFD chord offset must be positive")
+    box_tag = _normalize_tag(box_tag)
+    if not box_tag:
+        raise FFDBoxSplitError("Single FFD box tag must be non-empty")
+
+    columns = [float(value) for value in columns]
+    if len(columns) < 3:
+        raise FFDBoxSplitError(
+            "A single progressive FFD box requires two boundaries and at "
+            "least one active column"
+        )
+    if not all(math.isfinite(value) for value in columns):
+        raise FFDBoxSplitError("Single FFD columns must be finite")
+    if any(
+        right - left <= 1.0e-12
+        for left, right in zip(columns[:-1], columns[1:])
+    ):
+        raise FFDBoxSplitError("Single FFD columns must be strictly increasing")
+
+    with open(mesh_in, "r") as fp:
+        lines = fp.readlines()
+
+    nbox_line = _find_key_line(lines, 0, len(lines), "FFD_NBOX")
+    if nbox_line is None or _parse_int_value(lines[nbox_line]) != 1:
+        raise FFDBoxSplitError("Progressive single rewrite requires FFD_NBOX=1")
+    nlevel_line = _find_key_line(lines, 0, len(lines), "FFD_NLEVEL")
+    if nlevel_line is None or _parse_int_value(lines[nlevel_line]) != 1:
+        raise FFDBoxSplitError("Progressive single rewrite requires FFD_NLEVEL=1")
+    tag_lines = [
+        index for index, line in enumerate(lines) if _line_key(line) == "FFD_TAG"
+    ]
+    if len(tag_lines) != 1:
+        raise FFDBoxSplitError(
+            "Progressive single rewrite requires exactly one box, "
+            f"found {len(tag_lines)}"
+        )
+
+    box = _parse_existing_dual_box(lines, box_tag)
+    if box["block_start"] != tag_lines[0]:
+        raise FFDBoxSplitError("Unexpected FFD box tag found in single mesh")
+    blending_spec = box["blending_spec"]
+    try:
+        validate_blending_spec(
+            blending_spec,
+            control_counts=(len(columns), 2, len(box["z_planes"])),
+            dual_2d=True,
+        )
+    except ValueError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
+
+    try:
+        mesh = read_su2_mesh(mesh_in)
+        marker_tag, ordered_node_ids, closed = extract_marker_nodes(mesh, marker)
+    except BSplineDefError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
+    if mesh["ndime"] != 2:
+        raise FFDBoxSplitError("Progressive single FFD supports only NDIME=2")
+    if closed:
+        raise FFDBoxSplitError("Progressive single FFD requires an open marker")
+
+    try:
+        x_le, x_te, chord = infer_chord(
+            mesh["points"],
+            ordered_node_ids,
+            {"mode": "auto", "x_le": None, "x_te": None},
+        )
+    except BSplineDefError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
+    edge_tol = 1.0e-10 * max(1.0, float(chord))
+    if columns[0] > x_le + edge_tol or columns[-1] < x_te - edge_tol:
+        raise FFDBoxSplitError(
+            "The single FFD columns do not enclose the chord: "
+            f"columns=[{columns[0]:.16g},{columns[-1]:.16g}], "
+            f"chord=[{x_le:.16g},{x_te:.16g}]"
+        )
+
+    le_node_ids = {
+        node_id
+        for node_id in ordered_node_ids
+        if abs(float(mesh["points"][node_id][0]) - x_le) <= edge_tol
+    }
+    te_node_ids = {
+        node_id
+        for node_id in ordered_node_ids
+        if abs(float(mesh["points"][node_id][0]) - x_te) <= edge_tol
+    }
+    if not le_node_ids or not te_node_ids:
+        raise FFDBoxSplitError("Could not identify both LE and TE marker nodes")
+    edge_node_ids = le_node_ids | te_node_ids
+
+    def _edge_y(node_ids, label):
+        values = [float(mesh["points"][node_id][1]) for node_id in node_ids]
+        if max(values) - min(values) > edge_tol:
+            raise FFDBoxSplitError(
+                f"The open marker has multiple inconsistent {label} ordinates"
+            )
+        return sum(values) / float(len(values))
+
+    y_le = _edge_y(le_node_ids, "LE")
+    y_te = _edge_y(te_node_ids, "TE")
+
+    def inner_y(x):
+        alpha = (float(x) - float(x_le)) / float(chord)
+        return y_le + alpha * (y_te - y_le)
+
+    surface_y = _make_linear_interpolant(
+        [
+            (mesh["points"][node_id][0], mesh["points"][node_id][1])
+            for node_id in ordered_node_ids
+        ],
+        edge_tol,
+    )
+    inner_values = [float(inner_y(x)) for x in columns]
+    surface_values = [float(surface_y(x)) for x in columns]
+    delta = offset_chord * chord
+    if side == "upper":
+        if any(
+            value < inner - edge_tol
+            for value, inner in zip(surface_values, inner_values)
+        ):
+            raise FFDBoxSplitError("HALF_UPPER marker crosses below its LE-TE line")
+        control_y = [
+            inner_values,
+            [value + delta for value in surface_values],
+        ]
+    else:
+        if any(
+            value > inner + edge_tol
+            for value, inner in zip(surface_values, inner_values)
+        ):
+            raise FFDBoxSplitError("HALF_LOWER marker crosses above its LE-TE line")
+        control_y = [
+            [value - delta for value in surface_values],
+            inner_values,
+        ]
+
+    reconstruction_tol = 1.0e-10 * max(1.0, float(chord))
+    templates = _parse_curved_surface_lines(
+        box["surface_block"],
+        mesh["points"],
+        box["columns"],
+        box["control_y"],
+        box["z_planes"],
+        marker_tag,
+        reconstruction_tol,
+        blending_spec,
+    )
+    expected = set(ordered_node_ids) - edge_node_ids
+    if set(templates) != expected:
+        missing = sorted(expected - set(templates))
+        extra = sorted(set(templates) - expected)
+        raise FFDBoxSplitError(
+            "Single FFD surface-point membership does not match the open "
+            f"marker: missing={missing[:8]}, extra={extra[:8]}"
+        )
+
+    side_by_node = {node_id: side for node_id in ordered_node_ids}
+    surface_lines, diagnostics, max_error = _reembed_side(
+        side,
+        box_tag,
+        ordered_node_ids,
+        side_by_node,
+        edge_node_ids,
+        mesh["points"],
+        templates,
+        columns,
+        control_y,
+        box["z_planes"],
+        chord,
+        blending_spec,
+    )
+    if not surface_lines:
+        raise FFDBoxSplitError("The rewritten single box has no movable points")
+
+    box_block = _build_box_block(
+        box_tag,
+        len(columns) - 1,
+        box["degree"]["k"],
+        columns,
+        control_y,
+        box["z_planes"],
+        box["coord_dim"],
+        box["control_format"],
+        surface_lines,
+        blending_spec,
+    )
+    output_lines = list(lines[: box["block_start"]])
+    _replace_key_line(output_lines, "FFD_NBOX", 1)
+    output_lines.extend(box_block)
+    output_lines.extend(lines[box["surface_block"]["data_end"] :])
+
+    for point_id in sorted(edge_node_ids):
+        point = mesh["points"][point_id]
+        diagnostics.append(
+            {
+                "point_id": point_id,
+                "side": side,
+                "box": "",
+                "x": float(point[0]),
+                "y": float(point[1]),
+                "u": "",
+                "v": "",
+                "w": "",
+                "reconstruction_error": 0.0,
+                "status": "FIXED_EDGE",
+            }
+        )
+    diagnostics.sort(key=lambda row: int(row["point_id"]))
+
+    diagnostics_abs = None
+    if diagnostics_csv is not False:
+        if diagnostics_csv is None:
+            stem, _ = os.path.splitext(mesh_out)
+            diagnostics_csv = stem + "_single_ffd_diagnostics.csv"
+        diagnostics_abs = os.path.abspath(diagnostics_csv)
+        if diagnostics_abs in (os.path.abspath(mesh_in), os.path.abspath(mesh_out)):
+            raise FFDBoxSplitError(
+                "Diagnostics CSV path must differ from mesh input/output paths"
+            )
+        if os.path.exists(diagnostics_csv) and not overwrite:
+            raise FFDBoxSplitError(
+                f"Diagnostics CSV already exists: {diagnostics_csv}"
+            )
+
+    _atomic_write_lines(mesh_out, output_lines)
+    if diagnostics_csv is not False:
+        _atomic_write_csv(
+            diagnostics_csv,
+            [
+                "point_id",
+                "side",
+                "box",
+                "x",
+                "y",
+                "u",
+                "v",
+                "w",
+                "reconstruction_error",
+                "status",
+            ],
+            diagnostics,
+        )
+
+    summary = {
+        "mesh_in": os.path.abspath(mesh_in),
+        "mesh_out": os.path.abspath(mesh_out),
+        "diagnostics_csv": diagnostics_abs,
+        "marker": marker_tag,
+        "box_tag": box_tag,
+        "side": side.upper(),
+        "x_le": float(x_le),
+        "x_te": float(x_te),
+        "chord": float(chord),
+        "columns": list(columns),
+        "column_index_by_x": {
+            float(x): index for index, x in enumerate(columns)
+        },
+        "control_y": [list(row) for row in control_y],
+        "surface_points": len(surface_lines),
+        "fixed_edge_points": len(edge_node_ids),
+        "max_reembedding_error": max_error,
+        "blending": blending_spec.kind,
+        "bspline_orders": list(blending_spec.orders),
+    }
+    print(
+        "[PROGRESSIVE_FFD_SINGLE] Rewritten | "
+        f"side={side.upper()} columns={len(columns)} "
+        f"max_error={max_error:.6e}"
+    )
+    return summary
+
+
 def rewrite_dual_ffd_boxes_with_columns_and_reembed(
     mesh_in,
     mesh_out,
@@ -1824,4 +2149,365 @@ def split_bootstrap_ffd_box(
     )
     print(f"[PROGRESSIVE_FFD_SPLIT] Mesh: {summary['mesh_out']}")
     print(f"[PROGRESSIVE_FFD_SPLIT] Diagnostics: {summary['diagnostics_csv']}")
+    return summary
+
+
+def build_single_surface_ffd_box(
+    mesh_in,
+    mesh_out,
+    *,
+    bootstrap_tag,
+    marker,
+    side,
+    offset_chord,
+    box_tag=None,
+    x_le=None,
+    x_te=None,
+    diagnostics_csv=None,
+    overwrite=False,
+    output_blending=BEZIER,
+    bspline_orders=(2, 2, 2),
+):
+    """Replace one rectangular bootstrap box with one curved half-profile box."""
+
+    _validate_output_path(mesh_in, mesh_out, overwrite)
+    side = str(side).strip().lower()
+    if side not in ("upper", "lower"):
+        raise FFDBoxSplitError(
+            f"Single FFD side must be 'upper' or 'lower', got {side!r}"
+        )
+    offset_chord = float(offset_chord)
+    if not math.isfinite(offset_chord) or offset_chord <= 0.0:
+        raise FFDBoxSplitError("Single FFD chord offset must be positive")
+    if box_tag is None:
+        box_tag = "UPPER_BOX" if side == "upper" else "LOWER_BOX"
+    box_tag = _normalize_tag(box_tag)
+    if not box_tag:
+        raise FFDBoxSplitError("Single FFD box tag must be non-empty")
+    if (x_le is None) != (x_te is None):
+        raise FFDBoxSplitError("x_le and x_te must be provided together")
+    try:
+        output_spec = make_blending_spec(output_blending, bspline_orders)
+    except ValueError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
+
+    with open(mesh_in, "r") as fp:
+        lines = fp.readlines()
+
+    ffd_tag_lines = [
+        index for index, line in enumerate(lines) if _line_key(line) == "FFD_TAG"
+    ]
+    if len(ffd_tag_lines) != 1:
+        raise FFDBoxSplitError(
+            "Single-side preparation requires exactly one bootstrap FFD box, "
+            f"found {len(ffd_tag_lines)}"
+        )
+    nbox_line = _find_key_line(lines, 0, len(lines), "FFD_NBOX")
+    if nbox_line is None or _parse_int_value(lines[nbox_line]) != 1:
+        raise FFDBoxSplitError("Single-side preparation requires FFD_NBOX=1")
+    nlevel_line = _find_key_line(lines, 0, len(lines), "FFD_NLEVEL")
+    if nlevel_line is None or _parse_int_value(lines[nlevel_line]) != 1:
+        raise FFDBoxSplitError("Single-side preparation requires FFD_NLEVEL=1")
+
+    try:
+        block_start, block_end = _find_tagged_ffd_block(lines, bootstrap_tag)
+    except FFDMeshError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
+    if block_start != ffd_tag_lines[0]:
+        raise FFDBoxSplitError(f"FFD_TAG={bootstrap_tag!r} is not the only input box")
+
+    level_line = _find_key_line(lines, block_start, block_end, "FFD_LEVEL")
+    if level_line is None or _parse_int_value(lines[level_line]) != 0:
+        raise FFDBoxSplitError("Bootstrap box must have FFD_LEVEL=0")
+    _parse_zero_relation_count(lines, block_start, block_end, "FFD_PARENTS")
+    _parse_zero_relation_count(lines, block_start, block_end, "FFD_CHILDREN")
+
+    blending_line = _find_key_line(lines, block_start, block_end, "FFD_BLENDING")
+    if blending_line is None:
+        raise FFDBoxSplitError("Bootstrap box is missing FFD_BLENDING")
+    bootstrap_blending = _normalize_tag(_line_value(lines[blending_line])).upper()
+    if bootstrap_blending != BEZIER:
+        raise FFDBoxSplitError(
+            "Single-side bootstrap preparation requires FFD_BLENDING=BEZIER, "
+            f"got {bootstrap_blending!r}"
+        )
+
+    degree = _parse_degree(lines, block_start, block_end)
+    if degree["i"] is None:
+        raise FFDBoxSplitError("Bootstrap box is missing FFD_DEGREE_I")
+    if degree["j"] != 1:
+        raise FFDBoxSplitError(
+            f"Bootstrap box must have FFD_DEGREE_J=1, got {degree['j']}"
+        )
+    try:
+        corner_block = _parse_count_block(
+            lines, block_start, block_end, "FFD_CORNER_POINTS"
+        )
+        control_block = _parse_count_block(
+            lines, block_start, block_end, "FFD_CONTROL_POINTS"
+        )
+        surface_block = _parse_count_block(
+            lines, block_start, block_end, "FFD_SURFACE_POINTS"
+        )
+    except FFDMeshError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
+    if corner_block is None or corner_block["count"] != 4:
+        raise FFDBoxSplitError("Single-side bootstrap requires four corner points")
+    _validate_corner_block_2d(corner_block)
+    if control_block is None or control_block["count"] <= 0:
+        raise FFDBoxSplitError("Bootstrap FFD_CONTROL_POINTS are required")
+    if surface_block is None or surface_block["count"] <= 0:
+        raise FFDBoxSplitError("Bootstrap FFD_SURFACE_POINTS are required")
+
+    try:
+        control_points, coord_dim, control_format = _parse_control_points(
+            control_block
+        )
+        columns, old_y_rows, z_planes = _infer_axes_from_control_points(
+            control_points, degree
+        )
+    except FFDMeshError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
+    columns = [float(value) for value in columns]
+    old_y_rows = [float(value) for value in old_y_rows]
+    z_planes = [float(value) for value in (z_planes or [0.0])]
+    if not all(math.isfinite(value) for value in columns + old_y_rows + z_planes):
+        raise FFDBoxSplitError("Bootstrap FFD_CONTROL_POINTS must be finite")
+    if len(columns) != int(degree["i"]) + 1:
+        raise FFDBoxSplitError(
+            "Bootstrap FFD column count does not match FFD_DEGREE_I"
+        )
+    if any(right - left <= 1.0e-12 for left, right in zip(columns[:-1], columns[1:])):
+        raise FFDBoxSplitError("Bootstrap FFD x-columns must be strictly increasing")
+    if len(old_y_rows) != 2:
+        raise FFDBoxSplitError("Bootstrap FFD box must contain exactly two y rows")
+    try:
+        validate_blending_spec(
+            output_spec,
+            control_counts=(len(columns), 2, len(z_planes)),
+            dual_2d=True,
+        )
+    except ValueError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
+    _validate_bootstrap_control_lattice(
+        control_points,
+        degree,
+        columns,
+        old_y_rows,
+        z_planes,
+        control_format,
+    )
+
+    try:
+        mesh = read_su2_mesh(mesh_in)
+        marker_tag, ordered_node_ids, closed = extract_marker_nodes(mesh, marker)
+    except BSplineDefError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
+    if mesh["ndime"] != 2:
+        raise FFDBoxSplitError("Single-side preparation supports only NDIME=2")
+    if closed:
+        raise FFDBoxSplitError("Single-side preparation requires an open marker")
+
+    chord_spec = {
+        "mode": "auto" if x_le is None else "explicit",
+        "x_le": x_le,
+        "x_te": x_te,
+    }
+    try:
+        x_le, x_te, chord = infer_chord(
+            mesh["points"], ordered_node_ids, chord_spec
+        )
+    except BSplineDefError as exc:
+        raise FFDBoxSplitError(str(exc)) from exc
+    if not all(math.isfinite(value) for value in (x_le, x_te, chord)):
+        raise FFDBoxSplitError("LE, TE, and chord must be finite")
+    edge_tol = 1.0e-10 * max(1.0, float(chord))
+    marker_x = [float(mesh["points"][node_id][0]) for node_id in ordered_node_ids]
+    if min(marker_x) < x_le - edge_tol or max(marker_x) > x_te + edge_tol:
+        raise FFDBoxSplitError("Requested LE/TE do not enclose the open marker")
+    if columns[0] > x_le + edge_tol or columns[-1] < x_te - edge_tol:
+        raise FFDBoxSplitError("Bootstrap FFD x-columns do not enclose the chord")
+
+    le_node_ids = {
+        node_id
+        for node_id in ordered_node_ids
+        if abs(float(mesh["points"][node_id][0]) - x_le) <= edge_tol
+    }
+    te_node_ids = {
+        node_id
+        for node_id in ordered_node_ids
+        if abs(float(mesh["points"][node_id][0]) - x_te) <= edge_tol
+    }
+    if not le_node_ids or not te_node_ids:
+        raise FFDBoxSplitError("Could not identify both LE and TE marker nodes")
+    edge_node_ids = le_node_ids | te_node_ids
+
+    def _edge_y(node_ids, label):
+        values = [float(mesh["points"][node_id][1]) for node_id in node_ids]
+        if max(values) - min(values) > edge_tol:
+            raise FFDBoxSplitError(
+                f"The open marker has multiple inconsistent {label} ordinates"
+            )
+        return sum(values) / float(len(values))
+
+    y_le = _edge_y(le_node_ids, "LE")
+    y_te = _edge_y(te_node_ids, "TE")
+
+    def inner_y(x):
+        alpha = (float(x) - float(x_le)) / float(chord)
+        return y_le + alpha * (y_te - y_le)
+
+    surface_samples = [
+        (mesh["points"][node_id][0], mesh["points"][node_id][1])
+        for node_id in ordered_node_ids
+    ]
+    surface_y = _make_linear_interpolant(surface_samples, edge_tol)
+    delta = offset_chord * chord
+    inner_values = [float(inner_y(x)) for x in columns]
+    surface_values = [float(surface_y(x)) for x in columns]
+    if side == "upper":
+        if any(y < inner - edge_tol for y, inner in zip(surface_values, inner_values)):
+            raise FFDBoxSplitError("HALF_UPPER marker crosses below its LE-TE line")
+        control_y = [
+            inner_values,
+            [value + delta for value in surface_values],
+        ]
+    else:
+        if any(y > inner + edge_tol for y, inner in zip(surface_values, inner_values)):
+            raise FFDBoxSplitError("HALF_LOWER marker crosses above its LE-TE line")
+        control_y = [
+            [value - delta for value in surface_values],
+            inner_values,
+        ]
+
+    old_axes = {
+        "columns": columns,
+        "y_rows": old_y_rows,
+        "z_planes": z_planes,
+    }
+    surface_templates = _parse_bootstrap_surface_lines(
+        surface_block,
+        mesh["points"],
+        old_axes,
+        marker_tag,
+        1.0e-10 * max(1.0, float(chord)),
+    )
+    if set(surface_templates) != set(ordered_node_ids):
+        missing = sorted(set(ordered_node_ids) - set(surface_templates))
+        extra = sorted(set(surface_templates) - set(ordered_node_ids))
+        raise FFDBoxSplitError(
+            "Bootstrap FFD_SURFACE_POINTS must match the requested marker exactly: "
+            f"missing={missing[:8]}, extra={extra[:8]}"
+        )
+
+    side_by_node = {node_id: side for node_id in ordered_node_ids}
+    surface_lines, diagnostics, max_error = _reembed_side(
+        side,
+        box_tag,
+        ordered_node_ids,
+        side_by_node,
+        edge_node_ids,
+        mesh["points"],
+        surface_templates,
+        columns,
+        control_y,
+        z_planes,
+        chord,
+        output_spec,
+    )
+    if not surface_lines:
+        raise FFDBoxSplitError("The single output box contains no movable points")
+
+    box_block = _build_box_block(
+        box_tag,
+        int(degree["i"]),
+        degree["k"],
+        columns,
+        control_y,
+        z_planes,
+        coord_dim,
+        control_format,
+        surface_lines,
+        output_spec,
+    )
+    output_lines = list(lines[:block_start])
+    _replace_key_line(output_lines, "FFD_NBOX", 1)
+    output_lines.extend(box_block)
+    output_lines.extend(lines[surface_block["data_end"] :])
+
+    for point_id in sorted(edge_node_ids):
+        point = mesh["points"][point_id]
+        diagnostics.append(
+            {
+                "point_id": point_id,
+                "side": side,
+                "box": "",
+                "x": float(point[0]),
+                "y": float(point[1]),
+                "u": "",
+                "v": "",
+                "w": "",
+                "reconstruction_error": 0.0,
+                "status": "FIXED_EDGE",
+            }
+        )
+    diagnostics.sort(key=lambda row: int(row["point_id"]))
+
+    if diagnostics_csv is None:
+        stem, _ = os.path.splitext(mesh_out)
+        diagnostics_csv = stem + "_single_ffd_diagnostics.csv"
+    diagnostics_abs = os.path.abspath(diagnostics_csv)
+    if diagnostics_abs in (os.path.abspath(mesh_in), os.path.abspath(mesh_out)):
+        raise FFDBoxSplitError(
+            "Diagnostics CSV path must differ from input and output mesh paths"
+        )
+    if os.path.exists(diagnostics_csv) and not overwrite:
+        raise FFDBoxSplitError(
+            f"Diagnostics CSV already exists: {diagnostics_csv}; "
+            "pass overwrite=True to replace it"
+        )
+
+    _atomic_write_lines(mesh_out, output_lines)
+    _atomic_write_csv(
+        diagnostics_csv,
+        [
+            "point_id",
+            "side",
+            "box",
+            "x",
+            "y",
+            "u",
+            "v",
+            "w",
+            "reconstruction_error",
+            "status",
+        ],
+        diagnostics,
+    )
+    summary = {
+        "mesh_in": os.path.abspath(mesh_in),
+        "mesh_out": os.path.abspath(mesh_out),
+        "diagnostics_csv": diagnostics_abs,
+        "marker": marker_tag,
+        "bootstrap_tag": _normalize_tag(bootstrap_tag),
+        "box_tag": box_tag,
+        "side": side.upper(),
+        "x_le": float(x_le),
+        "x_te": float(x_te),
+        "chord": float(chord),
+        "columns": columns,
+        "surface_points": len(surface_lines),
+        "fixed_edge_points": len(edge_node_ids),
+        "max_reembedding_error": max_error,
+        "blending": output_spec.kind,
+        "bspline_orders": list(output_spec.orders),
+    }
+    print(
+        "[PROGRESSIVE_FFD_SINGLE] Completed | "
+        f"side={summary['side']} points={summary['surface_points']} "
+        f"fixed_edges={summary['fixed_edge_points']} "
+        f"max_error={max_error:.6e}"
+    )
+    print(f"[PROGRESSIVE_FFD_SINGLE] Mesh: {summary['mesh_out']}")
+    print(f"[PROGRESSIVE_FFD_SINGLE] Diagnostics: {diagnostics_abs}")
     return summary

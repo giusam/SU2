@@ -226,6 +226,9 @@ def get_progressive_hh_options(config):
     min_center_spacing = float(
         config.get("PROGRESSIVE_HH_MIN_CENTER_SPACING", 0.0)
     )
+    ikkt_active_tol = float(
+        config.get("PROGRESSIVE_HH_IKKT_ACTIVE_TOL", 1.0e-6)
+    )
     spring_timing = str(
         config.get("PROGRESSIVE_HH_SPRING_TIMING", "POST_OPT")
     ).upper()
@@ -324,6 +327,8 @@ def get_progressive_hh_options(config):
         raise ValueError("PROGRESSIVE_HH_CANDIDATE_SAMPLES must be >= 1")
     if min_center_spacing < 0.0:
         raise ValueError("PROGRESSIVE_HH_MIN_CENTER_SPACING must be >= 0.0")
+    if ikkt_active_tol < 0.0:
+        raise ValueError("PROGRESSIVE_HH_IKKT_ACTIVE_TOL must be non-negative")
 
     upper_initial_value = config.get("PROGRESSIVE_HH_INITIAL_UPPER", None)
     lower_initial_value = config.get("PROGRESSIVE_HH_INITIAL_LOWER", None)
@@ -434,6 +439,7 @@ def get_progressive_hh_options(config):
         "adaptive_indicator": str(
             config.get("PROGRESSIVE_HH_ADAPTIVE_INDICATOR", "ABS_GRAD")
         ).upper(),
+        "ikkt_active_tol": ikkt_active_tol,
         "marker": str(config.get("DV_MARKER", "Airfoil")),
         "scale": scale,
         "spring_enabled": _as_bool(config.get("PROGRESSIVE_HH_SPRING", "NO")),

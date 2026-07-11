@@ -22,6 +22,7 @@ from SU2.opt.progressive_ffd_core import (
 from SU2.opt.progressive_ffd_mesh import rewrite_ffd_box_with_columns_and_reembed
 from SU2.opt.progressive_ffd_split import (
     rewrite_dual_ffd_boxes_with_columns_and_reembed,
+    rewrite_single_ffd_box_with_columns_and_reembed,
 )
 from SU2.opt.progressive_hh_levels import (
     _remove_progressive_keys as _remove_hh_progressive_keys,
@@ -121,6 +122,7 @@ def build_initial_ffd_level(base_config, opts):
         active_xmin=active_xmin,
         active_xmax=active_xmax,
         active_include_bounds=opts.get("ffd_active_include_bounds", False),
+        side=opts.get("ffd_side"),
     )
 
 
@@ -151,6 +153,7 @@ def _ffdtype_level_kwargs(opts):
         "active_xmin": active_xmin,
         "active_xmax": active_xmax,
         "active_include_bounds": opts.get("ffd_active_include_bounds", False),
+        "side": opts.get("ffd_side"),
     }
 
 
@@ -177,7 +180,10 @@ def build_next_ffd_level(prev_level, result, opts):
             initial_mesh_source=getattr(prev_level, "initial_mesh_source", None),
             dv_values=[0.0] * (len(upper_columns) + len(lower_columns)),
             selection_metadata=selection_metadata,
-            post_opt_spring_pending=False,
+            post_opt_spring_pending=bool(
+                selection_metadata
+                and selection_metadata.get("post_opt_spring_pending", False)
+            ),
             spring_reallocated=False,
             **_ffdtype_level_kwargs(opts),
         )
@@ -202,10 +208,8 @@ def build_next_ffd_level(prev_level, result, opts):
 
 
 def build_ffd_spring_reallocated_level(prev_level, result, opts, reoptimize=True):
-    if getattr(prev_level, "dual_box", False):
-        raise NotImplementedError("Spring redistribution is unavailable in dual FFD mode")
-    columns = apply_post_opt_ffd_spring(prev_level, result, opts)
-    if columns is None:
+    columns_by_side = apply_post_opt_ffd_spring(prev_level, result, opts)
+    if columns_by_side is None:
         print(
             "[PROGRESSIVE_FFD][SPRING] WARNING: could not build "
             "spring-reallocated level"
@@ -216,6 +220,13 @@ def build_ffd_spring_reallocated_level(prev_level, result, opts, reoptimize=True
     if next_mesh is None:
         next_mesh = prev_level.mesh_source
 
+    upper_before = prev_level.columns_by_side.get("UPPER", [])
+    lower_before = prev_level.columns_by_side.get("LOWER", [])
+    upper_after = columns_by_side.get("UPPER", [])
+    lower_after = columns_by_side.get("LOWER", [])
+    ordered_before = list(upper_before) + list(lower_before)
+    ordered_after = list(upper_after) + list(lower_after)
+
     spring_metadata = {
         "level_id": prev_level.level_id,
         "ndv": prev_level.ndv,
@@ -223,48 +234,112 @@ def build_ffd_spring_reallocated_level(prev_level, result, opts, reoptimize=True
         "spring_score_mode": opts.get("spring_score_mode", "COEFFICIENT"),
         "spring_post_action": opts.get("spring_post_action", "REOPTIMIZE"),
         "post_spring_optimization_skipped": not reoptimize,
-        "columns_before": sorted(prev_level.columns),
-        "columns_after": sorted(columns),
-        "upper_before": sorted(prev_level.columns),
-        "lower_before": [],
-        "upper_after": sorted(columns),
-        "lower_after": [],
+        "columns_before": ordered_before,
+        "columns_after": ordered_after,
+        "upper_before": sorted(upper_before),
+        "lower_before": sorted(lower_before),
+        "upper_after": sorted(upper_after),
+        "lower_after": sorted(lower_after),
         "column_coeff_abs": result.get("spring_ffd_coeff_abs", []),
+        "column_coeff_abs_by_side": result.get(
+            "spring_ffd_coeff_abs_by_side", {}
+        ),
         "history_file": result.get("history_file"),
         "final_mesh": result.get("final_mesh"),
     }
 
+    if getattr(prev_level, "dual_box", False):
+        level_columns = {
+            "columns": upper_after,
+            "upper_columns": upper_after,
+            "lower_columns": lower_after,
+        }
+    else:
+        side = str(prev_level.side).upper()
+        level_columns = {"columns": columns_by_side[side]}
+
     if not reoptimize:
         return FFDLevel(
             level_id=prev_level.level_id,
-            columns=columns,
             workdir=prev_level.workdir,
             config_filename=prev_level.config_filename,
             project_filename=prev_level.project_filename,
             mesh_source=next_mesh,
             initial_mesh_source=getattr(prev_level, "initial_mesh_source", None),
-            dv_values=[0.0] * len(columns),
+            dv_values=[0.0] * prev_level.ndv,
             selection_metadata=spring_metadata,
             post_opt_spring_pending=False,
             spring_reallocated=True,
+            **level_columns,
             **_ffdtype_level_kwargs(opts),
         )
 
     next_id = prev_level.level_id + 1
     return FFDLevel(
         level_id=next_id,
-        columns=columns,
         workdir=f"LEVEL_{next_id}",
         config_filename=f"config_level{next_id}.cfg",
         project_filename=f"project_level{next_id}.pkl",
         mesh_source=next_mesh,
         initial_mesh_source=getattr(prev_level, "initial_mesh_source", None),
-        dv_values=[0.0] * len(columns),
+        dv_values=[0.0] * prev_level.ndv,
         selection_metadata=spring_metadata,
         post_opt_spring_pending=False,
         spring_reallocated=True,
+        **level_columns,
         **_ffdtype_level_kwargs(opts),
     )
+
+
+def refresh_ffd_scoring_baseline(project, level, dv_values, opts):
+    """Materialize adjoint assets at the accepted design before exact scoring."""
+
+    if str(opts.get("refinement", "UNIFORM")).upper() != "ADAPTIVE":
+        return False
+    if dv_values is None or len(dv_values) != level.ndv:
+        raise RuntimeError(
+            "Cannot refresh the exact FFD scoring baseline: accepted DV values "
+            f"have size {0 if dv_values is None else len(dv_values)}, "
+            f"expected {level.ndv}"
+        )
+
+    dv_values = [float(value) for value in dv_values]
+    previous_gradient_x = getattr(project, "last_obj_grad_x", None)
+    max_parameter_gap = None
+    if previous_gradient_x is not None and len(previous_gradient_x) == len(dv_values):
+        max_parameter_gap = max(
+            abs(float(current) - float(previous))
+            for current, previous in zip(dv_values, previous_gradient_x)
+        )
+
+    print(
+        "[PROGRESSIVE_FFD] Refreshing exact-scoring baseline at accepted DV"
+        + (
+            f" | max_gap_from_last_gradient={max_parameter_gap:.6e}"
+            if max_parameter_gap is not None
+            else ""
+        )
+    )
+    cwd = os.getcwd()
+    try:
+        os.chdir(level.workdir)
+        project.obj_df(dv_values)
+        if str(opts.get("adaptive_indicator", "ABS_GRAD")).upper() == "IKKT":
+            # These are only SU2-native optimizer constraints.  The progressive
+            # thickness constraint is attached by scipy_tools and is
+            # intentionally not part of project.con_d* or the FFD IKKT basis.
+            project.con_dceq(dv_values)
+            project.con_dcieq(dv_values)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to build objective/constraint adjoint assets at the "
+            "accepted FFD design before exact scoring"
+        ) from exc
+    finally:
+        os.chdir(cwd)
+
+    project.last_obj_grad_x = list(dv_values)
+    return True
 
 
 def _ffd_mesh_basename(level):
@@ -335,14 +410,33 @@ def _prepare_ffd_mesh(cfg, level, opts):
         active_columns=level.columns,
         opts=opts,
     )
-    mesh_info = rewrite_ffd_box_with_columns_and_reembed(
-        src_mesh,
-        dst_mesh,
-        box_tag=opts["ffd_box_tag"],
-        new_columns=mesh_columns,
-        marker_name=opts["ffd_marker"],
-        domain_mode=opts["ffd_domain_mode"],
-    )
+    if opts["ffd_domain_mode"] in ("HALF_UPPER", "HALF_LOWER"):
+        side = opts["ffd_side"]
+        offset = (
+            opts["ffd_upper_offset_chord"]
+            if side == "UPPER"
+            else opts["ffd_lower_offset_chord"]
+        )
+        mesh_info = rewrite_single_ffd_box_with_columns_and_reembed(
+            src_mesh,
+            dst_mesh,
+            marker=opts["ffd_marker"],
+            side=side,
+            box_tag=opts["ffd_box_tag"],
+            columns=mesh_columns,
+            offset_chord=offset,
+            diagnostics_csv=False,
+            overwrite=True,
+        )
+    else:
+        mesh_info = rewrite_ffd_box_with_columns_and_reembed(
+            src_mesh,
+            dst_mesh,
+            box_tag=opts["ffd_box_tag"],
+            new_columns=mesh_columns,
+            marker_name=opts["ffd_marker"],
+            domain_mode=opts["ffd_domain_mode"],
+        )
     validate_ffd_mesh_blending(
         mesh_info,
         opts,
@@ -374,7 +468,9 @@ def _validate_ffd_definition_request(level, opts, mesh_info):
     ffd_dv_kind = str(opts.get("ffd_dv_kind", "FFD_CONTROL_POINT_2D")).upper()
     if ffd_dv_kind == "FFD_CONTROL_POINT_2D":
         control_row = int(opts.get("ffd_control_row"))
-        n_rows = len(mesh_info.get("y_rows", []))
+        n_rows = len(
+            mesh_info.get("control_y", mesh_info.get("y_rows", []))
+        )
         if control_row >= n_rows:
             raise ValueError(
                 "PROGRESSIVE_FFD_CONTROL_ROW is outside the rewritten FFD grid: "
@@ -422,6 +518,11 @@ def write_ffd_level_config(base_config, level, opts):
             opts,
             mesh_info["column_index_by_x"],
         )
+        if level.domain_mode in ("HALF_UPPER", "HALF_LOWER"):
+            cfg["FFD_CONTINUITY"] = "USER_INPUT"
+            for key in ("FFD_FIX_I", "FFD_FIX_J", "FFD_FIX_K"):
+                if key in cfg:
+                    del cfg[key]
     cfg["DV_MARKER"] = str(opts["ffd_marker"])
     cfg["DV_KIND"] = str(opts["ffd_dv_kind"])
     cfg["FFD_BLENDING"] = str(opts.get("ffd_blending", "BEZIER"))

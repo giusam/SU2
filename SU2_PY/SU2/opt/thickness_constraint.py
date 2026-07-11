@@ -448,6 +448,54 @@ def _read_ffd_surface_param_map(mesh_filename, box_tag, marker_name):
     return points, marker_segments, param_by_point, axes
 
 
+def _read_curved_ffd_surface_param_maps(mesh_filename, box_tags, marker_name):
+    """Read per-box surface parameters for curved Bezier/B-spline FFD boxes."""
+
+    from SU2.opt.progressive_ffd_split import (
+        _parse_curved_surface_lines,
+        _parse_existing_dual_box,
+    )
+
+    points, marker_segments = _read_su2_points_and_marker_segments_with_ids(
+        mesh_filename,
+        marker_name,
+    )
+    with open(mesh_filename, "r") as fp:
+        lines = fp.readlines()
+
+    coordinate_scale = max(
+        [1.0]
+        + [
+            max(abs(float(point[0])), abs(float(point[1])))
+            for point in points.values()
+        ]
+    )
+    reconstruction_tol = 1.0e-10 * coordinate_scale
+    box_data = {}
+    for box_tag in box_tags:
+        box = _parse_existing_dual_box(lines, box_tag)
+        parsed = _parse_curved_surface_lines(
+            box["surface_block"],
+            points,
+            box["columns"],
+            box["control_y"],
+            box["z_planes"],
+            marker_name,
+            reconstruction_tol,
+            box["blending_spec"],
+        )
+        box_data[str(box_tag)] = {
+            "params": {
+                int(point_id): list(values["old_uvw"])
+                for point_id, values in parsed.items()
+            },
+            "columns": list(box["columns"]),
+            "control_y": [list(row) for row in box["control_y"]],
+            "blending_spec": box["blending_spec"],
+        }
+    return points, marker_segments, box_data
+
+
 def _section_measure_from_segments(
     mesh_filename,
     marker_name,
@@ -809,6 +857,8 @@ class ThicknessConstraint:
         return jac
 
     def _jacobian_ffd_control_point_2d(self, def_dv, project):
+        from SU2.opt.progressive_ffd_blending import basis_values
+
         n_dv = _definition_dv_size(def_dv)
         if any(int(size) != 1 for size in def_dv.get("SIZE", [])):
             raise ValueError("FFD_CONTROL_POINT_2D analytic gradient requires SIZE=1")
@@ -817,38 +867,80 @@ class ThicknessConstraint:
         box_tags = [str(tag) for tag in def_dv.get("FFDTAG", []) if str(tag)]
         if not box_tags:
             raise ValueError("FFD_CONTROL_POINT_2D definitions require FFDTAG")
-        if len(set(box_tags)) != 1:
-            raise ValueError("Analytic FFD thickness gradient supports one FFD box")
-
-        points, segments, param_by_point, axes = _read_ffd_surface_param_map(
+        unique_box_tags = list(dict.fromkeys(box_tags))
+        points, segments, box_data = _read_curved_ffd_surface_param_maps(
             mesh_filename,
-            box_tags[0],
+            unique_box_tags,
             self.marker,
         )
-        degree_i = len(axes["columns"]) - 1
-        degree_j = len(axes["y_rows"]) - 1
 
-        point_dy = {}
-        for point_id, uvw in param_by_point.items():
-            u, v = float(uvw[0]), float(uvw[1])
-            values = np.zeros(n_dv, dtype=float)
-            k = 0
-            for i_dv, params in enumerate(def_dv["PARAM"]):
-                i_idx, j_idx, dx, dy = _ffd_control_point_2d_params(params)
-                if abs(dx) > 1.0e-14:
-                    raise ValueError(
-                        "Analytic FFD thickness gradient supports only Y-direction "
-                        "FFD_CONTROL_POINT_2D variables"
-                    )
-                scale = float(def_dv["SCALE"][i_dv])
-                values[k] = (
-                    scale
-                    * dy
-                    * _bernstein(degree_i, i_idx, u)
-                    * _bernstein(degree_j, j_idx, v)
+        marker_point_ids = {
+            point_id
+            for segment in segments
+            for point_id in segment
+        }
+        point_dy = {
+            point_id: np.zeros(n_dv, dtype=float)
+            for point_id in marker_point_ids
+        }
+        embedded_point_ids = set()
+        for point_map in box_data.values():
+            embedded_point_ids.update(point_map["params"])
+
+        marker_x = [float(points[point_id][0]) for point_id in marker_point_ids]
+        x_min = min(marker_x)
+        x_max = max(marker_x)
+        edge_tol = 1.0e-10 * max(1.0, abs(x_min), abs(x_max))
+        unexpected_missing = [
+            point_id
+            for point_id in marker_point_ids - embedded_point_ids
+            if (
+                abs(float(points[point_id][0]) - x_min) > edge_tol
+                and abs(float(points[point_id][0]) - x_max) > edge_tol
+            )
+        ]
+        if unexpected_missing:
+            raise ValueError(
+                "FFD surface parameter data are missing for non-edge marker "
+                f"points: {sorted(unexpected_missing)[:8]}"
+            )
+
+        k = 0
+        for i_dv, params in enumerate(def_dv["PARAM"]):
+            box_tag = str(def_dv["FFDTAG"][i_dv])
+            if box_tag not in box_data:
+                raise ValueError(f"FFD box {box_tag!r} was not found in the mesh")
+            i_idx, j_idx, dx, dy = _ffd_control_point_2d_params(params)
+            if abs(dx) > 1.0e-14:
+                raise ValueError(
+                    "Analytic FFD thickness gradient supports only Y-direction "
+                    "FFD_CONTROL_POINT_2D variables"
                 )
-                k += 1
-            point_dy[point_id] = values
+            data = box_data[box_tag]
+            n_i = len(data["columns"])
+            n_j = len(data["control_y"])
+            if not 0 <= i_idx < n_i or not 0 <= j_idx < n_j:
+                raise ValueError(
+                    f"FFD control index ({i_idx},{j_idx}) is outside box "
+                    f"{box_tag!r} with shape ({n_i},{n_j})"
+                )
+            scale = float(def_dv["SCALE"][i_dv])
+            for point_id, uvw in data["params"].items():
+                u, v = float(uvw[0]), float(uvw[1])
+                basis_i = basis_values(
+                    n_i,
+                    u,
+                    data["blending_spec"],
+                    axis=0,
+                )[i_idx]
+                basis_j = basis_values(
+                    n_j,
+                    v,
+                    data["blending_spec"],
+                    axis=1,
+                )[j_idx]
+                point_dy[point_id][k] = scale * dy * basis_i * basis_j
+            k += 1
 
         jac = np.zeros((len(self.x_stations), n_dv), dtype=float)
         tol = 1.0e-12
@@ -932,7 +1024,17 @@ def build_thickness_constraint_from_config(base_config):
     gradient_mode = _normalize_gradient_mode(
         base_config.get("PROGRESSIVE_THICKNESS_GRADIENT", "AUTO")
     )
-    default_domain = "AUTO" if "BSPLINE_SURFACE_MODE" in base_config else "FULL"
+    if (
+        str(base_config.get("PROGRESSIVE_PARAM_KIND", "")).strip().upper()
+        == "FFD"
+    ):
+        default_domain = str(
+            base_config.get("PROGRESSIVE_FFD_DOMAIN_MODE", "FULL")
+        ).strip().upper()
+    else:
+        default_domain = (
+            "AUTO" if "BSPLINE_SURFACE_MODE" in base_config else "FULL"
+        )
     domain_mode = _resolve_domain_mode(
         base_config.get("PROGRESSIVE_THICKNESS_DOMAIN_MODE", default_domain),
         base_config.get("BSPLINE_SURFACE_MODE")

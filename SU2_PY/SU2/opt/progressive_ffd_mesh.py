@@ -719,9 +719,9 @@ def rewrite_ffd_box_with_columns_and_reembed(
     After the control grid changes, FFD_SURFACE_POINTS must be re-embedded so
     that DV=0 maps the current surface coordinates back to themselves.
     """
-    if str(domain_mode).upper() not in ("FULL", "HALF_UPPER"):
+    if str(domain_mode).upper() not in ("FULL", "HALF_UPPER", "HALF_LOWER"):
         raise ValueError(
-            "PROGRESSIVE_FFD_DOMAIN_MODE must be FULL or HALF_UPPER, "
+            "PROGRESSIVE_FFD_DOMAIN_MODE must be FULL, HALF_UPPER, or HALF_LOWER, "
             f"got {domain_mode!r}"
         )
 
@@ -798,7 +798,9 @@ def rewrite_ffd_box_with_columns_and_reembed(
         old_axes,
         new_axes,
         ndime,
-        marker_name if str(domain_mode).upper() == "HALF_UPPER" else None,
+        marker_name
+        if str(domain_mode).upper() in ("HALF_UPPER", "HALF_LOWER")
+        else None,
     )
 
     new_corner_lines = None

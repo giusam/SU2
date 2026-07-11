@@ -505,110 +505,194 @@ def _extract_constraint_names(cfg):
     return names
 
 
+def _extract_constraint_specs(cfg, constraint_names=None):
+    """Return normalized SU2 constraint metadata in the requested order."""
+
+    opt_con = cfg.get("OPT_CONSTRAINT", {})
+    specs_by_name = {}
+    if isinstance(opt_con, dict):
+        for group_name in ("EQUALITY", "INEQUALITY"):
+            group = opt_con.get(group_name, {}) or {}
+            if not isinstance(group, dict):
+                continue
+            for raw_name, raw_spec in group.items():
+                name = str(raw_name).strip().upper()
+                if not name or not isinstance(raw_spec, dict):
+                    continue
+                try:
+                    target = float(raw_spec.get("VALUE"))
+                except (TypeError, ValueError):
+                    target = None
+                try:
+                    scale = float(raw_spec.get("SCALE", 1.0))
+                except (TypeError, ValueError):
+                    scale = 1.0
+                specs_by_name[name] = {
+                    "name": name,
+                    "sign": str(raw_spec.get("SIGN", "")).strip(),
+                    "target": target,
+                    "scale": scale,
+                    "group": group_name,
+                }
+    elif isinstance(opt_con, str):
+        for raw_part in opt_con.split(";"):
+            part = raw_part.strip()
+            if not part:
+                continue
+            expression, separator, raw_scale = part.partition("*")
+            try:
+                scale = float(raw_scale) if separator else 1.0
+            except ValueError:
+                scale = 1.0
+            expression = expression.strip().strip("() ")
+            sign = next((item for item in ("<", ">", "=") if item in expression), "")
+            if not sign:
+                continue
+            lhs, rhs = expression.split(sign, 1)
+            name = lhs.strip().upper()
+            if not name:
+                continue
+            try:
+                target = float(rhs.strip())
+            except ValueError:
+                target = None
+            specs_by_name[name] = {
+                "name": name,
+                "sign": sign,
+                "target": target,
+                "scale": scale,
+                "group": "EQUALITY" if sign == "=" else "INEQUALITY",
+            }
+
+    names = (
+        _extract_constraint_names(cfg)
+        if constraint_names is None
+        else [str(name).strip().upper() for name in constraint_names]
+    )
+    return [
+        specs_by_name.get(
+            name,
+            {
+                "name": name,
+                "sign": "",
+                "target": None,
+                "scale": 1.0,
+                "group": "UNKNOWN",
+            },
+        )
+        for name in names
+    ]
+
+
+def _latest_design_function_values(design_dir):
+    """Load the function values associated with the adjoint baseline design."""
+
+    design_file = os.path.join(str(design_dir), "design.pkl")
+    if not os.path.exists(design_file):
+        return {}, None
+    try:
+        design = SU2.io.load_data(design_file)
+        values = getattr(getattr(design, "state", None), "FUNCTIONS", {})
+        return {
+            str(name).strip().upper(): float(value)
+            for name, value in values.items()
+            if np.isfinite(float(value))
+        }, design_file
+    except Exception as exc:
+        return {}, f"{design_file}: {exc}"
+
+
+def _select_active_ikkt_constraints(
+    cfg,
+    constraint_names,
+    design_dir=None,
+    current_values=None,
+    active_tol=1.0e-6,
+    verbose=True,
+):
+    """Classify configured constraints for the FFD/HH IKKT active set."""
+
+    active_tol = float(active_tol)
+    if active_tol < 0.0:
+        raise ValueError("PROGRESSIVE_HH_IKKT_ACTIVE_TOL must be non-negative")
+
+    value_source = "provided"
+    if current_values is None:
+        current_values, value_source = _latest_design_function_values(design_dir)
+    normalized_values = {
+        str(name).strip().upper(): float(value)
+        for name, value in (current_values or {}).items()
+    }
+
+    active_names = []
+    records = []
+    for spec in _extract_constraint_specs(cfg, constraint_names):
+        name = spec["name"]
+        sign = spec["sign"]
+        target = spec["target"]
+        value = normalized_values.get(name)
+        c_value = None
+        if value is not None and target is not None:
+            if sign == ">":
+                c_value = float(value) - float(target)
+            elif sign == "<":
+                c_value = float(target) - float(value)
+            elif sign == "=":
+                c_value = float(value) - float(target)
+
+        if sign == "=":
+            status = "active_equality"
+            included = True
+        elif sign in (">", "<") and c_value is not None:
+            included = bool(c_value <= active_tol)
+            status = "active_inequality" if included else "inactive"
+        else:
+            # Preserve compatibility for incomplete/mocked configs, while making
+            # the missing active-set information explicit in diagnostics.
+            included = True
+            status = "active_status_unknown"
+
+        if included:
+            active_names.append(name)
+        record = {
+            **spec,
+            "current_value": value,
+            "c_value": c_value,
+            "active_tol": active_tol,
+            "status": status,
+            "included": included,
+            "value_source": value_source,
+        }
+        records.append(record)
+        if verbose:
+            gap_text = "unavailable" if c_value is None else f"{c_value:.6e}"
+            print(
+                "[PROGRESSIVE_IKKT] active set | "
+                f"constraint={name} sign={sign or 'UNKNOWN'} "
+                f"c={gap_text} status={status}"
+            )
+
+    return active_names, records
+
+
 def _extract_constraint_signs(cfg, constraint_names):
     """
-    Build lambda bounds consistent with the paper:
+    Build multiplier bounds for ``residual = grad(J) - A @ lambda``.
 
-      - maximum-bound inequality  -> lambda >= 0
-      - minimum-bound inequality  -> lambda <= 0
-      - equality constraints      -> lambda free
-
-    Assumed SU2 convention:
-      SIGN "<"  -> upper / maximum bound
-      SIGN ">"  -> lower / minimum bound
-      SIGN "="  -> equality
+    The columns of ``A`` are raw SU2 function gradients. Therefore a lower
+    bound ``F > target`` uses lambda >= 0, while an upper bound
+    ``F < target`` uses lambda <= 0. Equalities use a free multiplier.
     """
     lb = []
     ub = []
-
-    opt_con = cfg.get("OPT_CONSTRAINT", {})
-
-    # -------------------------------------------------
-    # Case 1: structured dict
-    # -------------------------------------------------
-    if isinstance(opt_con, dict):
-        equality = opt_con.get("EQUALITY", {}) or {}
-        inequality = opt_con.get("INEQUALITY", {}) or {}
-
-        for cname in constraint_names:
-            cname = str(cname).upper()
-
-            if cname in equality:
-                lb.append(-np.inf)
-                ub.append(np.inf)
-                continue
-
-            entry = inequality.get(cname, None)
-
-            if not isinstance(entry, dict):
-                lb.append(-np.inf)
-                ub.append(np.inf)
-                continue
-
-            sign = str(entry.get("SIGN", "")).strip()
-
-            if sign == "<":
-                lb.append(0.0)
-                ub.append(np.inf)
-            elif sign == ">":
-                lb.append(-np.inf)
-                ub.append(0.0)
-            elif sign == "=":
-                lb.append(-np.inf)
-                ub.append(np.inf)
-            else:
-                lb.append(-np.inf)
-                ub.append(np.inf)
-
-        return np.asarray(lb, dtype=float), np.asarray(ub, dtype=float)
-
-    # -------------------------------------------------
-    # Case 2: raw string, e.g.
-    # ( MOMENT_Z < 0.092 )*0.01; (AIRFOIL_AREA>0.0778)*0.01; (LIFT=0.824)*0.01
-    # -------------------------------------------------
-    sign_map = {}
-
-    raw = str(opt_con).strip()
-    if raw:
-        parts = [p.strip() for p in raw.split(";") if p.strip()]
-
-        for part in parts:
-            # take content inside first parentheses if present
-            if "(" in part and ")" in part:
-                inside = part[part.find("(") + 1 : part.find(")")]
-            else:
-                inside = part
-
-            inside = inside.strip()
-
-            # detect sign
-            sign = None
-            if "<" in inside:
-                sign = "<"
-                lhs = inside.split("<", 1)[0].strip()
-            elif ">" in inside:
-                sign = ">"
-                lhs = inside.split(">", 1)[0].strip()
-            elif "=" in inside:
-                sign = "="
-                lhs = inside.split("=", 1)[0].strip()
-            else:
-                continue
-
-            cname = lhs.replace(",", " ").split()[0].strip().upper()
-            if cname:
-                sign_map[cname] = sign
-
-    for cname in constraint_names:
-        cname = str(cname).upper()
-        sign = sign_map.get(cname, None)
-
+    for spec in _extract_constraint_specs(cfg, constraint_names):
+        sign = spec["sign"]
         if sign == "<":
-            lb.append(0.0)
-            ub.append(np.inf)
-        elif sign == ">":
             lb.append(-np.inf)
             ub.append(0.0)
+        elif sign == ">":
+            lb.append(0.0)
+            ub.append(np.inf)
         elif sign == "=":
             lb.append(-np.inf)
             ub.append(np.inf)
@@ -617,7 +701,6 @@ def _extract_constraint_signs(cfg, constraint_names):
             ub.append(np.inf)
 
     return np.asarray(lb, dtype=float), np.asarray(ub, dtype=float)
-
 
 
 def _flatten_indicator_numeric_values(value):
@@ -887,13 +970,40 @@ def _run_geo_gradient_for_function(level_dir, cfg_dot, func_name):
     return info["GRADIENTS"][func_name]
 
 
-def _compute_ikkt_residual_vector(g_obj, constraint_grads, lambda_bounds=None):
+def _compute_ikkt_residual_vector(
+    g_obj,
+    constraint_grads,
+    lambda_bounds=None,
+    strict=False,
+    verbose=True,
+    diagnostics=None,
+):
     g = np.asarray(g_obj, dtype=float)
+    diagnostic_payload = diagnostics if diagnostics is not None else {}
 
     if not constraint_grads:
+        diagnostic_payload.update(
+            {
+                "status": "no_active_constraints",
+                "grad_objective_norm": float(np.linalg.norm(g)),
+                "n_constraints": 0,
+            }
+        )
         return g.copy(), np.zeros(0)
 
     A = np.column_stack([np.asarray(cg, dtype=float) for cg in constraint_grads])
+    diagnostic_payload.update(
+        {
+            "grad_objective_norm": float(np.linalg.norm(g)),
+            "grad_constraint_norms": [
+                float(np.linalg.norm(A[:, index])) for index in range(A.shape[1])
+            ],
+            "constraint_matrix_shape": [int(A.shape[0]), int(A.shape[1])],
+            "constraint_matrix_rank": int(np.linalg.matrix_rank(A)),
+            "constraint_matrix_condition": float(np.linalg.cond(A)),
+            "n_constraints": int(A.shape[1]),
+        }
+    )
 
     try:
         if lambda_bounds is None:
@@ -904,33 +1014,49 @@ def _compute_ikkt_residual_vector(g_obj, constraint_grads, lambda_bounds=None):
             lb, ub = lambda_bounds
             res = lsq_linear(A, g, bounds=(lb, ub), lsmr_tol="auto")
 
+        if not bool(res.success):
+            raise RuntimeError(
+                f"IKKT multiplier least-squares solve failed: {res.message}"
+            )
+
         lam = res.x
         residual = g - A @ lam
+        diagnostic_payload.update(
+            {
+                "status": "ok",
+                "cost": float(res.cost),
+                "optimality": float(res.optimality),
+                "active_mask": [int(value) for value in res.active_mask.tolist()],
+                "residual_norm": float(np.linalg.norm(residual)),
+                "relative_residual_norm": float(np.linalg.norm(residual))
+                / max(float(np.linalg.norm(g)), 1.0e-16),
+            }
+        )
 
-        # =========================
-        # IKKT DEBUG BLOCK
-        # =========================
-        g_norm = np.linalg.norm(g)
-        r_norm = np.linalg.norm(residual)
-        rel_res = r_norm / max(g_norm, 1e-16)
+        if verbose:
+            g_norm = np.linalg.norm(g)
+            r_norm = np.linalg.norm(residual)
+            rel_res = r_norm / max(g_norm, 1e-16)
 
-        print("\n[IKKT DEBUG]")
-        print(f"||g||           = {g_norm:.6e}")
-        print(f"||r||           = {r_norm:.6e}")
-        print(f"relative resid  = {rel_res:.6e}")
-        print(f"lambdas         = {lam.tolist()}")
-        print(f"lambda lower    = {lb.tolist()}")
-        print(f"lambda upper    = {ub.tolist()}")
+            print("\n[IKKT DEBUG]")
+            print(f"||g||           = {g_norm:.6e}")
+            print(f"||r||           = {r_norm:.6e}")
+            print(f"relative resid  = {rel_res:.6e}")
+            print(f"lambdas         = {lam.tolist()}")
+            print(f"lambda lower    = {lb.tolist()}")
+            print(f"lambda upper    = {ub.tolist()}")
 
-        for j, cg in enumerate(constraint_grads):
-            contrib = abs(lam[j]) * np.linalg.norm(cg)
-            print(f"||lambda[{j}] * gradC[{j}]|| = {contrib:.6e}")
+            for j, cg in enumerate(constraint_grads):
+                contrib = abs(lam[j]) * np.linalg.norm(cg)
+                print(f"||lambda[{j}] * gradC[{j}]|| = {contrib:.6e}")
 
-        g_reconstructed = A @ lam
-        print(f"||A lambda||    = {np.linalg.norm(g_reconstructed):.6e}")
-        # =========================
+            g_reconstructed = A @ lam
+            print(f"||A lambda||    = {np.linalg.norm(g_reconstructed):.6e}")
 
-    except Exception:
+    except Exception as exc:
+        diagnostic_payload.update({"status": "failed", "error": str(exc)})
+        if strict:
+            raise
         residual = g.copy()
         lam = np.zeros(A.shape[1])
 
@@ -1046,8 +1172,14 @@ def _compute_dot_candidate_scores_symmetric(level, opts):
     indicator_mode = opts.get("adaptive_indicator", "ABS_GRAD").upper()
 
     if indicator_mode == "IKKT":
-        constraint_names = _extract_constraint_names(cfg_level)
-        lambda_bounds = _extract_constraint_signs(cfg_level, constraint_names)
+        requested_names = _extract_constraint_names(cfg_level)
+        constraint_names, _ = _select_active_ikkt_constraints(
+            cfg_level,
+            requested_names,
+            design_dir=design_dir,
+            active_tol=opts.get("ikkt_active_tol", 1.0e-6),
+        )
+        included_names = []
         constraint_grads_full = []
 
         for cname in constraint_names:
@@ -1074,7 +1206,9 @@ def _compute_dot_candidate_scores_symmetric(level, opts):
                 )
 
             constraint_grads_full.append(grad_c)
+            included_names.append(cname)
 
+        lambda_bounds = _extract_constraint_signs(cfg_level, included_names)
         residual_full, lam = _compute_ikkt_residual_vector(
             grad_obj,
             constraint_grads_full,
@@ -1276,8 +1410,14 @@ def _compute_dot_candidate_scores(level, opts):
     indicator_mode = opts.get("adaptive_indicator", "ABS_GRAD").upper()
 
     if indicator_mode == "IKKT":
-        constraint_names = _extract_constraint_names(cfg_level)
-        lambda_bounds = _extract_constraint_signs(cfg_level, constraint_names)
+        requested_names = _extract_constraint_names(cfg_level)
+        constraint_names, _ = _select_active_ikkt_constraints(
+            cfg_level,
+            requested_names,
+            design_dir=design_dir,
+            active_tol=opts.get("ikkt_active_tol", 1.0e-6),
+        )
+        included_names = []
         constraint_grads_full = []
 
         for cname in constraint_names:
@@ -1304,7 +1444,9 @@ def _compute_dot_candidate_scores(level, opts):
                 )
 
             constraint_grads_full.append(grad_c)
+            included_names.append(cname)
 
+        lambda_bounds = _extract_constraint_signs(cfg_level, included_names)
         residual_full, lam = _compute_ikkt_residual_vector(
             grad_obj,
             constraint_grads_full,

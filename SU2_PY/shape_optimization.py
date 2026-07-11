@@ -28,6 +28,7 @@ from SU2.opt.progressive_ffd import (
     build_initial_ffd_level,
     build_next_ffd_level,
     build_ffd_spring_reallocated_level,
+    refresh_ffd_scoring_baseline,
     prepare_progressive_ffd_input,
     write_ffd_level_config,
 )
@@ -794,12 +795,11 @@ def progressive_ffd_shape_optimization(
 
         if not refine_now:
             if (
-                ffd_opts.get("ffd_dual_box", False)
-                and ffd_opts.get("nfinal", None) is not None
+                ffd_opts.get("nfinal", None) is not None
                 and level.ndv < int(ffd_opts["nfinal"])
             ):
                 raise RuntimeError(
-                    "Progressive dual FFD stopped before reaching "
+                    "Progressive FFD stopped before reaching "
                     f"NFINAL={ffd_opts['nfinal']} (current NDV={level.ndv})"
                 )
             sys.stdout.write(f"[PROGRESSIVE_FFD] Stop after level {ilevel}\n")
@@ -808,6 +808,16 @@ def progressive_ffd_shape_optimization(
         if ffd_opts.get("nfinal", None) is None and ilevel == ffd_opts["nlevels"] - 1:
             sys.stdout.write(f"[PROGRESSIVE_FFD] Reached maximum level {ilevel}\n")
             break
+
+        if str(ffd_opts.get("refinement", "UNIFORM")).upper() == "ADAPTIVE":
+            refresh_ffd_scoring_baseline(
+                project,
+                level,
+                result.get("dv_values"),
+                ffd_opts,
+            )
+            refreshed_result = collect_level_result(level)
+            result.update(refreshed_result)
 
         ndv_before_refine = level.ndv
         level = build_next_ffd_level(level, result, ffd_opts)
@@ -821,10 +831,7 @@ def progressive_ffd_shape_optimization(
                 "Progressive FFD refinement did not increase NDV before "
                 f"reaching NFINAL={ffd_opts['nfinal']}"
             )
-            if ffd_opts.get("ffd_dual_box", False):
-                raise RuntimeError(message)
-            sys.stdout.write(f"[PROGRESSIVE_FFD] Stop: {message}\n")
-            break
+            raise RuntimeError(message)
         ilevel += 1
 
     if projectname and final_project and os.path.exists(final_project):

@@ -25,6 +25,7 @@ from SU2.opt.progressive_ffd_mesh import (
 from SU2.opt.progressive_ffd_blending import evaluate_curve
 from SU2.opt.progressive_ffd_split import (
     FFDBoxSplitError,
+    build_single_surface_ffd_box,
     rewrite_dual_ffd_boxes_with_columns_and_reembed,
     split_bootstrap_ffd_box,
 )
@@ -52,6 +53,19 @@ CAMBERED_POINTS = [
     (0.75, 0.005),
 ]
 
+HALF_UPPER_POINTS = [
+    (1.0, 0.0),
+    (0.90, 0.014),
+    (0.75, 0.06),
+    (0.55, 0.079),
+    (0.35, 0.072),
+    (0.18, 0.052),
+    (0.06, 0.025),
+    (0.0, 0.0),
+]
+
+HALF_LOWER_POINTS = [(x, -y) for x, y in HALF_UPPER_POINTS]
+
 DEFAULT_COLUMNS = [-0.1, 0.25, 0.5, 0.75, 1.1]
 OUTER_POINTS = [
     (2.0, 0.0),
@@ -73,6 +87,7 @@ def _write_bootstrap_mesh(
     blending="BEZIER",
     surface_ids=None,
     disconnected_marker=False,
+    marker_closed=True,
 ):
     points = list(points)
     columns = list(columns)
@@ -96,7 +111,8 @@ def _write_bootstrap_mesh(
         lines.append(f"{x:.16g} {y:.16g} {point_id}\n")
 
     marker_segments = [
-        (index, (index + 1) % len(points)) for index in range(len(points))
+        (index, (index + 1) % len(points))
+        for index in range(len(points) if marker_closed else len(points) - 1)
     ]
     if disconnected_marker:
         marker_segments[3] = marker_segments[0]
@@ -622,6 +638,118 @@ def test_dual_rewrite_supports_independent_upper_lower_columns(tmp_path):
     _assert_surface_reconstruction(lower, rewritten_points)
 
 
+@pytest.mark.parametrize(
+    "blending,bspline_orders",
+    [
+        ("BEZIER", (2, 2, 2)),
+        ("BSPLINE_UNIFORM", (4, 2, 2)),
+    ],
+)
+def test_open_upper_marker_builds_one_curved_box(
+    tmp_path,
+    blending,
+    bspline_orders,
+):
+    bootstrap = _write_bootstrap_mesh(
+        tmp_path / "half_bootstrap.su2",
+        points=HALF_UPPER_POINTS,
+        marker_closed=False,
+    )
+    output = tmp_path / "half_upper.su2"
+
+    summary = build_single_surface_ffd_box(
+        bootstrap,
+        output,
+        bootstrap_tag="BOOTSTRAP_BOX",
+        marker="AIRFOIL",
+        side="UPPER",
+        offset_chord=0.04,
+        box_tag="UPPER_BOX",
+        output_blending=blending,
+        bspline_orders=bspline_orders,
+    )
+
+    text = output.read_text()
+    assert "FFD_NBOX= 1\n" in text
+    assert "FFD_TAG= UPPER_BOX\n" in text
+    assert "FFD_TAG= LOWER_BOX\n" not in text
+    assert summary["side"] == "UPPER"
+    assert summary["surface_points"] == len(HALF_UPPER_POINTS) - 2
+    assert summary["fixed_edge_points"] == 2
+    assert summary["max_reembedding_error"] <= 1.0e-10
+    assert summary["blending"] == blending
+
+    box = _read_box(output, "UPPER_BOX")
+    assert {row["point_id"] for row in box["surface"]} == set(
+        range(1, len(HALF_UPPER_POINTS) - 1)
+    )
+    assert box["control_by_index"][(0, 0, 0)][1] == pytest.approx(0.0)
+    assert box["control_by_index"][(4, 0, 0)][1] == pytest.approx(0.0)
+    assert box["control_by_index"][(2, 1, 0)][1] > HALF_UPPER_POINTS[4][1]
+    if blending == "BSPLINE_UNIFORM":
+        assert box["blending_spec"].kind == "BSPLINE_UNIFORM"
+        assert box["blending_spec"].orders == (4, 2, 2)
+
+    mesh_points = read_su2_mesh(output)["points"]
+    _assert_surface_reconstruction(box, mesh_points)
+
+
+@pytest.mark.parametrize(
+    "blending,bspline_orders",
+    [
+        ("BEZIER", (2, 2, 2)),
+        ("BSPLINE_UNIFORM", (4, 2, 2)),
+    ],
+)
+def test_open_lower_marker_builds_one_curved_box(
+    tmp_path,
+    blending,
+    bspline_orders,
+):
+    bootstrap = _write_bootstrap_mesh(
+        tmp_path / "half_lower_bootstrap.su2",
+        points=HALF_LOWER_POINTS,
+        marker_closed=False,
+    )
+    output = tmp_path / "half_lower.su2"
+
+    summary = build_single_surface_ffd_box(
+        bootstrap,
+        output,
+        bootstrap_tag="BOOTSTRAP_BOX",
+        marker="AIRFOIL",
+        side="LOWER",
+        offset_chord=0.04,
+        box_tag="LOWER_BOX",
+        output_blending=blending,
+        bspline_orders=bspline_orders,
+    )
+
+    text = output.read_text()
+    assert "FFD_NBOX= 1\n" in text
+    assert "FFD_TAG= LOWER_BOX\n" in text
+    assert "FFD_TAG= UPPER_BOX\n" not in text
+    assert summary["side"] == "LOWER"
+    assert summary["surface_points"] == len(HALF_LOWER_POINTS) - 2
+    assert summary["fixed_edge_points"] == 2
+    assert summary["max_reembedding_error"] <= 1.0e-10
+    assert summary["blending"] == blending
+
+    box = _read_box(output, "LOWER_BOX")
+    assert {row["point_id"] for row in box["surface"]} == set(
+        range(1, len(HALF_LOWER_POINTS) - 1)
+    )
+    assert box["control_by_index"][(0, 1, 0)][1] == pytest.approx(0.0)
+    assert box["control_by_index"][(4, 1, 0)][1] == pytest.approx(0.0)
+    assert box["control_by_index"][(2, 0, 0)][1] < HALF_LOWER_POINTS[4][1]
+    if blending == "BSPLINE_UNIFORM":
+        assert box["blending_spec"].kind == "BSPLINE_UNIFORM"
+        assert box["blending_spec"].orders == (4, 2, 2)
+
+    mesh_points = read_su2_mesh(output)["points"]
+    _assert_surface_reconstruction(box, mesh_points)
+
+
 @pytest.mark.skipif(
     shutil.which("SU2_DEF") is None
     or os.environ.get("RUN_SU2_DEF_SMOKE", "NO").upper() != "YES",
@@ -713,3 +841,83 @@ def test_su2_def_reads_both_boxes_at_zero_deformation(
         assert deformed_points[point_id] == pytest.approx(
             original_points[point_id], abs=1.0e-12
         )
+
+
+@pytest.mark.skipif(
+    shutil.which("SU2_DEF") is None
+    or os.environ.get("RUN_SU2_DEF_SMOKE", "NO").upper() != "YES",
+    reason="set RUN_SU2_DEF_SMOKE=YES to enable the native SU2_DEF smoke test",
+)
+def test_su2_def_dual_box_line_search_does_not_reverse_lower_box(tmp_path):
+    mesh_in = _write_bootstrap_mesh(tmp_path / "bootstrap.su2")
+    mesh_out = tmp_path / "dual.su2"
+    _split(
+        mesh_in,
+        mesh_out,
+        output_blending="BSPLINE_UNIFORM",
+        bspline_orders=(4, 2, 2),
+    )
+
+    config = tmp_path / "dual_line_search.cfg"
+    config.write_text(
+        "\n".join(
+            [
+                "SOLVER= EULER",
+                "MATH_PROBLEM= DIRECT",
+                "MESH_FILENAME= dual.su2",
+                "MESH_FORMAT= SU2",
+                "MESH_OUT_FILENAME= dual_line_search_out",
+                "MARKER_EULER= ( AIRFOIL )",
+                "MARKER_FAR= ( FARFIELD )",
+                "MARKER_PLOTTING= ( AIRFOIL )",
+                "MARKER_MONITORING= ( AIRFOIL )",
+                (
+                    "DV_KIND= FFD_CONTROL_POINT_2D, "
+                    "FFD_CONTROL_POINT_2D"
+                ),
+                "DV_MARKER= ( AIRFOIL )",
+                (
+                    "DV_PARAM= ( UPPER_BOX, 2, 1, 0.0, 1.0 ); "
+                    "( LOWER_BOX, 2, 0, 0.0, -1.0 )"
+                ),
+                "DV_VALUE= 0.2, 0.005",
+                "OPT_RELAX_FACTOR= 1.0",
+                "OPT_LINE_SEARCH_BOUND= 0.01",
+                "DEFORM_LINEAR_SOLVER= FGMRES",
+                "DEFORM_LINEAR_SOLVER_PREC= LU_SGS",
+                "DEFORM_LINEAR_SOLVER_ITER= 100",
+                "DEFORM_NONLINEAR_ITER= 1",
+                "DEFORM_LINEAR_SOLVER_ERROR= 1E-14",
+                "DEFORM_STIFFNESS_TYPE= INVERSE_VOLUME",
+                "FFD_TOLERANCE= 1E-12",
+                "FFD_ITERATIONS= 200",
+                "FFD_BLENDING= BSPLINE_UNIFORM",
+                "FFD_BSPLINE_ORDER= 4, 2, 2",
+                "OUTPUT_FILES= ( PARAVIEW_ASCII )",
+                "",
+            ]
+        )
+    )
+    env = dict(os.environ)
+    env.setdefault("OMPI_MCA_osc", "pt2pt")
+    result = subprocess.run(
+        [shutil.which("SU2_DEF"), config.name],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    combined_output = result.stdout + result.stderr
+    assert result.returncode == 0, combined_output
+    assert "Out-of-bounds, re-adjusting scale factor" in combined_output
+
+    original_points = read_su2_mesh(mesh_out)["points"]
+    deformed_points = read_su2_mesh(
+        tmp_path / "dual_line_search_out.su2"
+    )["points"]
+    lower_midpoint_id = 6
+    assert deformed_points[lower_midpoint_id][1] < original_points[
+        lower_midpoint_id
+    ][1]

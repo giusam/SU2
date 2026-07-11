@@ -327,6 +327,12 @@ vector<vector<su2double> > CSurfaceMovement::SetSurface_Deformation(CGeometry* g
               /*--- Apply the design variables to the control point position ---*/
               ApplyDesignVariables(geometry, config, FFDBox, iFFDBox);
 
+              /*--- New_Scale is only the incremental correction for this FFD box.
+               * Restore the original scale before processing another box; otherwise
+               * a negative correction reverses every subsequent box deformation. ---*/
+              config->SetOpt_RelaxFactor(Current_Scale);
+
+
               /*--- Recompute cartesian coordinates using the new control point location ---*/
 
               MaxDiff = SetCartesianCoord(geometry, config, FFDBox[iFFDBox], iFFDBox, false);

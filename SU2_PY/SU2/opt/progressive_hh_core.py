@@ -340,12 +340,26 @@ def get_progressive_hh_options(config):
         ffd_initial_count = _count_initial_points(ffd_initial_value)
         if ffd_initial_count is None:
             ffd_initial_count = upper_count
+        optimize_ffd_endpoints = _as_bool(
+            config.get("PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS", "NO")
+        )
         if ffd_initial_count is None:
+            if optimize_ffd_endpoints and n0 < 2:
+                raise ValueError(
+                    "PROGRESSIVE_HH_N0 must be >= 2 when "
+                    "PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS=YES"
+                )
             ffd_initial_count = n0
-        if _as_bool(config.get("PROGRESSIVE_FFD_DUAL_BOX", "NO")):
-            initial_ndv = 2 * ffd_initial_count
-        else:
-            initial_ndv = ffd_initial_count
+        elif optimize_ffd_endpoints:
+            # Explicit FFD lists contain interior columns only.  The two
+            # offset endpoints are added by the FFD option parser.
+            ffd_initial_count += 2
+
+        ffd_domain_mode = str(
+            config.get("PROGRESSIVE_FFD_DOMAIN_MODE", "FULL")
+        ).strip().upper()
+        active_side_count = 2 if ffd_domain_mode == "FULL" else 1
+        initial_ndv = active_side_count * ffd_initial_count
     elif symmetry_mode == "REDUCED":
         if surface_mode != "BOTH":
             raise ValueError(

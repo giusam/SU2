@@ -165,15 +165,18 @@ def _parse_ffd_initial_columns(
     )
 
 
-def _parse_ffd_initial_columns_unbounded(value):
+def _parse_ffd_initial_columns_unbounded(value, min_count=2):
     if value is None:
         return None
     raw = str(value).strip().strip("()[]")
     if not raw:
         return []
     values = [float(token.strip()) for token in raw.split(",") if token.strip()]
-    if len(values) < 2:
-        raise ValueError("Progressive dual FFD requires at least two initial columns")
+    if len(values) < int(min_count):
+        raise ValueError(
+            "Progressive FFD requires at least "
+            f"{int(min_count)} initial columns"
+        )
     if not all(math.isfinite(value) for value in values):
         raise ValueError("Progressive FFD columns must be finite")
     values = sorted(values)
@@ -205,6 +208,7 @@ def validate_active_ffd_columns(
     xmin=0.0,
     xmax=1.0,
     include_bounds=False,
+    min_count=2,
 ):
     columns = [float(x) for x in columns]
     xmin = float(xmin)
@@ -214,8 +218,11 @@ def validate_active_ffd_columns(
             "Progressive FFD active column bounds must satisfy xmin < xmax "
             f"(got xmin={xmin}, xmax={xmax})"
         )
-    if len(columns) < 2:
-        raise ValueError("Progressive FFD requires at least two initial columns")
+    if len(columns) < int(min_count):
+        raise ValueError(
+            "Progressive FFD requires at least "
+            f"{int(min_count)} initial columns"
+        )
 
     tol = 1.0e-10
     for a, b in zip(columns[:-1], columns[1:]):
@@ -268,6 +275,10 @@ def ffd_active_range_from_opts(opts):
 
 
 def ffd_active_include_bounds_from_opts(opts):
+    if opts is not None and _as_bool(
+        opts.get("ffd_optimize_offset_endpoints", False)
+    ):
+        return True
     if opts is not None and str(opts.get("ffd_domain_mode", "")).upper() in (
         "FULL",
         "HALF_UPPER",
@@ -275,6 +286,12 @@ def ffd_active_include_bounds_from_opts(opts):
     ):
         return False
     return _ffd_allow_external_columns_from_opts(opts)
+
+
+def _with_ffd_offset_endpoints(columns, xmin, xmax):
+    return _sorted_unique_with_tolerance(
+        [float(xmin)] + [float(x) for x in columns] + [float(xmax)]
+    )
 
 
 def _sorted_unique_with_tolerance(values, tol=1.0e-10):
@@ -308,6 +325,14 @@ def build_ffd_mesh_columns(mesh_in, box_tag, active_columns, opts=None):
     for boundary in boundary_columns:
         for active in raw_active_columns:
             if abs(float(active) - float(boundary)) <= 1.0e-10:
+                is_enabled_offset_endpoint = _as_bool(
+                    (opts or {}).get("ffd_optimize_offset_endpoints", False)
+                ) and (
+                    abs(float(active) - active_xmin) <= 1.0e-10
+                    or abs(float(active) - active_xmax) <= 1.0e-10
+                )
+                if is_enabled_offset_endpoint:
+                    continue
                 raise ValueError(
                     f"Active FFD column {active} coincides with the inactive "
                     "FFD box boundary."
@@ -474,6 +499,9 @@ def get_progressive_ffd_options(config, hh_opts):
     allow_external_columns = _as_bool(
         config.get("PROGRESSIVE_FFD_ALLOW_EXTERNAL_COLUMNS", "NO")
     )
+    optimize_offset_endpoints = _as_bool(
+        config.get("PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS", "NO")
+    )
     active_xmin = float(config.get("PROGRESSIVE_FFD_ACTIVE_XMIN", 0.0))
     active_xmax = float(config.get("PROGRESSIVE_FFD_ACTIVE_XMAX", 1.0))
     if not active_xmin < active_xmax:
@@ -481,7 +509,9 @@ def get_progressive_ffd_options(config, hh_opts):
             "PROGRESSIVE_FFD_ACTIVE_XMIN must be less than "
             "PROGRESSIVE_FFD_ACTIVE_XMAX"
         )
-    initial_include_bounds = bool(allow_external_columns) if not dual_box else False
+    initial_include_bounds = bool(optimize_offset_endpoints) or (
+        bool(allow_external_columns) if not dual_box else False
+    )
 
     if ffd_dv_kind == "FFD_THICKNESS_2D":
         raise NotImplementedError(
@@ -635,20 +665,58 @@ def get_progressive_ffd_options(config, hh_opts):
                 "spring is disabled"
             )
 
-    initial_columns = _parse_ffd_initial_columns_unbounded(
-        config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None)
+    explicit_initial_columns = _parse_ffd_initial_columns_unbounded(
+        config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None),
+        min_count=0 if optimize_offset_endpoints else 2,
     )
-    if initial_columns is None:
+    if explicit_initial_columns is None:
         fallback = config.get("PROGRESSIVE_HH_INITIAL_UPPER", None)
-        initial_columns = _parse_ffd_initial_columns_unbounded(fallback)
-    if initial_columns is None:
+        explicit_initial_columns = _parse_ffd_initial_columns_unbounded(
+            fallback,
+            min_count=0 if optimize_offset_endpoints else 2,
+        )
+    if explicit_initial_columns is None:
         n0 = int(opts.get("n0", 3))
-        initial_columns = initial_centers(n0)
+        if optimize_offset_endpoints:
+            if n0 < 2:
+                raise ValueError(
+                    "PROGRESSIVE_HH_N0 must be >= 2 when "
+                    "PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS=YES"
+                )
+            span = active_xmax - active_xmin
+            initial_interior_columns = [
+                active_xmin + span * value for value in initial_centers(n0 - 2)
+            ]
+        else:
+            initial_interior_columns = initial_centers(n0)
+    else:
+        initial_interior_columns = validate_active_ffd_columns(
+            explicit_initial_columns,
+            xmin=active_xmin,
+            xmax=active_xmax,
+            include_bounds=False,
+            min_count=0 if optimize_offset_endpoints else 2,
+        )
+
+    if optimize_offset_endpoints:
+        initial_columns = _with_ffd_offset_endpoints(
+            initial_interior_columns,
+            active_xmin,
+            active_xmax,
+        )
+    else:
+        initial_columns = list(initial_interior_columns)
+
     initial_columns_count = len(active_sides) * len(initial_columns)
+    geometric_columns = _with_ffd_offset_endpoints(
+        initial_columns,
+        active_xmin,
+        active_xmax,
+    )
     try:
         validate_blending_spec(
             blending_spec,
-            control_counts=(len(initial_columns) + 2, 2, 2),
+            control_counts=(len(geometric_columns), 2, 2),
             dual_2d=True,
         )
     except ValueError as exc:
@@ -672,6 +740,7 @@ def get_progressive_ffd_options(config, hh_opts):
             "ffd_control_row": control_row,
             "ffd_direction": direction,
             "ffd_allow_external_columns": allow_external_columns,
+            "ffd_optimize_offset_endpoints": optimize_offset_endpoints,
             "ffd_active_xmin": active_xmin,
             "ffd_active_xmax": active_xmax,
             "ffd_active_include_bounds": initial_include_bounds,
@@ -689,6 +758,7 @@ def get_progressive_ffd_options(config, hh_opts):
             "ffd_lower_offset_chord": lower_offset_chord,
             "ffd_refinement_coupling": refinement_coupling,
             "ffd_initial_columns": initial_columns,
+            "ffd_initial_interior_columns": initial_interior_columns,
             "ffd_blending": blending_spec.kind,
             "ffd_bspline_orders": tuple(blending_spec.orders),
             "ffd_blending_spec": blending_spec,
@@ -707,6 +777,14 @@ def get_progressive_ffd_options(config, hh_opts):
         print(f"[PROGRESSIVE_FFD] marker = {marker}")
         print(f"[PROGRESSIVE_FFD] domain mode = {domain_mode}")
         print(f"[PROGRESSIVE_FFD] blending = {blending_spec.kind}")
+        print(
+            "[PROGRESSIVE_FFD] optimize offset endpoints = "
+            f"{'YES' if optimize_offset_endpoints else 'NO'}"
+        )
+        print(
+            "[PROGRESSIVE_FFD] initial interior columns = "
+            f"{initial_interior_columns}"
+        )
         if blending_spec.kind == BSPLINE_UNIFORM:
             print(
                 "[PROGRESSIVE_FFD] B-spline orders = "
@@ -1226,13 +1304,13 @@ def _uniform_dual_ffd_refinement(prev_level, opts):
         sorted(set(upper)),
         xmin=active_xmin,
         xmax=active_xmax,
-        include_bounds=False,
+        include_bounds=prev_level.active_include_bounds,
     )
     lower = validate_active_ffd_columns(
         sorted(set(lower)),
         xmin=active_xmin,
         xmax=active_xmax,
-        include_bounds=False,
+        include_bounds=prev_level.active_include_bounds,
     )
 
     spring_enabled = bool(opts.get("spring_enabled", False))
@@ -1287,6 +1365,13 @@ def _spring_redistribute_ffd_columns(columns, scores, opts):
         A=float(opts.get("spring_A", 20.0)),
     )
     include_bounds = ffd_active_include_bounds_from_opts(opts)
+    if include_bounds and redistributed:
+        if abs(min(normalized)) > 1.0e-10 or abs(max(normalized) - 1.0) > 1.0e-10:
+            raise ValueError(
+                "Endpoint-enabled FFD spring requires exact xmin/xmax anchors"
+            )
+        redistributed[0] = 0.0
+        redistributed[-1] = 1.0
     return validate_active_ffd_columns(
         [float(xmin) + span * float(x) for x in redistributed],
         xmin=xmin,
@@ -1300,7 +1385,9 @@ def _spring_spacing_is_valid(columns, opts):
     if min_spacing <= 0.0:
         return True
     xmin, xmax = ffd_active_range_from_opts(opts)
-    extended = [float(xmin)] + sorted(float(x) for x in columns) + [float(xmax)]
+    extended = _sorted_unique_with_tolerance(
+        [float(xmin)] + sorted(float(x) for x in columns) + [float(xmax)]
+    )
     return all(
         right - left >= min_spacing - 1.0e-12
         for left, right in zip(extended[:-1], extended[1:])
@@ -1343,7 +1430,7 @@ def _limit_spring_redistribution_by_spacing(original, redistributed, opts):
         best,
         xmin=ffd_active_range_from_opts(opts)[0],
         xmax=ffd_active_range_from_opts(opts)[1],
-        include_bounds=False,
+        include_bounds=ffd_active_include_bounds_from_opts(opts),
     )
 
 
@@ -1448,7 +1535,7 @@ def _refine_ffd_adaptive_sided(prev_level, result, opts):
             sorted(set(columns)),
             xmin=prev_level.active_xmin,
             xmax=prev_level.active_xmax,
-            include_bounds=False,
+            include_bounds=prev_level.active_include_bounds,
         )
 
     ndv_after = sum(len(columns) for columns in refined.values())
@@ -1625,13 +1712,13 @@ def _refine_ffd_adaptive_dual(prev_level, result, opts):
         sorted(set(upper)),
         xmin=prev_level.active_xmin,
         xmax=prev_level.active_xmax,
-        include_bounds=False,
+        include_bounds=prev_level.active_include_bounds,
     )
     lower = validate_active_ffd_columns(
         sorted(set(lower)),
         xmin=prev_level.active_xmin,
         xmax=prev_level.active_xmax,
-        include_bounds=False,
+        include_bounds=prev_level.active_include_bounds,
     )
     ndv_after = len(upper) + len(lower)
     if scoring.get("sequential_selection", False):
@@ -1964,12 +2051,19 @@ def apply_post_opt_ffd_spring(level, result, opts):
 def initial_ffd_columns_from_config(base_config, opts):
     active_xmin, active_xmax = ffd_active_range_from_opts(opts)
     include_bounds = ffd_active_include_bounds_from_opts(opts)
+    columns = opts.get("ffd_initial_columns", None)
+    if columns is not None:
+        return validate_active_ffd_columns(
+            columns,
+            xmin=active_xmin,
+            xmax=active_xmax,
+            include_bounds=include_bounds,
+        )
+
     if _as_bool(opts.get("ffd_dual_box", False)):
-        columns = opts.get("ffd_initial_columns", None)
-        if columns is None:
-            columns = _parse_ffd_initial_columns_unbounded(
-                base_config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None)
-            )
+        columns = _parse_ffd_initial_columns_unbounded(
+            base_config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None)
+        )
         if columns is None:
             raise ValueError(
                 "PROGRESSIVE_FFD_INITIAL_COLUMNS is required in dual FFD mode"
@@ -1978,7 +2072,7 @@ def initial_ffd_columns_from_config(base_config, opts):
             columns,
             xmin=active_xmin,
             xmax=active_xmax,
-            include_bounds=False,
+            include_bounds=include_bounds,
         )
 
     columns = _parse_ffd_initial_columns(

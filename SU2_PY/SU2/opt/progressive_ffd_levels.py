@@ -41,6 +41,7 @@ def _remove_ffd_progressive_keys(cfg):
         "PROGRESSIVE_FFD_CONTROL_ROW",
         "PROGRESSIVE_FFD_DIRECTION",
         "PROGRESSIVE_FFD_INITIAL_COLUMNS",
+        "PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS",
         "PROGRESSIVE_FFD_ALLOW_EXTERNAL_COLUMNS",
         "PROGRESSIVE_FFD_ACTIVE_XMIN",
         "PROGRESSIVE_FFD_ACTIVE_XMAX",
@@ -101,7 +102,7 @@ def build_initial_ffd_level(base_config, opts):
             direction="OUTWARD",
             active_xmin=active_xmin,
             active_xmax=active_xmax,
-            active_include_bounds=False,
+            active_include_bounds=opts.get("ffd_active_include_bounds", False),
         )
 
     return FFDLevel(
@@ -141,7 +142,9 @@ def _ffdtype_level_kwargs(opts):
             "direction": "OUTWARD",
             "active_xmin": active_xmin,
             "active_xmax": active_xmax,
-            "active_include_bounds": False,
+            "active_include_bounds": opts.get(
+                "ffd_active_include_bounds", False
+            ),
         }
     return {
         "ffd_box_tag": opts["ffd_box_tag"],

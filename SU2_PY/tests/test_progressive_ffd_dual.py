@@ -9,6 +9,7 @@ import SU2
 from SU2.opt.progressive_ffd_core import (
     FFDLevel,
     apply_post_opt_ffd_spring,
+    build_ffd_mesh_columns,
     get_progressive_ffd_options,
     make_dual_ffd_definition,
     ordered_ffd_records,
@@ -32,6 +33,7 @@ from SU2.opt.progressive_ffd_prepare import (
     _mesh_geometry,
     _persist_smoke_artifacts,
     _validate_dual_mesh,
+    _write_bootstrap_config,
 )
 from SU2.opt.progressive_ffd_split import (
     build_single_surface_ffd_box,
@@ -118,6 +120,37 @@ def _half_upper_config(**overrides):
     return SU2.io.Config(values)
 
 
+def test_bootstrap_config_writes_all_eight_ffd_corner_points(tmp_path):
+    config_path = tmp_path / "bootstrap.cfg"
+    _write_bootstrap_config(
+        str(config_path),
+        mesh_in="mesh.su2",
+        mesh_out_base="mesh_out",
+        marker="AIRFOIL",
+        other_markers=[],
+        symmetry_markers=[],
+        bootstrap_tag="AIRFOIL_BOX",
+        x_le=0.0,
+        x_te=1.0,
+        y_bottom=-0.1,
+        y_top=0.1,
+    )
+
+    definition = next(
+        line.strip()
+        for line in config_path.read_text().splitlines()
+        if line.startswith("FFD_DEFINITION=")
+    )
+    fields = [
+        token.strip()
+        for token in definition.split("=", 1)[1].strip().strip("()").split(",")
+    ]
+
+    assert fields[0] == "AIRFOIL_BOX"
+    assert len(fields) == 25
+    assert [float(value) for value in fields[13:]] == pytest.approx([0.0] * 12)
+
+
 def test_dual_nfinal_counts_upper_and_lower_dvs():
     config = _dual_config(PROGRESSIVE_HH_NFINAL=5)
     with pytest.raises(ValueError, match="initial HH NDV.*6"):
@@ -127,6 +160,177 @@ def test_dual_nfinal_counts_upper_and_lower_dvs():
     opts = _dual_opts(config)
     assert opts["nfinal"] == 8
     assert opts["ffd_initial_columns"] == pytest.approx([0.25, 0.5, 0.75])
+
+
+def test_offset_endpoint_n0_counts_total_columns_per_side():
+    config = _dual_config(
+        PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS="YES",
+        PROGRESSIVE_HH_N0=7,
+        PROGRESSIVE_HH_NFINAL=14,
+    )
+    config.pop("PROGRESSIVE_FFD_INITIAL_COLUMNS")
+
+    opts = _dual_opts(config)
+    expected = [0.0] + [index / 6.0 for index in range(1, 6)] + [1.0]
+    assert opts["ffd_optimize_offset_endpoints"] is True
+    assert opts["ffd_active_include_bounds"] is True
+    assert opts["ffd_initial_interior_columns"] == pytest.approx(expected[1:-1])
+    assert opts["ffd_initial_columns"] == pytest.approx(expected)
+
+    level = build_initial_ffd_level(
+        SU2.io.Config(dict(config, MESH_FILENAME="prepared.su2")),
+        opts,
+    )
+    assert level.ndv == 14
+    assert level.upper_columns == pytest.approx(expected)
+    assert level.lower_columns == pytest.approx(expected)
+
+
+def test_offset_endpoint_explicit_list_contains_only_interior_columns():
+    interior = [0.1, 0.25, 0.5, 0.75, 0.9]
+    config = _dual_config(
+        PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS="YES",
+        PROGRESSIVE_FFD_INITIAL_COLUMNS="( 0.1, 0.25, 0.5, 0.75, 0.9 )",
+        PROGRESSIVE_HH_NFINAL=14,
+    )
+    opts = _dual_opts(config)
+    assert opts["ffd_initial_interior_columns"] == pytest.approx(interior)
+    assert opts["ffd_initial_columns"] == pytest.approx(
+        [0.0] + interior + [1.0]
+    )
+
+    with pytest.raises(ValueError, match=r"must satisfy 0.0 < x < 1.0"):
+        _dual_opts(
+            _dual_config(
+                PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS="YES",
+                PROGRESSIVE_FFD_INITIAL_COLUMNS="( 0.0, 0.25, 0.5 )",
+                PROGRESSIVE_HH_NFINAL=10,
+            )
+        )
+
+
+def test_offset_endpoint_initial_count_validates_nfinal_and_half_topology():
+    full = _dual_config(
+        PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS="YES",
+        PROGRESSIVE_HH_N0=7,
+        PROGRESSIVE_HH_NFINAL=13,
+    )
+    full.pop("PROGRESSIVE_FFD_INITIAL_COLUMNS")
+    with pytest.raises(ValueError, match="initial HH NDV.*14"):
+        get_progressive_hh_options(full)
+
+    half = _half_upper_config(
+        PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS="YES",
+        PROGRESSIVE_HH_N0=7,
+        PROGRESSIVE_HH_NFINAL=7,
+    )
+    half.pop("PROGRESSIVE_FFD_INITIAL_COLUMNS")
+    opts = _dual_opts(half)
+    level = build_initial_ffd_level(
+        SU2.io.Config(dict(half, MESH_FILENAME="prepared.su2")),
+        opts,
+    )
+    assert level.ndv == 7
+    assert level.columns[0] == pytest.approx(0.0)
+    assert level.columns[-1] == pytest.approx(1.0)
+
+
+def test_offset_endpoints_keep_growth_ratio_based_on_total_ndv():
+    level = SimpleNamespace(ndv=14)
+    candidates = [
+        {"side": "UPPER", "interval_id": index} for index in range(20)
+    ]
+    target, interval_count = _exact_growth_ratio_insertion_target(
+        level,
+        candidates,
+        {"growth_ratio": 2.0, "nfinal": 40},
+    )
+    assert target == 14
+    assert interval_count == 20
+
+
+def test_offset_endpoint_definition_targets_only_outer_rows():
+    columns = [0.0, 0.2, 0.5, 0.8, 1.0]
+    records = ordered_dual_ffd_records(columns, columns)
+    mapping = {value: index for index, value in enumerate(columns)}
+    definition = make_dual_ffd_definition(
+        records,
+        {
+            "ffd_dual_box": True,
+            "ffd_active_sides": ("UPPER", "LOWER"),
+            "ffd_marker": "AIRFOIL",
+            "ffd_upper_box_tag": "UPPER_BOX",
+            "ffd_lower_box_tag": "LOWER_BOX",
+            "scale": 1.0,
+        },
+        {"UPPER": mapping, "LOWER": mapping},
+    )
+    assert definition["PARAM"][0] == [0, 1, 0.0, 1.0]
+    assert definition["PARAM"][4] == [4, 1, 0.0, 1.0]
+    assert definition["PARAM"][5] == [0, 0, 0.0, -1.0]
+    assert definition["PARAM"][-1] == [4, 0, 0.0, -1.0]
+
+
+def test_offset_endpoint_active_columns_reuse_mesh_boundaries(tmp_path):
+    columns = [0.0, 0.2, 0.5, 0.8, 1.0]
+    bootstrap = _write_bootstrap_mesh(
+        tmp_path / "bootstrap.su2",
+        columns=columns,
+    )
+    prepared = tmp_path / "prepared.su2"
+    _split(bootstrap, prepared)
+
+    mesh_columns, active_columns = build_ffd_mesh_columns(
+        str(prepared),
+        "UPPER_BOX",
+        columns,
+        {
+            "ffd_domain_mode": "FULL",
+            "ffd_active_xmin": 0.0,
+            "ffd_active_xmax": 1.0,
+            "ffd_optimize_offset_endpoints": True,
+        },
+    )
+    assert mesh_columns == pytest.approx(columns)
+    assert active_columns == pytest.approx(columns)
+
+
+def test_offset_endpoint_level_config_contains_fourteen_outer_row_dvs(
+    tmp_path,
+    monkeypatch,
+):
+    columns = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
+    bootstrap = _write_bootstrap_mesh(
+        tmp_path / "bootstrap.su2",
+        columns=columns,
+    )
+    prepared = tmp_path / "prepared.su2"
+    _split(bootstrap, prepared)
+    config = _dual_config(
+        MESH_FILENAME=str(prepared),
+        MESH_OUT_FILENAME="mesh_out",
+        PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS="YES",
+        PROGRESSIVE_FFD_INITIAL_COLUMNS="( 0.1, 0.25, 0.5, 0.75, 0.9 )",
+        PROGRESSIVE_HH_NFINAL=14,
+        FFD_CONTINUITY="2ND_DERIVATIVE",
+        FFD_FIX_I="( 0, 1 )",
+    )
+    config._filename = str(tmp_path / "Config_FFD.cfg")
+    opts = _dual_opts(config)
+    level = build_initial_ffd_level(config, opts)
+
+    monkeypatch.chdir(tmp_path)
+    cfg_path = Path(write_ffd_level_config(config, level, opts))
+    cfg_text = cfg_path.read_text()
+    assert cfg_text.count("( 19") == 14
+    assert cfg_text.count("UPPER_BOX") == 7
+    assert cfg_text.count("LOWER_BOX") == 7
+    assert "FFD_CONTINUITY= USER_INPUT" in cfg_text
+    assert "FFD_FIX_I" not in cfg_text
+    assert "PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS" not in cfg_text
+
+    mesh_text = (tmp_path / "LEVEL_0" / "ffd_level0.su2").read_text()
+    assert mesh_text.count("FFD_DEGREE_I= 6") == 2
 
 
 def test_dual_bspline_options_are_native_and_validated():
@@ -282,6 +486,32 @@ def test_prepare_cache_request_changes_with_bspline_order(tmp_path):
     assert request_o4["bspline_orders"] == [4, 2, 2]
     assert request_o3["bspline_orders"] == [3, 2, 2]
     assert request_o4 != request_o3
+
+
+def test_prepare_cache_request_changes_with_offset_endpoint_mode(tmp_path):
+    raw_mesh = _write_bootstrap_mesh(tmp_path / "raw.su2")
+    geometry = _mesh_geometry(str(raw_mesh), "AIRFOIL")
+    disabled = _dual_opts(_dual_config())
+    enabled = _dual_opts(
+        _dual_config(
+            PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS="YES",
+            PROGRESSIVE_FFD_INITIAL_COLUMNS="( 0.25, 0.5, 0.75 )",
+            PROGRESSIVE_HH_NFINAL=10,
+        )
+    )
+    disabled_request = _build_prepare_request(
+        str(raw_mesh), str(tmp_path / "prepared.su2"), geometry, disabled
+    )
+    enabled_request = _build_prepare_request(
+        str(raw_mesh), str(tmp_path / "prepared.su2"), geometry, enabled
+    )
+    assert disabled_request["schema_version"] == 3
+    assert disabled_request["optimize_offset_endpoints"] is False
+    assert enabled_request["optimize_offset_endpoints"] is True
+    assert enabled_request["initial_interior_columns"] == pytest.approx(
+        [0.25, 0.5, 0.75]
+    )
+    assert enabled_request != disabled_request
 
 
 def test_domain_mode_rejects_conflicting_legacy_topology_options():
@@ -501,6 +731,49 @@ def test_post_opt_spring_redistributes_full_sides_independently():
         "UPPER": [4.0, 1.0, 0.2],
         "LOWER": [0.2, 1.0, 4.0],
     }
+
+
+def test_offset_endpoint_spring_keeps_exact_boundary_anchors():
+    columns = [0.0, 0.2, 0.5, 0.8, 1.0]
+    level = FFDLevel(
+        level_id=1,
+        columns=columns,
+        upper_columns=columns,
+        lower_columns=columns,
+        dual_box=True,
+        workdir="LEVEL_1",
+        config_filename="config.cfg",
+        project_filename="project.pkl",
+        active_xmin=0.0,
+        active_xmax=1.0,
+        active_include_bounds=True,
+    )
+    result = {
+        "dv_values": [4.0, 2.0, 1.0, 0.5, 0.1, 0.1, 0.5, 1.0, 2.0, 4.0]
+    }
+    redistributed = apply_post_opt_ffd_spring(
+        level,
+        result,
+        {
+            "ffd_domain_mode": "FULL",
+            "ffd_active_xmin": 0.0,
+            "ffd_active_xmax": 1.0,
+            "ffd_optimize_offset_endpoints": True,
+            "min_center_spacing": 0.05,
+            "spring_A": 20.0,
+        },
+    )
+
+    for side in ("UPPER", "LOWER"):
+        assert redistributed[side][0] == pytest.approx(0.0)
+        assert redistributed[side][-1] == pytest.approx(1.0)
+        assert len(redistributed[side]) == len(columns)
+        assert all(
+            right - left >= 0.05 - 1.0e-12
+            for left, right in zip(
+                redistributed[side][:-1], redistributed[side][1:]
+            )
+        )
 
 
 @pytest.mark.parametrize("reoptimize", [True, False])
@@ -2375,9 +2648,16 @@ def test_progressive_ffd_thickness_value_and_analytic_gradient_are_compatible(
     )
 
     values = constraint.values([0.0] * level.ndv, project)
+    cfg_level["OPT_RELAX_FACTOR"] = 1.0
+    jacobian_unit_relax = constraint.jacobian_analytic(
+        [0.0] * level.ndv,
+        project,
+    )
+    cfg_level["OPT_RELAX_FACTOR"] = 37.0
     jacobian = constraint.jacobian_analytic([0.0] * level.ndv, project)
     assert values == pytest.approx([0.0], abs=1.0e-13)
     assert jacobian.shape == (1, level.ndv)
+    assert jacobian == pytest.approx(jacobian_unit_relax * 37.0)
     assert all(float(value) >= -1.0e-13 for value in jacobian[0])
     assert max(float(value) for value in jacobian[0]) > 0.0
 

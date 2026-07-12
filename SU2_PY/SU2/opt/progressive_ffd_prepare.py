@@ -18,6 +18,7 @@ from SU2.opt.bspline_def import (
     read_su2_mesh,
 )
 from SU2.opt.progressive_ffd_core import (
+    _with_ffd_offset_endpoints,
     validate_active_ffd_columns,
     validate_ffd_mesh_blending,
 )
@@ -210,12 +211,18 @@ def _write_bootstrap_config(
             f"DV_MARKER= {_format_marker_list([marker])}",
             "DV_PARAM= ( 1.0 )",
             "DV_VALUE= 0.0",
+            # COptionFFDDef always consumes eight 3D corner points. For a
+            # two-dimensional box, the final four points are zero placeholders.
             (
                 f"FFD_DEFINITION= ( {bootstrap_tag}, "
                 f"{x_le:.16g}, {y_bottom:.16g}, 0.0, "
                 f"{x_te:.16g}, {y_bottom:.16g}, 0.0, "
                 f"{x_te:.16g}, {y_top:.16g}, 0.0, "
-                f"{x_le:.16g}, {y_top:.16g}, 0.0 )"
+                f"{x_le:.16g}, {y_top:.16g}, 0.0, "
+                "0.0, 0.0, 0.0, "
+                "0.0, 0.0, 0.0, "
+                "0.0, 0.0, 0.0, "
+                "0.0, 0.0, 0.0 )"
             ),
             "FFD_DEGREE= ( 1, 1, 0 )",
             "FFD_BLENDING= BEZIER",
@@ -591,26 +598,48 @@ def _marker_groups(geometry):
 def _update_runtime_options(base_config, opts, prepared_mesh, geometry):
     opts["ffd_active_xmin"] = float(geometry["x_le"])
     opts["ffd_active_xmax"] = float(geometry["x_te"])
-    opts["ffd_active_include_bounds"] = False
+    optimize_endpoints = bool(opts.get("ffd_optimize_offset_endpoints", False))
+    opts["ffd_active_include_bounds"] = optimize_endpoints
     opts["ffd_prepared_mesh_resolved"] = os.path.abspath(prepared_mesh)
-    opts["ffd_initial_columns"] = validate_active_ffd_columns(
-        opts["ffd_initial_columns"],
-        xmin=geometry["x_le"],
-        xmax=geometry["x_te"],
-        include_bounds=False,
-    )
+    if optimize_endpoints:
+        interior = validate_active_ffd_columns(
+            opts.get("ffd_initial_interior_columns", []),
+            xmin=geometry["x_le"],
+            xmax=geometry["x_te"],
+            include_bounds=False,
+            min_count=0,
+        )
+        opts["ffd_initial_interior_columns"] = interior
+        opts["ffd_initial_columns"] = _with_ffd_offset_endpoints(
+            interior,
+            geometry["x_le"],
+            geometry["x_te"],
+        )
+    else:
+        opts["ffd_initial_columns"] = validate_active_ffd_columns(
+            opts["ffd_initial_columns"],
+            xmin=geometry["x_le"],
+            xmax=geometry["x_te"],
+            include_bounds=False,
+        )
     base_config["MESH_FILENAME"] = os.path.abspath(prepared_mesh)
 
 
 def _build_prepare_request(source_mesh, prepared_mesh, geometry, opts):
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "raw_mesh": os.path.abspath(source_mesh),
         "raw_mesh_sha256": _sha256_file(source_mesh),
         "marker": geometry["marker_tag"],
         "domain_mode": opts["ffd_domain_mode"],
         "active_sides": list(opts.get("ffd_active_sides", ())),
         "initial_columns": [float(x) for x in opts["ffd_initial_columns"]],
+        "initial_interior_columns": [
+            float(x) for x in opts.get("ffd_initial_interior_columns", [])
+        ],
+        "optimize_offset_endpoints": bool(
+            opts.get("ffd_optimize_offset_endpoints", False)
+        ),
         "bootstrap_tag": opts["ffd_bootstrap_tag"],
         "bootstrap_y_padding_chord": float(
             opts["ffd_bootstrap_y_padding_chord"]
@@ -642,12 +671,29 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
         opts["ffd_marker"],
         domain_mode=opts["ffd_domain_mode"],
     )
-    opts["ffd_initial_columns"] = validate_active_ffd_columns(
-        opts["ffd_initial_columns"],
-        xmin=geometry["x_le"],
-        xmax=geometry["x_te"],
-        include_bounds=False,
-    )
+    optimize_endpoints = bool(opts.get("ffd_optimize_offset_endpoints", False))
+    if optimize_endpoints:
+        interior = validate_active_ffd_columns(
+            opts.get("ffd_initial_interior_columns", []),
+            xmin=geometry["x_le"],
+            xmax=geometry["x_te"],
+            include_bounds=False,
+            min_count=0,
+        )
+        opts["ffd_initial_interior_columns"] = interior
+        opts["ffd_initial_columns"] = _with_ffd_offset_endpoints(
+            interior,
+            geometry["x_le"],
+            geometry["x_te"],
+        )
+        opts["ffd_active_include_bounds"] = True
+    else:
+        opts["ffd_initial_columns"] = validate_active_ffd_columns(
+            opts["ffd_initial_columns"],
+            xmin=geometry["x_le"],
+            xmax=geometry["x_te"],
+            include_bounds=False,
+        )
 
     if not opts.get("ffd_auto_prepare", False):
         _validate_prepared_mesh(source_mesh, geometry, opts)
@@ -825,9 +871,11 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
             )
 
         exact_bootstrap = os.path.join(stage_dir, "bootstrap_exact_columns.su2")
-        geometric_columns = [geometry["x_le"]] + list(
-            opts["ffd_initial_columns"]
-        ) + [geometry["x_te"]]
+        geometric_columns = _with_ffd_offset_endpoints(
+            opts["ffd_initial_columns"],
+            geometry["x_le"],
+            geometry["x_te"],
+        )
         rewrite_summary = rewrite_ffd_box_with_columns_and_reembed(
             bootstrap_mesh,
             exact_bootstrap,

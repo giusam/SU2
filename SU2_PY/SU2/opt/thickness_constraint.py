@@ -306,7 +306,9 @@ def _hicks_henne_bump(x, center):
 
     exponent = math.log(0.5) / math.log(center)
     value = math.sin(math.pi * (x ** exponent))
-    return value ** 6
+    # Keep this kernel aligned with CSurfaceMovement::SetHicksHenne,
+    # where the native SU2 exponent is t2 = 1.
+    return value
 
 
 def _bernstein(n, i, t):
@@ -688,6 +690,7 @@ class ThicknessConstraint:
                 "dv_marker": cfg.get("DV_MARKER", ""),
                 "definition_dv": cfg.get("DEFINITION_DV", ""),
                 "dv_value_old": cfg.get("DV_VALUE_OLD", ""),
+                "opt_relax_factor": cfg.get("OPT_RELAX_FACTOR", 1.0),
                 "x": np.asarray(x_eval, dtype=float).tolist(),
             }
         ).encode("utf-8")
@@ -779,7 +782,7 @@ class ThicknessConstraint:
             raise ValueError("DEFINITION_DV is empty")
 
         if all(kind == "HICKS_HENNE" for kind in kinds):
-            return self._jacobian_hicks_henne(def_dv)
+            return self._jacobian_hicks_henne(def_dv, project)
 
         if all(kind == "FFD_CONTROL_POINT_2D" for kind in kinds):
             return self._jacobian_ffd_control_point_2d(def_dv, project)
@@ -822,9 +825,10 @@ class ThicknessConstraint:
                 self._fallback_warned = True
             return self.jacobian_fd(x_eval, project)
 
-    def _jacobian_hicks_henne(self, def_dv):
+    def _jacobian_hicks_henne(self, def_dv, project):
         n_dv = _definition_dv_size(def_dv)
         jac = np.zeros((len(self.x_stations), n_dv), dtype=float)
+        relax_factor = float(project.config.get("OPT_RELAX_FACTOR", 1.0))
 
         k = 0
         for i_dv, kind in enumerate(def_dv["KIND"]):
@@ -841,7 +845,7 @@ class ThicknessConstraint:
             scale = float(def_dv["SCALE"][i_dv])
 
             for i_x, x in enumerate(self.x_stations):
-                bump = scale * _hicks_henne_bump(x, center)
+                bump = scale * relax_factor * _hicks_henne_bump(x, center)
                 if self.domain_mode == "FULL":
                     jac[i_x, k] = bump
                 elif self.domain_mode == "HALF_UPPER":
@@ -860,6 +864,7 @@ class ThicknessConstraint:
         from SU2.opt.progressive_ffd_blending import basis_values
 
         n_dv = _definition_dv_size(def_dv)
+        relax_factor = float(project.config.get("OPT_RELAX_FACTOR", 1.0))
         if any(int(size) != 1 for size in def_dv.get("SIZE", [])):
             raise ValueError("FFD_CONTROL_POINT_2D analytic gradient requires SIZE=1")
 
@@ -939,7 +944,9 @@ class ThicknessConstraint:
                     data["blending_spec"],
                     axis=1,
                 )[j_idx]
-                point_dy[point_id][k] = scale * dy * basis_i * basis_j
+                point_dy[point_id][k] = (
+                    scale * relax_factor * dy * basis_i * basis_j
+                )
             k += 1
 
         jac = np.zeros((len(self.x_stations), n_dv), dtype=float)

@@ -678,6 +678,30 @@ def _format_centers(values):
     return ";".join(f"{float(x):.12g}" for x in values)
 
 
+def _upgrade_selection_history_schema(csv_path, columns):
+    if not os.path.isfile(csv_path) or os.path.getsize(csv_path) == 0:
+        return
+    with open(csv_path, "r", newline="") as fp:
+        reader = csv.DictReader(fp)
+        existing_columns = list(reader.fieldnames or [])
+        rows = list(reader)
+    if existing_columns == list(columns):
+        return
+    unknown = [column for column in existing_columns if column not in columns]
+    if unknown:
+        raise RuntimeError(
+            "Cannot upgrade progressive selection-history schema; unknown "
+            f"existing columns: {unknown}"
+        )
+    temporary = csv_path + ".schema_upgrade_tmp"
+    with open(temporary, "w", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in columns})
+    os.replace(temporary, csv_path)
+
+
 def append_selection_history_csv(
     csv_path,
     selection_metadata,
@@ -698,6 +722,7 @@ def append_selection_history_csv(
         "nadd_mode",
         "trigger_mode",
         "refinement",
+        "ffd_scoring_mode",
         "spring_enabled",
         "side",
         "x",
@@ -711,6 +736,21 @@ def append_selection_history_csv(
         "candidate_dv_index",
         "control_point_i",
         "scoring_basis",
+        "signal_source",
+        "score_net",
+        "score_net_normalized",
+        "score_pure",
+        "score_pure_normalized",
+        "energy_current",
+        "energy_candidate",
+        "rank_current",
+        "rank_candidate",
+        "rank_gain",
+        "pure_rank",
+        "nesting_rms",
+        "nesting_max",
+        "locality",
+        "innovation_center_x",
         "temporary_mesh",
         "insertion_step",
         "insertion_target",
@@ -727,7 +767,8 @@ def append_selection_history_csv(
         "final_mesh",
     ]
 
-    write_header = not os.path.exists(csv_path)
+    _upgrade_selection_history_schema(csv_path, columns)
+    write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
 
     with open(csv_path, "a", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=columns)
@@ -744,6 +785,9 @@ def append_selection_history_csv(
                     "nadd_mode": selection_metadata.get("nadd_mode"),
                     "trigger_mode": selection_metadata.get("trigger_mode"),
                     "refinement": selection_metadata.get("refinement"),
+                    "ffd_scoring_mode": selection_metadata.get(
+                        "ffd_scoring_mode", c.get("ffd_scoring_mode", "")
+                    ),
                     "spring_enabled": "YES"
                     if selection_metadata.get("spring_enabled")
                     else "NO",
@@ -767,6 +811,41 @@ def append_selection_history_csv(
                     "candidate_dv_index": c.get("candidate_dv_index", ""),
                     "control_point_i": c.get("control_point_i", ""),
                     "scoring_basis": c.get("scoring_basis", ""),
+                    "signal_source": c.get("signal_source", ""),
+                    "score_net": ""
+                    if c.get("score_net") is None
+                    else f"{float(c.get('score_net')):.12e}",
+                    "score_net_normalized": ""
+                    if c.get("score_net_normalized") is None
+                    else f"{float(c.get('score_net_normalized')):.12e}",
+                    "score_pure": ""
+                    if c.get("score_pure") is None
+                    else f"{float(c.get('score_pure')):.12e}",
+                    "score_pure_normalized": ""
+                    if c.get("score_pure_normalized") is None
+                    else f"{float(c.get('score_pure_normalized')):.12e}",
+                    "energy_current": ""
+                    if c.get("energy_current") is None
+                    else f"{float(c.get('energy_current')):.12e}",
+                    "energy_candidate": ""
+                    if c.get("energy_candidate") is None
+                    else f"{float(c.get('energy_candidate')):.12e}",
+                    "rank_current": c.get("rank_current", ""),
+                    "rank_candidate": c.get("rank_candidate", ""),
+                    "rank_gain": c.get("rank_gain", ""),
+                    "pure_rank": c.get("pure_rank", ""),
+                    "nesting_rms": ""
+                    if c.get("nesting_rms") is None
+                    else f"{float(c.get('nesting_rms')):.12e}",
+                    "nesting_max": ""
+                    if c.get("nesting_max") is None
+                    else f"{float(c.get('nesting_max')):.12e}",
+                    "locality": ""
+                    if c.get("locality") is None
+                    else f"{float(c.get('locality')):.12e}",
+                    "innovation_center_x": ""
+                    if c.get("innovation_center_x") is None
+                    else f"{float(c.get('innovation_center_x')):.12e}",
                     "temporary_mesh": c.get("temporary_mesh", ""),
                     "insertion_step": c.get("insertion_step", ""),
                     "insertion_target": c.get("insertion_target", ""),

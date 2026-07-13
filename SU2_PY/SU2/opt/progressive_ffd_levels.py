@@ -35,6 +35,7 @@ def _remove_ffd_progressive_keys(cfg):
     progressive_keys = [
         "PROGRESSIVE_PARAM_KIND",
         "PROGRESSIVE_FFD_DV_KIND",
+        "PROGRESSIVE_FFD_SCORING_MODE",
         "PROGRESSIVE_FFD_BOX_TAG",
         "PROGRESSIVE_FFD_MARKER",
         "PROGRESSIVE_FFD_DOMAIN_MODE",
@@ -173,6 +174,20 @@ def build_next_ffd_level(prev_level, result, opts):
     next_mesh = result.get("final_mesh", None)
     if next_mesh is None:
         next_mesh = prev_level.mesh_source
+    if (
+        selection_metadata
+        and str(selection_metadata.get("ffd_scoring_mode", "")).upper()
+        == "VIRTUAL_TANGENT"
+    ):
+        for selected in reversed(selection_metadata.get("selected", [])):
+            candidate_mesh = selected.get("temporary_mesh")
+            if candidate_mesh and os.path.isfile(candidate_mesh):
+                next_mesh = candidate_mesh
+                print(
+                    "[PROGRESSIVE_FFD] Reusing selected virtual candidate mesh "
+                    f"for level {next_id}: {candidate_mesh}"
+                )
+                break
 
     if getattr(prev_level, "dual_box", False):
         upper_columns, lower_columns = columns

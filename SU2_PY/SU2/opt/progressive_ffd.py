@@ -42,3 +42,16 @@ from SU2.opt.progressive_ffd_split import (
 from SU2.opt.progressive_ffd_projection import (
     _compute_ffd_dot_candidate_scores,
 )
+
+from SU2.opt.progressive_ffd_tangent import (
+    COMPONENT,
+    VIRTUAL_TANGENT,
+    FFDTangentError,
+    airfoil_area_value_and_field,
+    airfoil_thickness_value_and_field,
+    build_ffd_tangent_state,
+    compare_tangent_spaces,
+    fit_surface_ikkt_signal,
+    load_surface_sensitivity_vector,
+    project_surface_field,
+)

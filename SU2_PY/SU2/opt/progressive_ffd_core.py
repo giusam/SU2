@@ -22,6 +22,50 @@ from SU2.opt.progressive_ffd_envelope import (
 )
 
 
+FFD_SCORING_COMPONENT = "COMPONENT"
+FFD_SCORING_VIRTUAL_TANGENT = "VIRTUAL_TANGENT"
+SUPPORTED_FFD_SCORING_MODES = (
+    FFD_SCORING_COMPONENT,
+    FFD_SCORING_VIRTUAL_TANGENT,
+)
+
+
+def _normalize_ffd_scoring_mode(value):
+    mode = str(value or FFD_SCORING_COMPONENT).strip().upper()
+    if mode not in SUPPORTED_FFD_SCORING_MODES:
+        raise ValueError(
+            "PROGRESSIVE_FFD_SCORING_MODE must be one of "
+            f"{SUPPORTED_FFD_SCORING_MODES}, got {value!r}"
+        )
+    return mode
+
+
+def _numeric_values(value, default):
+    if value is None:
+        return [float(default)]
+    if isinstance(value, str):
+        tokens = value.strip().strip("()[]").replace(",", " ").split()
+        result = []
+        for token in tokens:
+            try:
+                result.append(float(token))
+            except ValueError:
+                continue
+        return result or [float(default)]
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            try:
+                result.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        return result or [float(default)]
+    try:
+        return [float(value)]
+    except (TypeError, ValueError):
+        return [float(default)]
+
+
 class FFDLevel:
     def __init__(
         self,
@@ -558,6 +602,9 @@ def get_progressive_ffd_options(config, hh_opts):
     ffd_dv_kind = str(
         config.get("PROGRESSIVE_FFD_DV_KIND", "FFD_CONTROL_POINT_2D")
     ).strip().upper()
+    scoring_mode = _normalize_ffd_scoring_mode(
+        config.get("PROGRESSIVE_FFD_SCORING_MODE", FFD_SCORING_COMPONENT)
+    )
     marker = str(config.get("PROGRESSIVE_FFD_MARKER", opts.get("marker", "AIRFOIL"))).strip()
     allow_external_columns = _as_bool(
         config.get("PROGRESSIVE_FFD_ALLOW_EXTERNAL_COLUMNS", "NO")
@@ -586,6 +633,44 @@ def get_progressive_ffd_options(config, hh_opts):
             "Unified progressive FFD supports only FFD_CONTROL_POINT_2D; "
             f"got {ffd_dv_kind}"
         )
+
+    if scoring_mode == FFD_SCORING_VIRTUAL_TANGENT:
+        refinement = str(opts.get("refinement", "UNIFORM")).strip().upper()
+        if refinement != "ADAPTIVE":
+            raise ValueError(
+                "PROGRESSIVE_FFD_SCORING_MODE=VIRTUAL_TANGENT requires "
+                "PROGRESSIVE_HH_REFINEMENT=ADAPTIVE"
+            )
+        nadd_mode = str(opts.get("nadd_mode", "GROWTH_RATIO")).strip().upper()
+        if nadd_mode != "GROWTH_RATIO":
+            raise ValueError(
+                "PROGRESSIVE_FFD_SCORING_MODE=VIRTUAL_TANGENT requires "
+                "PROGRESSIVE_HH_NADD_MODE=GROWTH_RATIO"
+            )
+        indicator_mode = str(
+            opts.get("adaptive_indicator", "ABS_GRAD")
+        ).strip().upper()
+        if indicator_mode not in ("ABS_GRAD", "IKKT"):
+            raise ValueError(
+                "VIRTUAL_TANGENT supports only "
+                "PROGRESSIVE_HH_ADAPTIVE_INDICATOR=ABS_GRAD or IKKT"
+            )
+        lower_bounds = _numeric_values(
+            config.get("OPT_BOUND_LOWER"),
+            -math.inf,
+        )
+        upper_bounds = _numeric_values(
+            config.get("OPT_BOUND_UPPER"),
+            math.inf,
+        )
+        if (
+            not all(value < 0.0 for value in lower_bounds)
+            or not all(value > 0.0 for value in upper_bounds)
+        ):
+            raise ValueError(
+                "VIRTUAL_TANGENT V1 requires bilateral DV bounds with "
+                "every OPT_BOUND_LOWER < 0 and every OPT_BOUND_UPPER > 0"
+            )
 
     thickness_enabled = _as_bool(
         config.get("PROGRESSIVE_THICKNESS_CONSTRAINT", "NO")
@@ -796,6 +881,7 @@ def get_progressive_ffd_options(config, hh_opts):
     opts.update(
         {
             "ffd_dv_kind": ffd_dv_kind,
+            "ffd_scoring_mode": scoring_mode,
             "ffd_box_tag": box_tag,
             "ffd_marker": marker,
             "ffd_domain_mode": domain_mode,
@@ -843,6 +929,7 @@ def get_progressive_ffd_options(config, hh_opts):
         print(f"[PROGRESSIVE_FFD] marker = {marker}")
         print(f"[PROGRESSIVE_FFD] domain mode = {domain_mode}")
         print(f"[PROGRESSIVE_FFD] blending = {blending_spec.kind}")
+        print(f"[PROGRESSIVE_FFD] scoring mode = {scoring_mode}")
         print(f"[PROGRESSIVE_FFD] envelope mode = {envelope_mode}")
         if envelope_spec is not None:
             print(
@@ -1649,6 +1736,9 @@ def _refine_ffd_adaptive_sided(prev_level, result, opts):
         "nadd_mode": selection_mode,
         "trigger_mode": opts.get("trigger", "MAX_ITER"),
         "refinement": "ADAPTIVE",
+        "ffd_scoring_mode": scoring.get(
+            "ffd_scoring_mode", opts.get("ffd_scoring_mode", FFD_SCORING_COMPONENT)
+        ),
         "spring_enabled": spring_enabled,
         "spring_timing": "POST_OPT",
         "spring_score_mode": "COEFFICIENT",
@@ -1672,6 +1762,26 @@ def _refine_ffd_adaptive_sided(prev_level, result, opts):
                 "control_point_i": candidate.get("control_point_i"),
                 "temporary_mesh": candidate.get("temporary_mesh"),
                 "scoring_basis": candidate.get("scoring_basis"),
+                "ffd_scoring_mode": candidate.get(
+                    "ffd_scoring_mode", opts.get("ffd_scoring_mode")
+                ),
+                "signal_source": candidate.get("signal_source", ""),
+                "score_net": candidate.get("score_net"),
+                "score_net_normalized": candidate.get("score_net_normalized"),
+                "score_pure": candidate.get("score_pure"),
+                "score_pure_normalized": candidate.get(
+                    "score_pure_normalized"
+                ),
+                "energy_current": candidate.get("energy_current"),
+                "energy_candidate": candidate.get("energy_candidate"),
+                "rank_current": candidate.get("rank_current"),
+                "rank_candidate": candidate.get("rank_candidate"),
+                "rank_gain": candidate.get("rank_gain"),
+                "pure_rank": candidate.get("pure_rank"),
+                "nesting_rms": candidate.get("nesting_rms"),
+                "nesting_max": candidate.get("nesting_max"),
+                "locality": candidate.get("locality"),
+                "innovation_center_x": candidate.get("innovation_center_x"),
                 "insertion_step": candidate.get("insertion_step"),
                 "insertion_target": candidate.get("insertion_target"),
                 "artifact_directory": candidate.get("artifact_directory", ""),
@@ -1745,6 +1855,7 @@ def _refine_ffd_adaptive_dual(prev_level, result, opts):
     exact_scoring = scoring.get("scoring_basis") in (
         "EXACT_SINGLE_INSERTION",
         "EXACT_SEQUENTIAL_INSERTION",
+        "VIRTUAL_TANGENT_SPACE",
     )
     if scoring.get("sequential_selection", False):
         chosen = list(scoring.get("selected_candidates", []))
@@ -1856,6 +1967,9 @@ def _refine_ffd_adaptive_dual(prev_level, result, opts):
         "nadd_mode": selection_mode,
         "trigger_mode": opts.get("trigger", "MAX_ITER"),
         "refinement": "ADAPTIVE",
+        "ffd_scoring_mode": scoring.get(
+            "ffd_scoring_mode", opts.get("ffd_scoring_mode", FFD_SCORING_COMPONENT)
+        ),
         "spring_enabled": False,
         "upper_before": sorted(prev_level.upper_columns),
         "lower_before": sorted(prev_level.lower_columns),
@@ -1876,6 +1990,26 @@ def _refine_ffd_adaptive_dual(prev_level, result, opts):
                 "control_point_i": candidate.get("control_point_i"),
                 "temporary_mesh": candidate.get("temporary_mesh"),
                 "scoring_basis": candidate.get("scoring_basis"),
+                "ffd_scoring_mode": candidate.get(
+                    "ffd_scoring_mode", opts.get("ffd_scoring_mode")
+                ),
+                "signal_source": candidate.get("signal_source", ""),
+                "score_net": candidate.get("score_net"),
+                "score_net_normalized": candidate.get("score_net_normalized"),
+                "score_pure": candidate.get("score_pure"),
+                "score_pure_normalized": candidate.get(
+                    "score_pure_normalized"
+                ),
+                "energy_current": candidate.get("energy_current"),
+                "energy_candidate": candidate.get("energy_candidate"),
+                "rank_current": candidate.get("rank_current"),
+                "rank_candidate": candidate.get("rank_candidate"),
+                "rank_gain": candidate.get("rank_gain"),
+                "pure_rank": candidate.get("pure_rank"),
+                "nesting_rms": candidate.get("nesting_rms"),
+                "nesting_max": candidate.get("nesting_max"),
+                "locality": candidate.get("locality"),
+                "innovation_center_x": candidate.get("innovation_center_x"),
                 "insertion_step": candidate.get("insertion_step"),
                 "insertion_target": candidate.get("insertion_target"),
                 "artifact_directory": candidate.get("artifact_directory", ""),

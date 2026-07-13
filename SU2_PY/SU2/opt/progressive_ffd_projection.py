@@ -13,6 +13,11 @@ import contextlib
 import numpy as np
 import SU2
 
+from SU2.opt.bspline_driver.geometry_constraints import (
+    is_geometry_constraint_name,
+    normalize_geometry_constraint_name,
+)
+
 from SU2.opt.progressive_ffd_core import (
     build_ffd_mesh_columns,
     ffd_active_range_from_opts,
@@ -29,8 +34,26 @@ from SU2.opt.progressive_ffd_blending import (
     BSPLINE_UNIFORM,
     normalize_ffd_blending,
 )
+from SU2.opt.progressive_ffd_tangent import (
+    COMPONENT,
+    VIRTUAL_TANGENT,
+    FFDTangentError,
+    airfoil_area_value_and_field,
+    airfoil_thickness_value_and_field,
+    build_ffd_tangent_state,
+    compare_tangent_spaces,
+    fit_surface_ikkt_signal,
+    internal_constraint_field,
+    load_design_gradient_csv,
+    load_surface_sensitivity_vector,
+    normalize_ffd_scoring_mode,
+    project_surface_field,
+    validate_surface_projection,
+)
 from SU2.opt.progressive_ffd_mesh import rewrite_ffd_box_with_columns_and_reembed
+from SU2.opt.progressive_ffd_envelope import FFDEnvelopeError
 from SU2.opt.progressive_ffd_split import (
+    FFDBoxSplitError,
     rewrite_dual_ffd_boxes_with_columns_and_reembed,
     rewrite_single_ffd_box_with_columns_and_reembed,
 )
@@ -39,6 +62,7 @@ from SU2.opt.progressive_hh_projection import (
     _dot_problem_kind,
     _extract_constraint_names,
     _extract_constraint_signs,
+    _extract_constraint_specs,
     _find_latest_design_with_geometry,
     _find_real_adjoint_assets,
     _make_projection_state,
@@ -1275,6 +1299,9 @@ def _write_exact_candidate_scores_csv(level, candidates):
         f"ffd_candidate_scores_level{level.level_id}.csv",
     )
     fieldnames = [
+        "ffd_scoring_mode",
+        "scoring_basis",
+        "signal_source",
         "insertion_step",
         "insertion_target",
         "ndv_before_insertion",
@@ -1291,8 +1318,26 @@ def _write_exact_candidate_scores_csv(level, candidates):
         "control_point_i",
         "objective_function",
         "objective_gradient",
+        "surface_residual_component",
         "constraint_gradients",
         "indicator",
+        "energy_current",
+        "energy_candidate",
+        "signal_energy",
+        "score_net",
+        "score_net_normalized",
+        "score_pure",
+        "score_pure_normalized",
+        "rank_current",
+        "rank_candidate",
+        "rank_gain",
+        "pure_rank",
+        "nesting_rms",
+        "nesting_max",
+        "locality",
+        "innovation_center_x",
+        "admissible",
+        "rejected_reason",
         "interval_winner",
         "global_rank",
     ]
@@ -1302,6 +1347,11 @@ def _write_exact_candidate_scores_csv(level, candidates):
         for candidate in candidates:
             writer.writerow(
                 {
+                    "ffd_scoring_mode": candidate.get(
+                        "ffd_scoring_mode", COMPONENT
+                    ),
+                    "scoring_basis": candidate.get("scoring_basis", ""),
+                    "signal_source": candidate.get("signal_source", ""),
                     "insertion_step": candidate.get("insertion_step", 1),
                     "insertion_target": candidate.get("insertion_target", 1),
                     "ndv_before_insertion": candidate.get(
@@ -1324,11 +1374,41 @@ def _write_exact_candidate_scores_csv(level, candidates):
                     "objective_gradient": (
                         f"{candidate['objective_gradient_component']:.16e}"
                     ),
+                    "surface_residual_component": (
+                        ""
+                        if candidate.get("surface_residual_component") is None
+                        else f"{float(candidate['surface_residual_component']):.16e}"
+                    ),
                     "constraint_gradients": json.dumps(
                         candidate.get("constraint_gradient_components", {}),
                         sort_keys=True,
                     ),
                     "indicator": f"{candidate['indicator']:.16e}",
+                    "energy_current": candidate.get("energy_current", ""),
+                    "energy_candidate": candidate.get("energy_candidate", ""),
+                    "signal_energy": candidate.get("signal_energy", ""),
+                    "score_net": candidate.get("score_net", ""),
+                    "score_net_normalized": candidate.get(
+                        "score_net_normalized", ""
+                    ),
+                    "score_pure": candidate.get("score_pure", ""),
+                    "score_pure_normalized": candidate.get(
+                        "score_pure_normalized", ""
+                    ),
+                    "rank_current": candidate.get("rank_current", ""),
+                    "rank_candidate": candidate.get("rank_candidate", ""),
+                    "rank_gain": candidate.get("rank_gain", ""),
+                    "pure_rank": candidate.get("pure_rank", ""),
+                    "nesting_rms": candidate.get("nesting_rms", ""),
+                    "nesting_max": candidate.get("nesting_max", ""),
+                    "locality": candidate.get("locality", ""),
+                    "innovation_center_x": candidate.get(
+                        "innovation_center_x", ""
+                    ),
+                    "admissible": (
+                        "YES" if candidate.get("admissible", True) else "NO"
+                    ),
+                    "rejected_reason": candidate.get("rejected_reason", ""),
                     "interval_winner": (
                         "YES" if candidate.get("interval_winner") else "NO"
                     ),
@@ -1452,6 +1532,758 @@ def _persist_selected_candidate_artifacts(
                 sort_keys=True,
             )
     return selected_dir
+
+
+def _resolve_surface_sensitivity_file(adjoint_dir, function_name):
+    direct = os.path.join(adjoint_dir, "surface_sens.csv")
+    if os.path.isfile(direct):
+        return direct
+    candidates = sorted(
+        path
+        for path in glob.glob(os.path.join(adjoint_dir, "*surface*sens*.csv"))
+        if os.path.isfile(path)
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No surface_sens.csv found for {function_name} in {adjoint_dir}"
+        )
+    raise RuntimeError(
+        f"Ambiguous surface sensitivity files for {function_name}: {candidates}"
+    )
+
+
+def _resolve_saved_gradient_file(adjoint_dir):
+    candidates = sorted(
+        path
+        for path in glob.glob(os.path.join(adjoint_dir, "*of_grad*.csv"))
+        if os.path.isfile(path)
+    )
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        raise RuntimeError(
+            f"Ambiguous saved SU2 gradient files in {adjoint_dir}: {candidates}"
+        )
+    return candidates[0]
+
+
+def _validate_saved_surface_projection(
+    tangent_state,
+    field,
+    adjoint_dir,
+    function_name,
+):
+    try:
+        reference_file = _resolve_saved_gradient_file(adjoint_dir)
+    except Exception as exc:
+        return {
+            "status": "reference_unavailable",
+            "function": str(function_name).upper(),
+            "reference_file": None,
+            "detail": str(exc),
+        }
+    if reference_file is None:
+        return {
+            "status": "reference_unavailable",
+            "function": str(function_name).upper(),
+            "reference_file": None,
+        }
+    try:
+        validation = validate_surface_projection(
+            tangent_state,
+            field,
+            load_design_gradient_csv(reference_file),
+            absolute_tolerance=5.0e-6,
+        )
+    except Exception as exc:
+        return {
+            "status": "reference_parameterization_differs",
+            "function": str(function_name).upper(),
+            "reference_file": reference_file,
+            "detail": str(exc),
+        }
+    validation.update(
+        {
+            "status": (
+                "passed"
+                if validation["passed"]
+                else "reference_parameterization_differs"
+            ),
+            "function": str(function_name).upper(),
+            "reference_file": reference_file,
+            "note": (
+                "The saved gradient belongs to the optimized level box; the "
+                "virtual baseline can use a newly re-embedded box. A strict "
+                "validation requires SU2_DOT on that same virtual baseline."
+            ),
+        }
+    )
+    return validation
+
+
+def _prepare_virtual_tangent_context(level, opts, cfg_level, obj_name, design_dir):
+    obj_adj_dir, objective_design_dir = _find_real_adjoint_assets(
+        level.workdir,
+        obj_name,
+    )
+    if os.path.abspath(objective_design_dir) != os.path.abspath(design_dir):
+        raise RuntimeError(
+            "Objective adjoint and accepted-design directories disagree during "
+            "virtual FFD scoring"
+        )
+    requested_names = _extract_constraint_names(cfg_level)
+    active_names, constraint_status = _select_active_ikkt_constraints(
+        cfg_level,
+        requested_names,
+        design_dir=design_dir,
+        active_tol=opts.get("ikkt_active_tol", 1.0e-6),
+        verbose=False,
+    )
+    specs = {
+        spec["name"]: spec
+        for spec in _extract_constraint_specs(cfg_level, requested_names)
+    }
+    return {
+        "objective_function": str(obj_name).upper(),
+        "objective_adjoint_dir": obj_adj_dir,
+        "objective_field_file": _resolve_surface_sensitivity_file(
+            obj_adj_dir,
+            obj_name,
+        ),
+        "design_dir": design_dir,
+        "active_constraint_names": list(active_names),
+        "constraint_status": constraint_status,
+        "constraint_specs": specs,
+        "active_tol": float(opts.get("ikkt_active_tol", 1.0e-6)),
+        "initialized_node_ids": None,
+    }
+
+
+def _constraint_active_from_value(spec, current_value, active_tol):
+    sign = str(spec.get("sign", "")).strip()
+    target = spec.get("target")
+    if target is None:
+        return True, None, "active_status_unknown"
+    if sign == ">":
+        c_value = float(current_value) - float(target)
+    elif sign == "<":
+        c_value = float(target) - float(current_value)
+    elif sign == "=":
+        c_value = float(current_value) - float(target)
+        return True, c_value, "active_equality"
+    else:
+        return True, None, "active_status_unknown"
+    active = bool(c_value <= float(active_tol))
+    return active, c_value, "active_inequality" if active else "inactive"
+
+
+def _initialize_virtual_tangent_context(
+    level,
+    opts,
+    baseline_state,
+    virtual_context,
+):
+    node_ids = list(baseline_state["node_ids"])
+    initialized = virtual_context.get("initialized_node_ids")
+    if initialized is not None:
+        if list(initialized) != node_ids:
+            raise RuntimeError(
+                "Virtual FFD marker node order changed between sequential passes"
+            )
+        return virtual_context
+
+    objective_field = load_surface_sensitivity_vector(
+        virtual_context["objective_field_file"],
+        baseline_state,
+    )
+    objective_projection_validation = _validate_saved_surface_projection(
+        baseline_state,
+        objective_field,
+        virtual_context.get("objective_adjoint_dir", ""),
+        virtual_context["objective_function"],
+    ) if virtual_context.get("objective_adjoint_dir") else {
+        "status": "reference_unavailable",
+        "function": virtual_context["objective_function"],
+        "reference_file": None,
+    }
+    status_by_name = {
+        str(record["name"]).upper(): dict(record)
+        for record in virtual_context["constraint_status"]
+    }
+    constraint_records = []
+    inactive_records = [
+        dict(record)
+        for record in virtual_context["constraint_status"]
+        if not bool(record.get("included", False))
+    ]
+    unsupported_records = []
+    indicator_mode = str(opts.get("adaptive_indicator", "ABS_GRAD")).upper()
+
+    if indicator_mode == "IKKT":
+        for name in virtual_context["active_constraint_names"]:
+            name = str(name).upper()
+            spec = dict(virtual_context["constraint_specs"].get(name, {}))
+            spec.setdefault("name", name)
+            status = status_by_name.get(name, {})
+            provider = None
+            provider_metadata = {}
+            raw_field = None
+            provider_value = status.get("current_value")
+            field_file = None
+
+            if is_geometry_constraint_name(name):
+                canonical = normalize_geometry_constraint_name(name)
+                if canonical == "AIRFOIL_AREA":
+                    provider_value, raw_field = airfoil_area_value_and_field(
+                        baseline_state
+                    )
+                    provider = "analytic_airfoil_area"
+                    provider_metadata = {
+                        "marker_closed": bool(baseline_state["closed"]),
+                        "implicit_chord_closure": not bool(
+                            baseline_state["closed"]
+                        ),
+                    }
+                elif canonical == "AIRFOIL_THICKNESS":
+                    provider_value, raw_field, provider_metadata = (
+                        airfoil_thickness_value_and_field(baseline_state)
+                    )
+                    provider = "analytic_airfoil_thickness"
+                else:
+                    unsupported_records.append(
+                        {
+                            "name": name,
+                            "source": "GEOMETRY",
+                            "reason": "unsupported_geometry_constraint",
+                        }
+                    )
+                    continue
+
+                active, c_value, active_status = _constraint_active_from_value(
+                    spec,
+                    provider_value,
+                    virtual_context["active_tol"],
+                )
+                if not active:
+                    inactive_records.append(
+                        {
+                            **status,
+                            "name": name,
+                            "provider": provider,
+                            "provider_current_value": float(provider_value),
+                            "c_value": c_value,
+                            "status": active_status,
+                        }
+                    )
+                    continue
+            else:
+                try:
+                    constraint_adj_dir, constraint_design_dir = (
+                        _find_real_adjoint_assets(level.workdir, name)
+                    )
+                except Exception as exc:
+                    unsupported_records.append(
+                        {
+                            "name": name,
+                            "source": "AERO",
+                            "reason": "active_field_unavailable",
+                            "detail": str(exc),
+                        }
+                    )
+                    continue
+                if os.path.abspath(constraint_design_dir) != os.path.abspath(
+                    virtual_context["design_dir"]
+                ):
+                    unsupported_records.append(
+                        {
+                            "name": name,
+                            "source": "AERO",
+                            "reason": "adjoint_baseline_mismatch",
+                            "field_design_dir": constraint_design_dir,
+                            "objective_design_dir": virtual_context["design_dir"],
+                        }
+                    )
+                    continue
+                field_file = _resolve_surface_sensitivity_file(
+                    constraint_adj_dir,
+                    name,
+                )
+                raw_field = load_surface_sensitivity_vector(
+                    field_file,
+                    baseline_state,
+                )
+                provider = "adjoint_surface_sensitivity"
+                if provider_value is None:
+                    unsupported_records.append(
+                        {
+                            "name": name,
+                            "source": "AERO",
+                            "reason": "current_value_unavailable",
+                            "field_file": field_file,
+                        }
+                    )
+                    continue
+                provider_metadata["projection_validation"] = (
+                    _validate_saved_surface_projection(
+                        baseline_state,
+                        raw_field,
+                        constraint_adj_dir,
+                        name,
+                    )
+                )
+
+            internal = internal_constraint_field(
+                spec,
+                provider_value,
+                raw_field,
+            )
+            constraint_records.append(
+                {
+                    "name": name,
+                    "source": (
+                        "GEOMETRY" if is_geometry_constraint_name(name) else "AERO"
+                    ),
+                    "function_name": name,
+                    "original_operator": str(spec.get("sign", "")),
+                    "target": spec.get("target"),
+                    "config_scale": float(spec.get("scale", 1.0)),
+                    "current_value": float(provider_value),
+                    "optimizer_current_value": status.get("current_value"),
+                    "provider": provider,
+                    "field_file": field_file,
+                    "provider_metadata": provider_metadata,
+                    **internal,
+                }
+            )
+
+    if unsupported_records:
+        details = "; ".join(
+            f"{record['name']}:{record['reason']}"
+            for record in unsupported_records
+        )
+        raise RuntimeError(
+            "Virtual FFD IKKT requires every active constraint field; " + details
+        )
+
+    virtual_context.update(
+        {
+            "initialized_node_ids": node_ids,
+            "objective_field": objective_field,
+            "objective_projection_validation": objective_projection_validation,
+            "constraint_records": constraint_records,
+            "inactive_constraints": inactive_records,
+            "unsupported_constraints": unsupported_records,
+            "progressive_thickness": {
+                "enabled": bool(opts.get("ffd_thickness_enabled", False)),
+                "included": False,
+                "reason": opts.get(
+                    "ffd_thickness_ikkt_exclusion_reason",
+                    "optimizer-only progressive constraint; excluded from FFD IKKT",
+                ),
+            },
+        }
+    )
+    return virtual_context
+
+
+def _virtual_ikkt_metadata(
+    virtual_context,
+    signal_source,
+    fit_diagnostics,
+    lambdas,
+    insertion_step,
+    insertion_target,
+):
+    included = []
+    for index, record in enumerate(virtual_context.get("constraint_records", [])):
+        item = {
+            key: value
+            for key, value in record.items()
+            if key != "field"
+        }
+        item["lambda"] = float(lambdas[index])
+        item["used_in_ikkt_gradient"] = True
+        included.append(item)
+    return {
+        "scoring_mode": VIRTUAL_TANGENT,
+        "signal_source": signal_source,
+        "insertion_step": int(insertion_step),
+        "insertion_target": int(insertion_target),
+        "objective_function": virtual_context["objective_function"],
+        "objective_field_file": virtual_context["objective_field_file"],
+        "objective_projection_validation": virtual_context.get(
+            "objective_projection_validation",
+            {"status": "reference_unavailable"},
+        ),
+        "sensitivity_metric": "DISCRETE_EUCLIDEAN",
+        "sensitivity_weighting": "NONE",
+        "sign_convention": "C_GE_ZERO_LAGRANGIAN_MINUS_LAMBDA_C",
+        "included_constraints": included,
+        "inactive_constraints": virtual_context.get("inactive_constraints", []),
+        "unsupported_constraints": virtual_context.get(
+            "unsupported_constraints", []
+        ),
+        "fit_diagnostics": fit_diagnostics,
+        "lambdas": np.asarray(lambdas, dtype=float).tolist(),
+        "progressive_thickness": virtual_context["progressive_thickness"],
+    }
+
+
+def _virtual_rejected_candidate(
+    raw,
+    candidate_number,
+    active_by_side,
+    opts,
+    obj_name,
+    signal_source,
+    insertion_step,
+    insertion_target,
+    reason,
+):
+    return {
+        "insertion_step": int(insertion_step),
+        "insertion_target": int(insertion_target),
+        "ndv_before_insertion": sum(
+            len(values) for values in active_by_side.values()
+        ),
+        "ndv_after_insertion": sum(
+            len(values) for values in active_by_side.values()
+        )
+        + 1,
+        "candidate_number": int(candidate_number),
+        "side": str(raw["side"]).upper(),
+        "x": float(raw["x"]),
+        "grad": 0.0,
+        "indicator": 0.0,
+        "interval_id": raw["interval_id"],
+        "interval_left": float(raw["interval_left"]),
+        "interval_right": float(raw["interval_right"]),
+        "sample_index": int(raw["sample_index"]),
+        "sample_fraction": float(raw["sample_fraction"]),
+        "candidate_dv_index": "",
+        "control_point_i": "",
+        "temporary_mesh": None,
+        "projection_artifacts": [],
+        "objective_function": obj_name,
+        "objective_gradient_component": 0.0,
+        "surface_residual_component": None,
+        "constraint_gradient_components": {},
+        "scoring_basis": "VIRTUAL_TANGENT_SPACE",
+        "ffd_scoring_mode": VIRTUAL_TANGENT,
+        "signal_source": signal_source,
+        "ffd_blending": normalize_ffd_blending(
+            opts.get("ffd_blending", BEZIER)
+        ),
+        "progressive_thickness_ikkt_included": False,
+        "admissible": False,
+        "rejected_reason": str(reason),
+        "nearest_center_or_boundary": raw.get(
+            "nearest_center_or_boundary", ""
+        ),
+        "nearest_distance": raw.get("nearest_distance", ""),
+        "required_spacing": raw.get("required_spacing", ""),
+    }
+
+
+def _compute_dual_virtual_tangent_candidate_scores_impl(
+    level,
+    opts,
+    cfg_level,
+    raw_candidates,
+    active_by_side,
+    virtual_context,
+    accepted_mesh=None,
+    insertion_step=1,
+    insertion_target=1,
+):
+    obj_name = str(cfg_level.get("OBJECTIVE_FUNCTION", "DRAG")).upper()
+    obj_adj_dir, design_dir = _find_real_adjoint_assets(level.workdir, obj_name)
+    real_dot_cfg_path, _ = _select_dot_config_path(obj_adj_dir, cfg_level)
+    real_dot_cfg = SU2.io.Config(real_dot_cfg_path)
+    dot_mesh_src = _find_projection_mesh_source(
+        str(real_dot_cfg["MESH_FILENAME"]),
+        obj_adj_dir,
+        design_dir,
+        level.workdir,
+    )
+    mesh_src = _resolve_accepted_projection_mesh(
+        accepted_mesh,
+        dot_mesh_src,
+        obj_adj_dir,
+        design_dir,
+        level.workdir,
+        opts.get("ffd_marker", "AIRFOIL"),
+        domain_mode=opts.get("ffd_domain_mode", "FULL"),
+        verbose=False,
+    )
+
+    baseline = _prepare_active_projection_variant(
+        level,
+        opts,
+        cfg_level,
+        real_dot_cfg,
+        mesh_src,
+        active_by_side,
+        (
+            f"{_exact_blending_slug(opts)}_virtual_step_"
+            f"{int(insertion_step):03d}_baseline"
+        ),
+        verbose=False,
+    )
+    try:
+        baseline_state = build_ffd_tangent_state(
+            baseline["mesh"],
+            opts["ffd_marker"],
+            active_by_side,
+            opts,
+        )
+        virtual_context = _initialize_virtual_tangent_context(
+            level,
+            opts,
+            baseline_state,
+            virtual_context,
+        )
+        indicator_mode = str(opts.get("adaptive_indicator", "ABS_GRAD")).upper()
+        if indicator_mode == "IKKT":
+            signal, lambdas, fit_diagnostics = fit_surface_ikkt_signal(
+                virtual_context["objective_field"],
+                virtual_context["constraint_records"],
+                baseline_state,
+            )
+            signal_source = (
+                "IKKT_SURFACE_RESIDUAL"
+                if len(virtual_context["constraint_records"])
+                else "OBJECTIVE_ONLY_NO_ACTIVE_CONSTRAINTS"
+            )
+        else:
+            signal = np.asarray(virtual_context["objective_field"], dtype=float)
+            lambdas = np.zeros(0, dtype=float)
+            fit_diagnostics = {
+                "status": "objective_only",
+                "objective_gradient": project_surface_field(
+                    baseline_state,
+                    signal,
+                ).tolist(),
+            }
+            signal_source = "OBJECTIVE_SURFACE_SENSITIVITY"
+        ikkt_metadata = _virtual_ikkt_metadata(
+            virtual_context,
+            signal_source,
+            fit_diagnostics,
+            lambdas,
+            insertion_step,
+            insertion_target,
+        )
+
+        candidates = []
+        best_candidate = None
+        for candidate_number, raw in enumerate(raw_candidates):
+            side = str(raw["side"]).upper()
+            x = float(raw["x"])
+            candidate_active = {
+                active_side: list(values)
+                for active_side, values in active_by_side.items()
+            }
+            candidate_active[side].append(x)
+            variant = None
+            candidate_suffix = (
+                f"{_exact_blending_slug(opts)}_virtual_step_"
+                f"{int(insertion_step):03d}_candidate_"
+                f"{candidate_number:04d}_{side.lower()}"
+            )
+            candidate_mesh_path = os.path.join(
+                level.workdir,
+                f"ffd_projection_level{level.level_id}_{candidate_suffix}.su2",
+            )
+            try:
+                variant = _prepare_active_projection_variant(
+                    level,
+                    opts,
+                    cfg_level,
+                    real_dot_cfg,
+                    mesh_src,
+                    candidate_active,
+                    candidate_suffix,
+                    verbose=False,
+                )
+                candidate_state = build_ffd_tangent_state(
+                    variant["mesh"],
+                    opts["ffd_marker"],
+                    candidate_active,
+                    opts,
+                )
+                metrics = compare_tangent_spaces(
+                    baseline_state,
+                    candidate_state,
+                    signal,
+                    x,
+                )
+            except (FFDBoxSplitError, FFDEnvelopeError, FFDTangentError) as exc:
+                _remove_artifact_path(
+                    variant.get("mesh") if variant is not None else candidate_mesh_path
+                )
+                candidates.append(
+                    _virtual_rejected_candidate(
+                        raw,
+                        candidate_number,
+                        active_by_side,
+                        opts,
+                        obj_name,
+                        signal_source,
+                        insertion_step,
+                        insertion_target,
+                        (
+                            "VIRTUAL_TANGENT_REEMBED_INVALID:"
+                            f"{type(exc).__name__}:{exc}"
+                        ),
+                    )
+                )
+                continue
+            candidate_dv_index = _dual_record_index(variant["records"], side, x)
+            objective_gradient = project_surface_field(
+                candidate_state,
+                virtual_context["objective_field"],
+            )
+            residual_gradient = project_surface_field(candidate_state, signal)
+            constraint_components = {}
+            for record in virtual_context["constraint_records"]:
+                projected = project_surface_field(candidate_state, record["field"])
+                constraint_components[record["name"]] = float(
+                    projected[candidate_dv_index]
+                )
+            control_mapping = variant["column_index_by_side"][side]
+            control_index = next(
+                int(value)
+                for station, value in control_mapping.items()
+                if abs(float(station) - x) <= 1.0e-10
+            )
+            admissible = bool(
+                int(metrics["rank_gain"]) == 1
+                and int(metrics["pure_rank"]) == 1
+            )
+            rejected_reason = raw.get("rejected_reason", "")
+            if not admissible:
+                rejected_reason = (
+                    "VIRTUAL_TANGENT_RANK_MISMATCH:"
+                    f"rank_gain={metrics['rank_gain']},pure_rank={metrics['pure_rank']}"
+                )
+            candidate = {
+                "insertion_step": int(insertion_step),
+                "insertion_target": int(insertion_target),
+                "ndv_before_insertion": sum(
+                    len(values) for values in active_by_side.values()
+                ),
+                "ndv_after_insertion": sum(
+                    len(values) for values in active_by_side.values()
+                )
+                + 1,
+                "candidate_number": int(candidate_number),
+                "side": side,
+                "x": x,
+                "grad": float(objective_gradient[candidate_dv_index]),
+                "indicator": float(metrics["score_net"]),
+                "interval_id": raw["interval_id"],
+                "interval_left": float(raw["interval_left"]),
+                "interval_right": float(raw["interval_right"]),
+                "sample_index": int(raw["sample_index"]),
+                "sample_fraction": float(raw["sample_fraction"]),
+                "candidate_dv_index": int(candidate_dv_index),
+                "control_point_i": control_index,
+                "temporary_mesh": variant["mesh"],
+                "projection_artifacts": [],
+                "objective_function": obj_name,
+                "objective_gradient_component": float(
+                    objective_gradient[candidate_dv_index]
+                ),
+                "surface_residual_component": float(
+                    residual_gradient[candidate_dv_index]
+                ),
+                "constraint_gradient_components": constraint_components,
+                "scoring_basis": "VIRTUAL_TANGENT_SPACE",
+                "ffd_scoring_mode": VIRTUAL_TANGENT,
+                "signal_source": signal_source,
+                "ffd_blending": normalize_ffd_blending(
+                    opts.get("ffd_blending", BEZIER)
+                ),
+                "progressive_thickness_ikkt_included": False,
+                "progressive_thickness_ikkt_exclusion_reason": opts.get(
+                    "ffd_thickness_ikkt_exclusion_reason",
+                    "excluded from FFD IKKT",
+                ),
+                "admissible": admissible,
+                "rejected_reason": rejected_reason,
+                "nearest_center_or_boundary": raw.get(
+                    "nearest_center_or_boundary", ""
+                ),
+                "nearest_distance": raw.get("nearest_distance", ""),
+                "required_spacing": raw.get("required_spacing", ""),
+                **metrics,
+            }
+            candidates.append(candidate)
+            if admissible and (
+                best_candidate is None
+                or _exact_candidate_rank_key(candidate)
+                < _exact_candidate_rank_key(best_candidate)
+            ):
+                if best_candidate is not None:
+                    _remove_candidate_artifacts(best_candidate)
+                best_candidate = candidate
+            else:
+                _remove_candidate_artifacts(candidate)
+
+        admissible_candidates = [
+            candidate for candidate in candidates if candidate.get("admissible", False)
+        ]
+        reduced_candidates = _reduce_candidates_to_interval_best(
+            admissible_candidates,
+            verbose=False,
+        )
+        ranked_candidates = sorted(
+            reduced_candidates,
+            key=_exact_candidate_rank_key,
+        )
+        for rank, candidate in enumerate(ranked_candidates, start=1):
+            candidate["rank"] = rank
+            candidate["interval_winner"] = True
+        for candidate in candidates:
+            candidate.setdefault("interval_winner", False)
+        if best_candidate is None or not ranked_candidates:
+            raise RuntimeError(
+                "Virtual FFD tangent scoring found no rank-one admissible candidate"
+            )
+        if ranked_candidates[0] is not best_candidate:
+            raise RuntimeError(
+                "Virtual FFD artifact retention disagrees with candidate ranking"
+            )
+        if float(best_candidate["indicator"]) <= 0.0:
+            print(
+                "[PROGRESSIVE_FFD_DUAL] VIRTUAL_TANGENT warning | all "
+                "admissible candidate scores are non-positive; selecting maximum "
+                f"score={float(best_candidate['indicator']):.6e}"
+            )
+        _print_exact_candidate_ranking(
+            ranked_candidates,
+            insertion_step=insertion_step,
+            insertion_target=insertion_target,
+        )
+        return {
+            "candidates": ranked_candidates,
+            "raw_candidates": candidates,
+            "scoring_basis": "VIRTUAL_TANGENT_SPACE",
+            "ffd_blending": normalize_ffd_blending(
+                opts.get("ffd_blending", BEZIER)
+            ),
+            "ikkt_constraint_names": [
+                record["name"] for record in virtual_context["constraint_records"]
+            ],
+            "ikkt_lambdas": np.asarray(lambdas, dtype=float).tolist(),
+            "ikkt_metadata": ikkt_metadata,
+            "selected_candidate": best_candidate,
+        }
+    finally:
+        _remove_artifact_path(baseline["mesh"])
 
 
 def _compute_dual_bezier_exact_candidate_scores_impl(
@@ -1748,6 +2580,12 @@ def _compute_dual_bezier_exact_candidate_scores_impl(
                 )
             },
             "scoring_basis": "EXACT_SEQUENTIAL_INSERTION",
+            "ffd_scoring_mode": COMPONENT,
+            "signal_source": (
+                "IKKT_COMPONENT_RESIDUAL"
+                if indicator_mode == "IKKT"
+                else "OBJECTIVE_COMPONENT_GRADIENT"
+            ),
             "ffd_blending": blending,
             "progressive_thickness_ikkt_included": False,
             "progressive_thickness_ikkt_exclusion_reason": opts.get(
@@ -1819,6 +2657,9 @@ def _compute_dual_bezier_exact_candidate_scores(
     """Run exact sequential scoring for BEZIER or BSPLINE_UNIFORM FFD."""
 
     blending = normalize_ffd_blending(opts.get("ffd_blending", BEZIER))
+    scoring_mode = normalize_ffd_scoring_mode(
+        opts.get("ffd_scoring_mode", COMPONENT)
+    )
     _cleanup_exact_scoring_artifacts(level, opts)
     try:
         insertion_target, interval_count = _exact_growth_ratio_insertion_target(
@@ -1835,6 +2676,7 @@ def _compute_dual_bezier_exact_candidate_scores(
                 "active_lower_scores": [],
                 "sequential_selection": True,
                 "scoring_basis": "EXACT_SEQUENTIAL_INSERTION",
+                "ffd_scoring_mode": scoring_mode,
                 "ffd_blending": blending,
                 "selected_candidates": [],
                 "selected_artifact_directory": None,
@@ -1844,6 +2686,20 @@ def _compute_dual_bezier_exact_candidate_scores(
             }
 
         indicator_mode = str(opts.get("adaptive_indicator", "ABS_GRAD")).upper()
+        virtual_context = None
+        if scoring_mode == VIRTUAL_TANGENT:
+            obj_name = str(cfg_level.get("OBJECTIVE_FUNCTION", "DRAG")).upper()
+            _obj_adj_dir, design_dir = _find_real_adjoint_assets(
+                level.workdir,
+                obj_name,
+            )
+            virtual_context = _prepare_virtual_tangent_context(
+                level,
+                opts,
+                cfg_level,
+                obj_name,
+                design_dir,
+            )
         configured_nadd_mode = str(
             opts.get("nadd_mode", "GROWTH_RATIO")
         ).upper()
@@ -1856,6 +2712,7 @@ def _compute_dual_bezier_exact_candidate_scores(
         print(
             "[PROGRESSIVE_FFD_DUAL] Entering adaptive scoring phase | "
             f"level={level.level_id} indicator={indicator_mode} "
+            f"scoring_mode={scoring_mode} "
             f"blending={blending} "
             f"intervals={interval_count} "
             f"samples_per_interval={int(opts.get('candidate_samples', 1))} "
@@ -1892,16 +2749,29 @@ def _compute_dual_bezier_exact_candidate_scores(
                 )
                 break
 
-            pass_result = _compute_dual_bezier_exact_candidate_scores_impl(
-                level,
-                opts,
-                cfg_level,
-                current_raw_candidates,
-                current_active,
-                accepted_mesh=accepted_mesh,
-                insertion_step=insertion_step,
-                insertion_target=insertion_target,
-            )
+            if scoring_mode == VIRTUAL_TANGENT:
+                pass_result = _compute_dual_virtual_tangent_candidate_scores_impl(
+                    level,
+                    opts,
+                    cfg_level,
+                    current_raw_candidates,
+                    current_active,
+                    virtual_context,
+                    accepted_mesh=accepted_mesh,
+                    insertion_step=insertion_step,
+                    insertion_target=insertion_target,
+                )
+            else:
+                pass_result = _compute_dual_bezier_exact_candidate_scores_impl(
+                    level,
+                    opts,
+                    cfg_level,
+                    current_raw_candidates,
+                    current_active,
+                    accepted_mesh=accepted_mesh,
+                    insertion_step=insertion_step,
+                    insertion_target=insertion_target,
+                )
             selected = pass_result["selected_candidate"]
             side = str(selected["side"]).upper()
             selected_x = float(selected["x"])
@@ -1960,7 +2830,12 @@ def _compute_dual_bezier_exact_candidate_scores(
             "active_upper_scores": [],
             "active_lower_scores": [],
             "sequential_selection": True,
-            "scoring_basis": "EXACT_SEQUENTIAL_INSERTION",
+            "scoring_basis": (
+                "VIRTUAL_TANGENT_SPACE"
+                if scoring_mode == VIRTUAL_TANGENT
+                else "EXACT_SEQUENTIAL_INSERTION"
+            ),
+            "ffd_scoring_mode": scoring_mode,
             "ffd_blending": blending,
             "selected_candidate": selected_candidates[0],
             "selected_candidates": selected_candidates,

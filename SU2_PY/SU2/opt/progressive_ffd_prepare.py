@@ -32,6 +32,11 @@ from SU2.opt.progressive_ffd_split import (
     split_bootstrap_ffd_box,
 )
 from SU2.opt.progressive_ffd_blending import BEZIER
+from SU2.opt.progressive_ffd_envelope import (
+    ADAPTIVE_CLEARANCE,
+    FIXED_OFFSET,
+    sample_envelope_curves,
+)
 
 
 class FFDPreparationError(RuntimeError):
@@ -111,6 +116,102 @@ def _atomic_write_text(path, text):
 
 def _atomic_write_json(path, payload):
     _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _write_adaptive_envelope_vtk(path, geometry, split_summary, opts):
+    """Write the true sampled FFD curves, not only the control lattice."""
+
+    profile = [
+        (
+            float(geometry["mesh"]["points"][node_id][0]),
+            float(geometry["mesh"]["points"][node_id][1]),
+        )
+        for node_id in geometry["node_ids"]
+    ]
+    if geometry.get("closed", False) and profile and profile[0] != profile[-1]:
+        profile.append(profile[0])
+
+    curve_groups = [(profile, 0)]
+    blending_spec = opts["ffd_blending_spec"]
+    if opts["ffd_domain_mode"] == "FULL":
+        box_specs = (
+            (
+                split_summary["columns"],
+                split_summary["upper_control_y"][0],
+                split_summary["upper_control_y"][1],
+                10,
+            ),
+            (
+                split_summary["columns"],
+                split_summary["lower_control_y"][1],
+                split_summary["lower_control_y"][0],
+                20,
+            ),
+        )
+    else:
+        control_y = split_summary["control_y"]
+        if split_summary["side"] == "UPPER":
+            inner_controls, outer_controls = control_y[0], control_y[1]
+        else:
+            inner_controls, outer_controls = control_y[1], control_y[0]
+        box_specs = (
+            (
+                split_summary["columns"],
+                inner_controls,
+                outer_controls,
+                10,
+            ),
+        )
+
+    for columns, inner_controls, outer_controls, label_base in box_specs:
+        inner, outer = sample_envelope_curves(
+            columns,
+            inner_controls,
+            outer_controls,
+            blending_spec,
+            count=1001,
+        )
+        curve_groups.extend(
+            [
+                (inner, label_base + 1),
+                (outer, label_base + 2),
+                ([inner[0], outer[0]], label_base + 3),
+                ([inner[-1], outer[-1]], label_base + 3),
+            ]
+        )
+
+    points = []
+    cells = []
+    labels = []
+    for group, label in curve_groups:
+        start = len(points)
+        points.extend((float(x), float(y), 0.0) for x, y in group)
+        cells.append(list(range(start, start + len(group))))
+        labels.append(int(label))
+
+    cell_size = sum(len(cell) + 1 for cell in cells)
+    lines = [
+        "# vtk DataFile Version 3.0\n",
+        "adaptive FFD envelope and profile\n",
+        "ASCII\n",
+        "DATASET POLYDATA\n",
+        f"POINTS {len(points)} float\n",
+    ]
+    lines.extend(f"{x:.15e} {y:.15e} {z:.15e}\n" for x, y, z in points)
+    lines.append(f"LINES {len(cells)} {cell_size}\n")
+    lines.extend(
+        str(len(cell)) + " " + " ".join(str(value) for value in cell) + "\n"
+        for cell in cells
+    )
+    lines.extend(
+        [
+            f"CELL_DATA {len(cells)}\n",
+            "SCALARS component int 1\n",
+            "LOOKUP_TABLE default\n",
+        ]
+    )
+    lines.extend(f"{label}\n" for label in labels)
+    _atomic_write_text(path, "".join(lines))
 
 
 def _format_marker_list(markers):
@@ -626,7 +727,7 @@ def _update_runtime_options(base_config, opts, prepared_mesh, geometry):
 
 
 def _build_prepare_request(source_mesh, prepared_mesh, geometry, opts):
-    return {
+    request = {
         "schema_version": 3,
         "raw_mesh": os.path.abspath(source_mesh),
         "raw_mesh_sha256": _sha256_file(source_mesh),
@@ -646,8 +747,6 @@ def _build_prepare_request(source_mesh, prepared_mesh, geometry, opts):
         ),
         "upper_tag": opts["ffd_upper_box_tag"],
         "lower_tag": opts["ffd_lower_box_tag"],
-        "upper_offset_chord": float(opts["ffd_upper_offset_chord"]),
-        "lower_offset_chord": float(opts["ffd_lower_offset_chord"]),
         "prepared_mesh": os.path.abspath(prepared_mesh),
         "smoke_test": bool(opts.get("ffd_prepare_smoke_test", True)),
         "ffd_blending": opts.get("ffd_blending", BEZIER),
@@ -655,6 +754,25 @@ def _build_prepare_request(source_mesh, prepared_mesh, geometry, opts):
             int(value) for value in opts.get("ffd_bspline_orders", (2, 2, 2))
         ],
     }
+    envelope_mode = opts.get("ffd_envelope_mode", FIXED_OFFSET)
+    if envelope_mode == FIXED_OFFSET:
+        request["upper_offset_chord"] = float(opts["ffd_upper_offset_chord"])
+        request["lower_offset_chord"] = float(opts["ffd_lower_offset_chord"])
+        return request
+
+    if envelope_mode != ADAPTIVE_CLEARANCE:
+        raise FFDPreparationError(
+            f"Unsupported progressive FFD envelope mode {envelope_mode!r}"
+        )
+    envelope_spec = opts.get("ffd_envelope_spec")
+    if envelope_spec is None:
+        raise FFDPreparationError(
+            "ADAPTIVE_CLEARANCE requires an FFD clearance specification"
+        )
+    request["schema_version"] = 4
+    request["envelope_mode"] = ADAPTIVE_CLEARANCE
+    request["clearance_profile"] = envelope_spec.as_dict()
+    return request
 
 
 def prepare_progressive_ffd_input(base_config, opts, partitions=1):
@@ -751,6 +869,10 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
         and os.path.isfile(prepared_mesh)
         and os.path.isfile(diagnostics_path)
     )
+    if opts.get("ffd_envelope_mode", FIXED_OFFSET) == ADAPTIVE_CLEARANCE:
+        cache_matches = cache_matches and os.path.isfile(
+            os.path.join(prep_dir, "ffd_envelope_curves.vtk")
+        )
     smoke_spec = _smoke_box_request(opts)
     other_markers, symmetry_markers = _marker_groups(geometry)
     if cache_matches:
@@ -897,6 +1019,7 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                 lower_tag=opts["ffd_lower_box_tag"],
                 upper_offset_chord=opts["ffd_upper_offset_chord"],
                 lower_offset_chord=opts["ffd_lower_offset_chord"],
+                envelope_spec=opts.get("ffd_envelope_spec"),
                 x_le=geometry["x_le"],
                 x_te=geometry["x_te"],
                 diagnostics_csv=staged_diagnostics,
@@ -917,6 +1040,7 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                     if side == "UPPER"
                     else opts["ffd_lower_offset_chord"]
                 ),
+                envelope_spec=opts.get("ffd_envelope_spec"),
                 box_tag=(
                     opts["ffd_upper_box_tag"]
                     if side == "UPPER"
@@ -934,6 +1058,18 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
             opts,
             context="Newly prepared FFD mesh",
         )
+        staged_envelope_vtk = None
+        if opts.get("ffd_envelope_mode", FIXED_OFFSET) == ADAPTIVE_CLEARANCE:
+            staged_envelope_vtk = os.path.join(
+                stage_dir,
+                "ffd_envelope_curves.vtk",
+            )
+            _write_adaptive_envelope_vtk(
+                staged_envelope_vtk,
+                geometry,
+                split_summary,
+                opts,
+            )
 
         coordinate_error, coordinate_point = _max_mesh_coordinate_difference(
             source_mesh,
@@ -992,6 +1128,10 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
         os.replace(staged_mesh, prepared_mesh)
         os.makedirs(os.path.dirname(diagnostics_path), exist_ok=True)
         os.replace(staged_diagnostics, diagnostics_path)
+        envelope_vtk = None
+        if staged_envelope_vtk is not None:
+            envelope_vtk = os.path.join(prep_dir, "ffd_envelope_curves.vtk")
+            os.replace(staged_envelope_vtk, envelope_vtk)
 
         result_payload = {
             "x_le": geometry["x_le"],
@@ -1011,7 +1151,12 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
             "smoke_coordinate_error": smoke_error,
             "ffd_blending": opts.get("ffd_blending", BEZIER),
             "bspline_orders": [int(value) for value in opts.get("ffd_bspline_orders", (2, 2, 2))],
+            "envelope_mode": opts.get("ffd_envelope_mode", FIXED_OFFSET),
         }
+        if opts.get("ffd_envelope_spec") is not None:
+            result_payload["clearance_profile"] = opts[
+                "ffd_envelope_spec"
+            ].as_dict()
         if opts["ffd_domain_mode"] == "FULL":
             result_payload.update(
                 {
@@ -1019,6 +1164,8 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                     "lower_surface_points": split_summary["lower_surface_points"],
                     "upper_max_error": split_summary["upper_max_reembedding_error"],
                     "lower_max_error": split_summary["lower_max_reembedding_error"],
+                    "upper_envelope": split_summary.get("upper_envelope"),
+                    "lower_envelope": split_summary.get("lower_envelope"),
                 }
             )
         else:
@@ -1027,6 +1174,7 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                     "surface_points": split_summary["surface_points"],
                     "max_error": split_summary["max_reembedding_error"],
                     "side": split_summary["side"],
+                    "envelope": split_summary.get("envelope"),
                 }
             )
         manifest_payload = {
@@ -1039,6 +1187,7 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
                     prep_dir, "bootstrap_ffd_setting.cfg"
                 ),
                 "bootstrap_log": os.path.join(prep_dir, "bootstrap_su2_def.log"),
+                "envelope_curve_vtk": envelope_vtk,
                 "smoke_config": smoke_artifacts.get("smoke_config"),
                 "smoke_log": smoke_artifacts.get("smoke_log"),
                 **{

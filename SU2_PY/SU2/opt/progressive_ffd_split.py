@@ -50,10 +50,93 @@ from SU2.opt.progressive_ffd_blending import (
     make_blending_spec,
     validate_blending_spec,
 )
+from SU2.opt.progressive_ffd_envelope import (
+    ADAPTIVE_CLEARANCE,
+    FIXED_OFFSET,
+    FFDClearanceSpec,
+    FFDEnvelopeError,
+    build_adaptive_outer_row,
+)
 
 
 class FFDBoxSplitError(FFDMeshError):
     """Raised when a bootstrap FFD box cannot be split safely."""
+
+
+def _resolve_envelope_mode(offset_chord, envelope_spec, label):
+    if envelope_spec is not None:
+        if offset_chord is not None:
+            raise FFDBoxSplitError(
+                f"{label} cannot combine a fixed chord offset with an adaptive "
+                "clearance envelope"
+            )
+        if not isinstance(envelope_spec, FFDClearanceSpec):
+            raise FFDBoxSplitError(
+                f"{label} envelope_spec must be an FFDClearanceSpec"
+            )
+        return ADAPTIVE_CLEARANCE, None
+
+    if offset_chord is None:
+        raise FFDBoxSplitError(
+            f"{label} requires either offset_chord or envelope_spec"
+        )
+    offset_chord = float(offset_chord)
+    if not math.isfinite(offset_chord) or offset_chord <= 0.0:
+        raise FFDBoxSplitError(f"{label} chord offset must be positive")
+    return FIXED_OFFSET, offset_chord
+
+
+def _build_outer_row(
+    *,
+    columns,
+    inner_controls,
+    surface_y,
+    surface_x,
+    x_le,
+    x_te,
+    chord,
+    side,
+    blending_spec,
+    offset_chord,
+    envelope_spec,
+    label,
+):
+    mode, offset_chord = _resolve_envelope_mode(
+        offset_chord,
+        envelope_spec,
+        label,
+    )
+    side_upper = str(side).strip().upper() == "UPPER"
+    surface_controls = [float(surface_y(x)) for x in columns]
+    if mode == FIXED_OFFSET:
+        delta = float(offset_chord) * float(chord)
+        outer = [
+            value + delta if side_upper else value - delta
+            for value in surface_controls
+        ]
+        return outer, {
+            "mode": FIXED_OFFSET,
+            "offset_chord": float(offset_chord),
+        }
+
+    try:
+        result = build_adaptive_outer_row(
+            columns=columns,
+            inner_controls=inner_controls,
+            surface_y=surface_y,
+            surface_x=surface_x,
+            x_le=x_le,
+            x_te=x_te,
+            chord=chord,
+            side=side,
+            blending_spec=blending_spec,
+            clearance_spec=envelope_spec,
+        )
+    except FFDEnvelopeError as exc:
+        raise FFDBoxSplitError(f"{label} adaptive envelope failed: {exc}") from exc
+    result = dict(result)
+    result["mode"] = ADAPTIVE_CLEARANCE
+    return list(result.pop("outer_controls")), result
 
 
 def _atomic_write_lines(path, lines):
@@ -1038,7 +1121,8 @@ def rewrite_single_ffd_box_with_columns_and_reembed(
     side,
     box_tag,
     columns,
-    offset_chord,
+    offset_chord=None,
+    envelope_spec=None,
     diagnostics_csv=None,
     overwrite=False,
 ):
@@ -1050,9 +1134,11 @@ def rewrite_single_ffd_box_with_columns_and_reembed(
         raise FFDBoxSplitError(
             f"Single FFD side must be 'upper' or 'lower', got {side!r}"
         )
-    offset_chord = float(offset_chord)
-    if not math.isfinite(offset_chord) or offset_chord <= 0.0:
-        raise FFDBoxSplitError("Single FFD chord offset must be positive")
+    envelope_mode, offset_chord = _resolve_envelope_mode(
+        offset_chord,
+        envelope_spec,
+        "Single FFD rewrite",
+    )
     box_tag = _normalize_tag(box_tag)
     if not box_tag:
         raise FFDBoxSplitError("Single FFD box tag must be non-empty")
@@ -1157,36 +1243,55 @@ def rewrite_single_ffd_box_with_columns_and_reembed(
         alpha = (float(x) - float(x_le)) / float(chord)
         return y_le + alpha * (y_te - y_le)
 
-    surface_y = _make_linear_interpolant(
-        [
-            (mesh["points"][node_id][0], mesh["points"][node_id][1])
-            for node_id in ordered_node_ids
-        ],
-        edge_tol,
-    )
+    surface_samples = [
+        (mesh["points"][node_id][0], mesh["points"][node_id][1])
+        for node_id in ordered_node_ids
+    ]
+    surface_y = _make_linear_interpolant(surface_samples, edge_tol)
     inner_values = [float(inner_y(x)) for x in columns]
     surface_values = [float(surface_y(x)) for x in columns]
-    delta = offset_chord * chord
     if side == "upper":
         if any(
             value < inner - edge_tol
             for value, inner in zip(surface_values, inner_values)
         ):
             raise FFDBoxSplitError("HALF_UPPER marker crosses below its LE-TE line")
-        control_y = [
-            inner_values,
-            [value + delta for value in surface_values],
-        ]
+        outer_values, envelope_summary = _build_outer_row(
+            columns=columns,
+            inner_controls=inner_values,
+            surface_y=surface_y,
+            surface_x=[sample[0] for sample in surface_samples],
+            x_le=x_le,
+            x_te=x_te,
+            chord=chord,
+            side="UPPER",
+            blending_spec=blending_spec,
+            offset_chord=offset_chord,
+            envelope_spec=envelope_spec,
+            label="Single upper FFD rewrite",
+        )
+        control_y = [inner_values, outer_values]
     else:
         if any(
             value > inner + edge_tol
             for value, inner in zip(surface_values, inner_values)
         ):
             raise FFDBoxSplitError("HALF_LOWER marker crosses above its LE-TE line")
-        control_y = [
-            [value - delta for value in surface_values],
-            inner_values,
-        ]
+        outer_values, envelope_summary = _build_outer_row(
+            columns=columns,
+            inner_controls=inner_values,
+            surface_y=surface_y,
+            surface_x=[sample[0] for sample in surface_samples],
+            x_le=x_le,
+            x_te=x_te,
+            chord=chord,
+            side="LOWER",
+            blending_spec=blending_spec,
+            offset_chord=offset_chord,
+            envelope_spec=envelope_spec,
+            label="Single lower FFD rewrite",
+        )
+        control_y = [outer_values, inner_values]
 
     reconstruction_tol = 1.0e-10 * max(1.0, float(chord))
     templates = _parse_curved_surface_lines(
@@ -1315,6 +1420,8 @@ def rewrite_single_ffd_box_with_columns_and_reembed(
         "max_reembedding_error": max_error,
         "blending": blending_spec.kind,
         "bspline_orders": list(blending_spec.orders),
+        "envelope_mode": envelope_mode,
+        "envelope": envelope_summary,
     }
     print(
         "[PROGRESSIVE_FFD_SINGLE] Rewritten | "
@@ -1333,23 +1440,28 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
     lower_tag,
     upper_columns,
     lower_columns,
-    upper_offset_chord,
-    lower_offset_chord,
+    upper_offset_chord=None,
+    lower_offset_chord=None,
+    envelope_spec=None,
     diagnostics_csv=None,
     overwrite=False,
 ):
     """Rewrite two curved independent boxes on the current physical surface."""
 
     _validate_output_path(mesh_in, mesh_out, overwrite)
-    upper_offset_chord = float(upper_offset_chord)
-    lower_offset_chord = float(lower_offset_chord)
-    if (
-        not math.isfinite(upper_offset_chord)
-        or not math.isfinite(lower_offset_chord)
-        or upper_offset_chord <= 0.0
-        or lower_offset_chord <= 0.0
-    ):
-        raise FFDBoxSplitError("Upper and lower chord offsets must be positive")
+    upper_mode, upper_offset_chord = _resolve_envelope_mode(
+        upper_offset_chord,
+        envelope_spec,
+        "Upper dual FFD rewrite",
+    )
+    lower_mode, lower_offset_chord = _resolve_envelope_mode(
+        lower_offset_chord,
+        envelope_spec,
+        "Lower dual FFD rewrite",
+    )
+    if upper_mode != lower_mode:
+        raise FFDBoxSplitError("Upper and lower FFD envelope modes must match")
+    envelope_mode = upper_mode
 
     upper_tag = _normalize_tag(upper_tag)
     lower_tag = _normalize_tag(lower_tag)
@@ -1500,8 +1612,6 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
 
     def _control_rows(columns):
         camber_values = []
-        upper_outer_values = []
-        lower_outer_values = []
         for x in columns:
             yu = float(upper_y(x))
             yl = float(lower_y(x))
@@ -1512,12 +1622,38 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
                 )
             camber = 0.5 * (yu + yl)
             camber_values.append(camber)
-            upper_outer_values.append(yu + upper_offset_chord * chord)
-            lower_outer_values.append(yl - lower_offset_chord * chord)
-        return camber_values, upper_outer_values, lower_outer_values
+        return camber_values
 
-    upper_camber, upper_outer, _ = _control_rows(upper_columns)
-    lower_camber, _, lower_outer = _control_rows(lower_columns)
+    upper_camber = _control_rows(upper_columns)
+    lower_camber = _control_rows(lower_columns)
+    upper_outer, upper_envelope = _build_outer_row(
+        columns=upper_columns,
+        inner_controls=upper_camber,
+        surface_y=upper_y,
+        surface_x=[sample[0] for sample in upper_samples],
+        x_le=x_le,
+        x_te=x_te,
+        chord=chord,
+        side="UPPER",
+        blending_spec=blending_spec,
+        offset_chord=upper_offset_chord,
+        envelope_spec=envelope_spec,
+        label="Upper dual FFD rewrite",
+    )
+    lower_outer, lower_envelope = _build_outer_row(
+        columns=lower_columns,
+        inner_controls=lower_camber,
+        surface_y=lower_y,
+        surface_x=[sample[0] for sample in lower_samples],
+        x_le=x_le,
+        x_te=x_te,
+        chord=chord,
+        side="LOWER",
+        blending_spec=blending_spec,
+        offset_chord=lower_offset_chord,
+        envelope_spec=envelope_spec,
+        label="Lower dual FFD rewrite",
+    )
     upper_control_y = [upper_camber, upper_outer]
     lower_control_y = [lower_outer, lower_camber]
 
@@ -1698,6 +1834,8 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
         "lower_column_index_by_x": {
             float(x): index for index, x in enumerate(lower_columns)
         },
+        "upper_control_y": [list(row) for row in upper_control_y],
+        "lower_control_y": [list(row) for row in lower_control_y],
         "upper_surface_points": len(upper_surface_lines),
         "lower_surface_points": len(lower_surface_lines),
         "fixed_edge_points": len(edge_node_ids),
@@ -1705,6 +1843,9 @@ def rewrite_dual_ffd_boxes_with_columns_and_reembed(
         "lower_max_reembedding_error": lower_max_error,
         "blending": blending_spec.kind,
         "bspline_orders": list(blending_spec.orders),
+        "envelope_mode": envelope_mode,
+        "upper_envelope": upper_envelope,
+        "lower_envelope": lower_envelope,
     }
     print(
         "[PROGRESSIVE_FFD_DUAL] Rewritten | "
@@ -1721,8 +1862,9 @@ def split_bootstrap_ffd_box(
     *,
     bootstrap_tag,
     marker,
-    upper_offset_chord,
-    lower_offset_chord,
+    upper_offset_chord=None,
+    lower_offset_chord=None,
+    envelope_spec=None,
     upper_tag="UPPER_BOX",
     lower_tag="LOWER_BOX",
     x_le=None,
@@ -1735,15 +1877,19 @@ def split_bootstrap_ffd_box(
     """Replace one bootstrap FFD box with independent curved upper/lower boxes."""
 
     _validate_output_path(mesh_in, mesh_out, overwrite)
-    upper_offset_chord = float(upper_offset_chord)
-    lower_offset_chord = float(lower_offset_chord)
-    if (
-        not math.isfinite(upper_offset_chord)
-        or not math.isfinite(lower_offset_chord)
-        or upper_offset_chord <= 0.0
-        or lower_offset_chord <= 0.0
-    ):
-        raise FFDBoxSplitError("Upper and lower chord offsets must be positive")
+    upper_mode, upper_offset_chord = _resolve_envelope_mode(
+        upper_offset_chord,
+        envelope_spec,
+        "Upper bootstrap FFD split",
+    )
+    lower_mode, lower_offset_chord = _resolve_envelope_mode(
+        lower_offset_chord,
+        envelope_spec,
+        "Lower bootstrap FFD split",
+    )
+    if upper_mode != lower_mode:
+        raise FFDBoxSplitError("Upper and lower FFD envelope modes must match")
+    envelope_mode = upper_mode
     upper_tag = _normalize_tag(upper_tag)
     lower_tag = _normalize_tag(lower_tag)
     if not upper_tag or not lower_tag:
@@ -1961,12 +2107,7 @@ def split_bootstrap_ffd_box(
 
     upper_y = _make_linear_interpolant(upper_samples, edge_tol)
     lower_y = _make_linear_interpolant(lower_samples, edge_tol)
-    delta_upper = upper_offset_chord * chord
-    delta_lower = lower_offset_chord * chord
-
     camber_values = []
-    upper_outer_values = []
-    lower_outer_values = []
     for x in columns:
         yu = float(upper_y(x))
         yl = float(lower_y(x))
@@ -1977,8 +2118,35 @@ def split_bootstrap_ffd_box(
             )
         camber = 0.5 * (yu + yl)
         camber_values.append(camber)
-        upper_outer_values.append(yu + delta_upper)
-        lower_outer_values.append(yl - delta_lower)
+
+    upper_outer_values, upper_envelope = _build_outer_row(
+        columns=columns,
+        inner_controls=camber_values,
+        surface_y=upper_y,
+        surface_x=[sample[0] for sample in upper_samples],
+        x_le=x_le,
+        x_te=x_te,
+        chord=chord,
+        side="UPPER",
+        blending_spec=output_spec,
+        offset_chord=upper_offset_chord,
+        envelope_spec=envelope_spec,
+        label="Upper bootstrap FFD split",
+    )
+    lower_outer_values, lower_envelope = _build_outer_row(
+        columns=columns,
+        inner_controls=camber_values,
+        surface_y=lower_y,
+        surface_x=[sample[0] for sample in lower_samples],
+        x_le=x_le,
+        x_te=x_te,
+        chord=chord,
+        side="LOWER",
+        blending_spec=output_spec,
+        offset_chord=lower_offset_chord,
+        envelope_spec=envelope_spec,
+        label="Lower bootstrap FFD split",
+    )
 
     upper_control_y = [camber_values, upper_outer_values]
     lower_control_y = [lower_outer_values, camber_values]
@@ -2132,6 +2300,8 @@ def split_bootstrap_ffd_box(
         "x_te": float(x_te),
         "chord": float(chord),
         "columns": columns,
+        "upper_control_y": [list(row) for row in upper_control_y],
+        "lower_control_y": [list(row) for row in lower_control_y],
         "upper_surface_points": len(upper_surface_lines),
         "lower_surface_points": len(lower_surface_lines),
         "fixed_edge_points": len(edge_node_ids),
@@ -2139,6 +2309,9 @@ def split_bootstrap_ffd_box(
         "lower_max_reembedding_error": lower_max_error,
         "blending": output_spec.kind,
         "bspline_orders": list(output_spec.orders),
+        "envelope_mode": envelope_mode,
+        "upper_envelope": upper_envelope,
+        "lower_envelope": lower_envelope,
     }
     print(
         "[PROGRESSIVE_FFD_SPLIT] Completed | "
@@ -2159,7 +2332,8 @@ def build_single_surface_ffd_box(
     bootstrap_tag,
     marker,
     side,
-    offset_chord,
+    offset_chord=None,
+    envelope_spec=None,
     box_tag=None,
     x_le=None,
     x_te=None,
@@ -2176,9 +2350,11 @@ def build_single_surface_ffd_box(
         raise FFDBoxSplitError(
             f"Single FFD side must be 'upper' or 'lower', got {side!r}"
         )
-    offset_chord = float(offset_chord)
-    if not math.isfinite(offset_chord) or offset_chord <= 0.0:
-        raise FFDBoxSplitError("Single FFD chord offset must be positive")
+    envelope_mode, offset_chord = _resolve_envelope_mode(
+        offset_chord,
+        envelope_spec,
+        "Single bootstrap FFD box",
+    )
     if box_tag is None:
         box_tag = "UPPER_BOX" if side == "upper" else "LOWER_BOX"
     box_tag = _normalize_tag(box_tag)
@@ -2362,23 +2538,44 @@ def build_single_surface_ffd_box(
         for node_id in ordered_node_ids
     ]
     surface_y = _make_linear_interpolant(surface_samples, edge_tol)
-    delta = offset_chord * chord
     inner_values = [float(inner_y(x)) for x in columns]
     surface_values = [float(surface_y(x)) for x in columns]
     if side == "upper":
         if any(y < inner - edge_tol for y, inner in zip(surface_values, inner_values)):
             raise FFDBoxSplitError("HALF_UPPER marker crosses below its LE-TE line")
-        control_y = [
-            inner_values,
-            [value + delta for value in surface_values],
-        ]
+        outer_values, envelope_summary = _build_outer_row(
+            columns=columns,
+            inner_controls=inner_values,
+            surface_y=surface_y,
+            surface_x=[sample[0] for sample in surface_samples],
+            x_le=x_le,
+            x_te=x_te,
+            chord=chord,
+            side="UPPER",
+            blending_spec=output_spec,
+            offset_chord=offset_chord,
+            envelope_spec=envelope_spec,
+            label="Single upper bootstrap FFD box",
+        )
+        control_y = [inner_values, outer_values]
     else:
         if any(y > inner + edge_tol for y, inner in zip(surface_values, inner_values)):
             raise FFDBoxSplitError("HALF_LOWER marker crosses above its LE-TE line")
-        control_y = [
-            [value - delta for value in surface_values],
-            inner_values,
-        ]
+        outer_values, envelope_summary = _build_outer_row(
+            columns=columns,
+            inner_controls=inner_values,
+            surface_y=surface_y,
+            surface_x=[sample[0] for sample in surface_samples],
+            x_le=x_le,
+            x_te=x_te,
+            chord=chord,
+            side="LOWER",
+            blending_spec=output_spec,
+            offset_chord=offset_chord,
+            envelope_spec=envelope_spec,
+            label="Single lower bootstrap FFD box",
+        )
+        control_y = [outer_values, inner_values]
 
     old_axes = {
         "columns": columns,
@@ -2496,11 +2693,14 @@ def build_single_surface_ffd_box(
         "x_te": float(x_te),
         "chord": float(chord),
         "columns": columns,
+        "control_y": [list(row) for row in control_y],
         "surface_points": len(surface_lines),
         "fixed_edge_points": len(edge_node_ids),
         "max_reembedding_error": max_error,
         "blending": output_spec.kind,
         "bspline_orders": list(output_spec.orders),
+        "envelope_mode": envelope_mode,
+        "envelope": envelope_summary,
     }
     print(
         "[PROGRESSIVE_FFD_SINGLE] Completed | "

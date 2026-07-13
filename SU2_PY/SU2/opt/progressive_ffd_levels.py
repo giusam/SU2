@@ -57,6 +57,11 @@ def _remove_ffd_progressive_keys(cfg):
         "PROGRESSIVE_FFD_LOWER_BOX_TAG",
         "PROGRESSIVE_FFD_UPPER_OFFSET_CHORD",
         "PROGRESSIVE_FFD_LOWER_OFFSET_CHORD",
+        "PROGRESSIVE_FFD_ENVELOPE_MODE",
+        "PROGRESSIVE_FFD_CLEARANCE_LE_CHORD",
+        "PROGRESSIVE_FFD_CLEARANCE_TRANSITION_START",
+        "PROGRESSIVE_FFD_CLEARANCE_TRANSITION_END",
+        "PROGRESSIVE_FFD_CLEARANCE_TE_CHORD",
         "PROGRESSIVE_FFD_REFINEMENT_COUPLING",
     ]
     for key in progressive_keys:
@@ -386,6 +391,7 @@ def _prepare_ffd_mesh(cfg, level, opts):
             lower_columns=lower_mesh_columns,
             upper_offset_chord=opts["ffd_upper_offset_chord"],
             lower_offset_chord=opts["ffd_lower_offset_chord"],
+            envelope_spec=opts.get("ffd_envelope_spec"),
             diagnostics_csv=False,
             overwrite=True,
         )
@@ -428,6 +434,7 @@ def _prepare_ffd_mesh(cfg, level, opts):
             box_tag=opts["ffd_box_tag"],
             columns=mesh_columns,
             offset_chord=offset,
+            envelope_spec=opts.get("ffd_envelope_spec"),
             diagnostics_csv=False,
             overwrite=True,
         )

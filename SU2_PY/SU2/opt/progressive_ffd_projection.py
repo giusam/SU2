@@ -973,6 +973,7 @@ def _prepare_projection_variant(
                 lower_columns=lower_mesh_columns,
                 upper_offset_chord=opts["ffd_upper_offset_chord"],
                 lower_offset_chord=opts["ffd_lower_offset_chord"],
+                envelope_spec=opts.get("ffd_envelope_spec"),
                 diagnostics_csv=False,
                 overwrite=True,
             )
@@ -1006,6 +1007,7 @@ def _prepare_projection_variant(
                 box_tag=box_tag,
                 columns=mesh_columns,
                 offset_chord=offset,
+                envelope_spec=opts.get("ffd_envelope_spec"),
                 diagnostics_csv=False,
                 overwrite=True,
             )
@@ -2101,6 +2103,7 @@ def _compute_dual_ffd_dot_candidate_scores(level, opts, mesh_source=None):
         lower_columns=lower_mesh_columns,
         upper_offset_chord=opts["ffd_upper_offset_chord"],
         lower_offset_chord=opts["ffd_lower_offset_chord"],
+        envelope_spec=opts.get("ffd_envelope_spec"),
         diagnostics_csv=False,
         overwrite=True,
     )

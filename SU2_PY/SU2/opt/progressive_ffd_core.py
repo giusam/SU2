@@ -13,6 +13,13 @@ from SU2.opt.progressive_ffd_blending import (
     parse_bspline_orders,
     validate_blending_spec,
 )
+from SU2.opt.progressive_ffd_envelope import (
+    ADAPTIVE_CLEARANCE,
+    FIXED_OFFSET,
+    FFDClearanceSpec,
+    FFDEnvelopeError,
+    normalize_ffd_envelope_mode,
+)
 
 
 class FFDLevel:
@@ -475,12 +482,68 @@ def get_progressive_ffd_options(config, hh_opts):
     lower_box_tag = str(
         config.get("PROGRESSIVE_FFD_LOWER_BOX_TAG", "LOWER_BOX")
     ).strip()
-    upper_offset_chord = float(
-        config.get("PROGRESSIVE_FFD_UPPER_OFFSET_CHORD", 0.05)
+    try:
+        envelope_mode = normalize_ffd_envelope_mode(
+            config.get("PROGRESSIVE_FFD_ENVELOPE_MODE", FIXED_OFFSET)
+        )
+    except FFDEnvelopeError as exc:
+        raise ValueError(str(exc)) from exc
+    fixed_offset_keys = (
+        "PROGRESSIVE_FFD_UPPER_OFFSET_CHORD",
+        "PROGRESSIVE_FFD_LOWER_OFFSET_CHORD",
     )
-    lower_offset_chord = float(
-        config.get("PROGRESSIVE_FFD_LOWER_OFFSET_CHORD", 0.05)
+    adaptive_clearance_keys = (
+        "PROGRESSIVE_FFD_CLEARANCE_LE_CHORD",
+        "PROGRESSIVE_FFD_CLEARANCE_TRANSITION_START",
+        "PROGRESSIVE_FFD_CLEARANCE_TRANSITION_END",
+        "PROGRESSIVE_FFD_CLEARANCE_TE_CHORD",
     )
+    if envelope_mode == FIXED_OFFSET:
+        conflicting = [key for key in adaptive_clearance_keys if key in config]
+        if conflicting:
+            raise ValueError(
+                "FIXED_OFFSET cannot be combined with adaptive clearance keys: "
+                + ", ".join(conflicting)
+            )
+        upper_offset_chord = float(
+            config.get("PROGRESSIVE_FFD_UPPER_OFFSET_CHORD", 0.05)
+        )
+        lower_offset_chord = float(
+            config.get("PROGRESSIVE_FFD_LOWER_OFFSET_CHORD", 0.05)
+        )
+        envelope_spec = None
+    else:
+        conflicting = [key for key in fixed_offset_keys if key in config]
+        if conflicting:
+            raise ValueError(
+                "ADAPTIVE_CLEARANCE cannot be combined with fixed offset keys: "
+                + ", ".join(conflicting)
+            )
+        upper_offset_chord = None
+        lower_offset_chord = None
+        try:
+            envelope_spec = FFDClearanceSpec(
+                leading_chord=float(
+                    config.get("PROGRESSIVE_FFD_CLEARANCE_LE_CHORD", 0.005)
+                ),
+                transition_start=float(
+                    config.get(
+                        "PROGRESSIVE_FFD_CLEARANCE_TRANSITION_START", 0.10
+                    )
+                ),
+                transition_end=float(
+                    config.get(
+                        "PROGRESSIVE_FFD_CLEARANCE_TRANSITION_END", 0.20
+                    )
+                ),
+                trailing_chord=float(
+                    config.get("PROGRESSIVE_FFD_CLEARANCE_TE_CHORD", 0.01)
+                ),
+            )
+        except FFDEnvelopeError as exc:
+            raise ValueError(
+                f"Invalid progressive FFD clearance profile: {exc}"
+            ) from exc
     refinement_coupling = str(
         config.get("PROGRESSIVE_FFD_REFINEMENT_COUPLING", "INDEPENDENT")
     ).strip().upper()
@@ -558,14 +621,15 @@ def get_progressive_ffd_options(config, hh_opts):
         raise ValueError(
             "PROGRESSIVE_FFD_BOOTSTRAP_Y_PADDING_CHORD must be positive"
         )
-    if "UPPER" in active_sides and (
-        not math.isfinite(upper_offset_chord) or upper_offset_chord <= 0.0
-    ):
-        raise ValueError("PROGRESSIVE_FFD_UPPER_OFFSET_CHORD must be positive")
-    if "LOWER" in active_sides and (
-        not math.isfinite(lower_offset_chord) or lower_offset_chord <= 0.0
-    ):
-        raise ValueError("PROGRESSIVE_FFD_LOWER_OFFSET_CHORD must be positive")
+    if envelope_mode == FIXED_OFFSET:
+        if "UPPER" in active_sides and (
+            not math.isfinite(upper_offset_chord) or upper_offset_chord <= 0.0
+        ):
+            raise ValueError("PROGRESSIVE_FFD_UPPER_OFFSET_CHORD must be positive")
+        if "LOWER" in active_sides and (
+            not math.isfinite(lower_offset_chord) or lower_offset_chord <= 0.0
+        ):
+            raise ValueError("PROGRESSIVE_FFD_LOWER_OFFSET_CHORD must be positive")
     if refinement_coupling != "INDEPENDENT":
         raise NotImplementedError(
             "PROGRESSIVE_FFD_REFINEMENT_COUPLING currently supports only "
@@ -756,6 +820,8 @@ def get_progressive_ffd_options(config, hh_opts):
             "ffd_lower_box_tag": lower_box_tag,
             "ffd_upper_offset_chord": upper_offset_chord,
             "ffd_lower_offset_chord": lower_offset_chord,
+            "ffd_envelope_mode": envelope_mode,
+            "ffd_envelope_spec": envelope_spec,
             "ffd_refinement_coupling": refinement_coupling,
             "ffd_initial_columns": initial_columns,
             "ffd_initial_interior_columns": initial_interior_columns,
@@ -777,6 +843,12 @@ def get_progressive_ffd_options(config, hh_opts):
         print(f"[PROGRESSIVE_FFD] marker = {marker}")
         print(f"[PROGRESSIVE_FFD] domain mode = {domain_mode}")
         print(f"[PROGRESSIVE_FFD] blending = {blending_spec.kind}")
+        print(f"[PROGRESSIVE_FFD] envelope mode = {envelope_mode}")
+        if envelope_spec is not None:
+            print(
+                "[PROGRESSIVE_FFD] clearance profile = "
+                f"{envelope_spec.as_dict()}"
+            )
         print(
             "[PROGRESSIVE_FFD] optimize offset endpoints = "
             f"{'YES' if optimize_offset_endpoints else 'NO'}"

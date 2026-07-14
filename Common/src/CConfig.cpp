@@ -2437,6 +2437,16 @@ void CConfig::SetConfig_Options() {
    - FFD_CAMBER ( FFDBox ID, i_Ind, j_Ind )
    - FFD_THICKNESS ( FFDBox ID, i_Ind, j_Ind ) */
   addDVParamOption("DV_PARAM", nDV, ParamDV, FFDTag, Design_Variable);
+  /* DESCRIPTION: Uniform exponent of the Hicks-Henne bump function */
+  addDoubleOption("HICKS_HENNE_T2", HicksHenne_T2, 1.0);
+  /* DESCRIPTION: Select the Hicks-Henne exponent according to the bump center */
+  addBoolOption("HICKS_HENNE_T2_BY_CENTER", HicksHenne_T2_ByCenter, false);
+  /* DESCRIPTION: Hicks-Henne exponent for bump centers at or forward of the switch */
+  addDoubleOption("HICKS_HENNE_T2_FORWARD", HicksHenne_T2_Forward, 3.0);
+  /* DESCRIPTION: Hicks-Henne exponent for bump centers aft of the switch */
+  addDoubleOption("HICKS_HENNE_T2_AFT", HicksHenne_T2_Aft, 1.0);
+  /* DESCRIPTION: Center coordinate separating forward and aft Hicks-Henne exponents */
+  addDoubleOption("HICKS_HENNE_T2_SWITCH_X", HicksHenne_T2_SwitchX, 0.5);
   /* DESCRIPTION: New value of the shape deformation */
   addDVValueOption("DV_VALUE", nDV_Value, DV_Value, nDV, ParamDV, Design_Variable);
   /* DESCRIPTION: Provide a file of surface positions from an external parameterization. */
@@ -3488,6 +3498,33 @@ void CConfig::SetPostprocessing(SU2_COMPONENT val_software, unsigned short val_i
                     (Kind_FluidModel == SU2_NONEQ));
   bool standard_air = ((Kind_FluidModel == STANDARD_AIR));
   bool nemo = GetNEMOProblem();
+
+  bool hicks_henne_active = false;
+  for (unsigned short iDV = 0; iDV < nDV; ++iDV) {
+    if (Design_Variable[iDV] == HICKS_HENNE) {
+      hicks_henne_active = true;
+      break;
+    }
+  }
+
+  if (hicks_henne_active) {
+    if (HicksHenne_T2_ByCenter) {
+      const auto t2_forward = SU2_TYPE::GetValue(HicksHenne_T2_Forward);
+      const auto t2_aft = SU2_TYPE::GetValue(HicksHenne_T2_Aft);
+      const auto switch_x = SU2_TYPE::GetValue(HicksHenne_T2_SwitchX);
+      if (!std::isfinite(t2_forward) || !(t2_forward > 0.0))
+        SU2_MPI::Error("HICKS_HENNE_T2_FORWARD must be finite and greater than zero.", CURRENT_FUNCTION);
+      if (!std::isfinite(t2_aft) || !(t2_aft > 0.0))
+        SU2_MPI::Error("HICKS_HENNE_T2_AFT must be finite and greater than zero.", CURRENT_FUNCTION);
+      if (!std::isfinite(switch_x) || !(switch_x > 0.0 && switch_x < 1.0))
+        SU2_MPI::Error("HICKS_HENNE_T2_SWITCH_X must be finite and strictly between zero and one.",
+                       CURRENT_FUNCTION);
+    } else {
+      const auto t2 = SU2_TYPE::GetValue(HicksHenne_T2);
+      if (!std::isfinite(t2) || !(t2 > 0.0))
+        SU2_MPI::Error("HICKS_HENNE_T2 must be finite and greater than zero.", CURRENT_FUNCTION);
+    }
+  }
 
   if (nZone > 1){
     Multizone_Problem = YES;
@@ -6792,6 +6829,25 @@ void CConfig::SetOutput(SU2_COMPONENT val_software, unsigned short val_izone) {
 
   if (val_software == SU2_COMPONENT::SU2_DOT) {
   cout << endl <<"-------------- Surface deformation parameters ( Zone "  << iZone << " ) ----------------" << endl;
+  }
+
+  bool output_hicks_henne_active = false;
+  for (unsigned short iDV = 0; iDV < nDV; ++iDV) {
+    if (Design_Variable[iDV] == HICKS_HENNE) {
+      output_hicks_henne_active = true;
+      break;
+    }
+  }
+
+  if ((rank == MASTER_NODE) && output_hicks_henne_active &&
+      ((val_software == SU2_COMPONENT::SU2_DEF) || (val_software == SU2_COMPONENT::SU2_DOT) ||
+       (val_software == SU2_COMPONENT::SU2_GEO))) {
+    if (HicksHenne_T2_ByCenter) {
+      cout << "Hicks-Henne t2 policy: BY_CENTER (forward=" << HicksHenne_T2_Forward
+           << ", aft=" << HicksHenne_T2_Aft << ", switch x_k=" << HicksHenne_T2_SwitchX << ")." << endl;
+    } else {
+      cout << "Hicks-Henne t2 policy: UNIFORM (t2=" << HicksHenne_T2 << ")." << endl;
+    }
   }
 
   if (((val_software == SU2_COMPONENT::SU2_DEF) || (val_software == SU2_COMPONENT::SU2_DOT)) && (Design_Variable[0] != NO_DEFORMATION)) {

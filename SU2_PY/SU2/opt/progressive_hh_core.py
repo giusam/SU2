@@ -11,6 +11,11 @@ from SU2.opt.progressive_hh_projection import (
     _check_min_center_spacing,
     _compute_dot_candidate_scores,
 )
+from SU2.opt.progressive_hh_tangent import (
+    COMPONENT as HH_COMPONENT,
+    VIRTUAL_TANGENT as HH_VIRTUAL_TANGENT,
+    normalize_hh_scoring_mode,
+)
 
 
 class HHLevel:
@@ -105,6 +110,29 @@ def _parse_initial_center_values(value):
         return []
 
     return [float(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+def _first_numeric(value, default):
+    if isinstance(value, str):
+        raw = value.strip().strip("()[]").replace(",", " ")
+        for token in raw.split():
+            try:
+                return float(token)
+            except ValueError:
+                continue
+        return None if default is None else float(default)
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            candidate = _first_numeric(item, None)
+            if candidate is not None:
+                return candidate
+        return None if default is None else float(default)
+    if value is None:
+        return None if default is None else float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None if default is None else float(default)
 
 
 def is_symmetric_reduced(opts):
@@ -229,6 +257,13 @@ def get_progressive_hh_options(config):
     ikkt_active_tol = float(
         config.get("PROGRESSIVE_HH_IKKT_ACTIVE_TOL", 1.0e-6)
     )
+    scoring_mode = normalize_hh_scoring_mode(
+        config.get("PROGRESSIVE_HH_SCORING_MODE", HH_COMPONENT)
+    )
+    refinement = str(config.get("PROGRESSIVE_HH_REFINEMENT", "UNIFORM")).upper()
+    adaptive_indicator = str(
+        config.get("PROGRESSIVE_HH_ADAPTIVE_INDICATOR", "ABS_GRAD")
+    ).upper()
     spring_timing = str(
         config.get("PROGRESSIVE_HH_SPRING_TIMING", "POST_OPT")
     ).upper()
@@ -329,6 +364,23 @@ def get_progressive_hh_options(config):
         raise ValueError("PROGRESSIVE_HH_MIN_CENTER_SPACING must be >= 0.0")
     if ikkt_active_tol < 0.0:
         raise ValueError("PROGRESSIVE_HH_IKKT_ACTIVE_TOL must be non-negative")
+    if scoring_mode == HH_VIRTUAL_TANGENT:
+        if refinement != "ADAPTIVE":
+            raise ValueError(
+                "PROGRESSIVE_HH_SCORING_MODE=VIRTUAL_TANGENT requires "
+                "PROGRESSIVE_HH_REFINEMENT=ADAPTIVE"
+            )
+        if adaptive_indicator not in ("ABS_GRAD", "IKKT"):
+            raise ValueError(
+                "Virtual HH tangent scoring requires ABS_GRAD or IKKT indicator"
+            )
+        lower = _first_numeric(config.get("OPT_BOUND_LOWER", -math.inf), -math.inf)
+        upper = _first_numeric(config.get("OPT_BOUND_UPPER", math.inf), math.inf)
+        if lower is None or upper is None or not lower < 0.0 < upper:
+            raise ValueError(
+                "Virtual HH tangent scoring requires bilateral DV bounds "
+                "(OPT_BOUND_LOWER < 0 < OPT_BOUND_UPPER)"
+            )
 
     upper_initial_value = config.get("PROGRESSIVE_HH_INITIAL_UPPER", None)
     lower_initial_value = config.get("PROGRESSIVE_HH_INITIAL_LOWER", None)
@@ -413,6 +465,7 @@ def get_progressive_hh_options(config):
         print(f"[PROGRESSIVE_HH][SYMMETRY] mode = {symmetry_mode}")
         print(f"[PROGRESSIVE_HH][SYMMETRY] sign = {symmetry_sign}")
         print(f"[PROGRESSIVE_HH] refine state mode = {refine_state_mode}")
+        print(f"[PROGRESSIVE_HH] scoring mode = {scoring_mode}")
         if param_kind == "HICKS_HENNE" and symmetry_mode == "REDUCED":
             print(f"[PROGRESSIVE_HH][SYMMETRY] pair count = {pair_count}")
             print(f"[PROGRESSIVE_HH][SYMMETRY] full SU2 HH = {initial_ndv}")
@@ -437,9 +490,12 @@ def get_progressive_hh_options(config):
         "stag_window": int(config.get("PROGRESSIVE_HH_STAG_WINDOW", 3)),
         "warmup_iter": int(config.get("PROGRESSIVE_HH_WARMUP_ITER", 0)),
         "max_iter_per_level": int(
-            config.get("PROGRESSIVE_HH_MAX_ITER_PER_LEVEL", config.OPT_ITERATIONS)
+            config.get(
+                "PROGRESSIVE_HH_MAX_ITER_PER_LEVEL",
+                config.get("OPT_ITERATIONS", 100),
+            )
         ),
-        "refinement": str(config.get("PROGRESSIVE_HH_REFINEMENT", "UNIFORM")).upper(),
+        "refinement": refinement,
         "refine_state_mode": refine_state_mode,
         "growth_ratio": float(config.get("PROGRESSIVE_HH_GROWTH_RATIO", 2.0)),
         "nadd_mode": nadd_mode,
@@ -450,9 +506,8 @@ def get_progressive_hh_options(config):
         "batch_max_per_side": batch_max_per_side,
         "candidate_samples": candidate_samples,
         "min_center_spacing": min_center_spacing,
-        "adaptive_indicator": str(
-            config.get("PROGRESSIVE_HH_ADAPTIVE_INDICATOR", "ABS_GRAD")
-        ).upper(),
+        "adaptive_indicator": adaptive_indicator,
+        "scoring_mode": scoring_mode,
         "ikkt_active_tol": ikkt_active_tol,
         "marker": str(config.get("DV_MARKER", "Airfoil")),
         "scale": scale,
@@ -797,6 +852,11 @@ def _refine_adaptive_symmetric(prev_level, result, opts):
         candidates = scoring.get("candidates", [])
         active_pair_scores = scoring.get("active_pair_scores", [])
     except Exception as err:
+        if opts.get("scoring_mode", HH_COMPONENT) == HH_VIRTUAL_TANGENT:
+            raise RuntimeError(
+                "PROGRESSIVE_HH_SCORING_MODE=VIRTUAL_TANGENT failed; "
+                "explicit tangent scoring does not fall back to UNIFORM"
+            ) from err
         print(
             "[PROGRESSIVE_HH] WARNING: ADAPTIVE symmetric refine failed -> "
             f"fallback to UNIFORM | {err}"
@@ -820,12 +880,15 @@ def _refine_adaptive_symmetric(prev_level, result, opts):
         return pair, pair
 
     active_centers_by_side = {"PAIR": sorted(prev_level.upper)}
-    chosen = select_candidates_by_nadd_mode(
-        candidates,
-        current_ndv,
-        opts,
-        active_centers_by_side=active_centers_by_side,
-    )
+    if scoring.get("sequential_selection", False):
+        chosen = list(scoring.get("selected_candidates", []))
+    else:
+        chosen = select_candidates_by_nadd_mode(
+            candidates,
+            current_ndv,
+            opts,
+            active_centers_by_side=active_centers_by_side,
+        )
     n_pairs_added = len(chosen)
 
     if not chosen:
@@ -928,6 +991,10 @@ def _refine_adaptive_symmetric(prev_level, result, opts):
         "nadd_mode": opts.get("nadd_mode", "GROWTH_RATIO"),
         "trigger_mode": opts.get("trigger", "MAX_ITER"),
         "refinement": opts.get("refinement", "UNIFORM"),
+        "scoring_mode": opts.get("scoring_mode", HH_COMPONENT),
+        "scoring_basis": scoring.get("scoring_basis", "COMPONENT"),
+        "candidate_scores_csv": scoring.get("candidate_scores_csv"),
+        "scoring_metadata_json": scoring.get("metadata_json"),
         "spring_enabled": spring_enabled,
         "spring_timing": spring_timing,
         "spring_score_mode": spring_score_mode,
@@ -955,6 +1022,26 @@ def _refine_adaptive_symmetric(prev_level, result, opts):
                 ),
                 "nearest_distance": c.get("nearest_distance", ""),
                 "required_spacing": c.get("required_spacing", ""),
+                "insertion_step": c.get("insertion_step", ""),
+                "insertion_target": c.get("insertion_target", ""),
+                "rank": c.get("rank", ""),
+                "t2": c.get("t2", ""),
+                "scoring_basis": c.get("scoring_basis", ""),
+                "signal_source": c.get("signal_source", ""),
+                "score_net": c.get("score_net"),
+                "score_net_normalized": c.get("score_net_normalized"),
+                "score_pure": c.get("score_pure"),
+                "score_pure_normalized": c.get("score_pure_normalized"),
+                "energy_current": c.get("energy_current"),
+                "energy_candidate": c.get("energy_candidate"),
+                "rank_current": c.get("rank_current"),
+                "rank_candidate": c.get("rank_candidate"),
+                "rank_gain": c.get("rank_gain"),
+                "pure_rank": c.get("pure_rank"),
+                "nesting_rms": c.get("nesting_rms"),
+                "nesting_max": c.get("nesting_max"),
+                "locality": c.get("locality"),
+                "innovation_center_x": c.get("innovation_center_x"),
             }
             for i, c in enumerate(chosen)
         ],
@@ -976,6 +1063,11 @@ def refine_adaptive(prev_level, result, opts):
         active_upper_scores = scoring.get("active_upper_scores", [])
         active_lower_scores = scoring.get("active_lower_scores", [])
     except Exception as err:
+        if opts.get("scoring_mode", HH_COMPONENT) == HH_VIRTUAL_TANGENT:
+            raise RuntimeError(
+                "PROGRESSIVE_HH_SCORING_MODE=VIRTUAL_TANGENT failed; "
+                "explicit tangent scoring does not fall back to UNIFORM"
+            ) from err
         print(
             "[PROGRESSIVE_HH] WARNING: ADAPTIVE refine failed -> fallback to UNIFORM | "
             f"{err}"
@@ -996,12 +1088,15 @@ def refine_adaptive(prev_level, result, opts):
         "UPPER": sorted(prev_level.upper),
         "LOWER": sorted(prev_level.lower),
     }
-    chosen = select_candidates_by_nadd_mode(
-        candidates,
-        current_ndv,
-        opts,
-        active_centers_by_side=active_centers_by_side,
-    )
+    if scoring.get("sequential_selection", False):
+        chosen = list(scoring.get("selected_candidates", []))
+    else:
+        chosen = select_candidates_by_nadd_mode(
+            candidates,
+            current_ndv,
+            opts,
+            active_centers_by_side=active_centers_by_side,
+        )
     nadd = len(chosen)
 
     if not chosen:
@@ -1140,6 +1235,10 @@ def refine_adaptive(prev_level, result, opts):
         "nadd_mode": opts.get("nadd_mode", "GROWTH_RATIO"),
         "trigger_mode": opts.get("trigger", "MAX_ITER"),
         "refinement": opts.get("refinement", "UNIFORM"),
+        "scoring_mode": opts.get("scoring_mode", HH_COMPONENT),
+        "scoring_basis": scoring.get("scoring_basis", "COMPONENT"),
+        "candidate_scores_csv": scoring.get("candidate_scores_csv"),
+        "scoring_metadata_json": scoring.get("metadata_json"),
         "spring_enabled": spring_enabled,
         "spring_timing": spring_timing,
         "spring_score_mode": spring_score_mode,
@@ -1165,6 +1264,26 @@ def refine_adaptive(prev_level, result, opts):
                 ),
                 "nearest_distance": c.get("nearest_distance", ""),
                 "required_spacing": c.get("required_spacing", ""),
+                "insertion_step": c.get("insertion_step", ""),
+                "insertion_target": c.get("insertion_target", ""),
+                "rank": c.get("rank", ""),
+                "t2": c.get("t2", ""),
+                "scoring_basis": c.get("scoring_basis", ""),
+                "signal_source": c.get("signal_source", ""),
+                "score_net": c.get("score_net"),
+                "score_net_normalized": c.get("score_net_normalized"),
+                "score_pure": c.get("score_pure"),
+                "score_pure_normalized": c.get("score_pure_normalized"),
+                "energy_current": c.get("energy_current"),
+                "energy_candidate": c.get("energy_candidate"),
+                "rank_current": c.get("rank_current"),
+                "rank_candidate": c.get("rank_candidate"),
+                "rank_gain": c.get("rank_gain"),
+                "pure_rank": c.get("pure_rank"),
+                "nesting_rms": c.get("nesting_rms"),
+                "nesting_max": c.get("nesting_max"),
+                "locality": c.get("locality"),
+                "innovation_center_x": c.get("innovation_center_x"),
             }
             for i, c in enumerate(chosen)
         ],

@@ -2850,9 +2850,13 @@ void CSurfaceMovement::SetHicksHenne(CGeometry* boundary, CConfig* config, unsig
 
   /*--- Perform multiple airfoil deformation ---*/
 
-  su2double Ampl = config->GetDV_Value(iDV) * Scale;
-  su2double xk = config->GetParamDV(iDV, 1);
-  const su2double t2 = 1.0;
+  const su2double Ampl = config->GetDV_Value(iDV) * Scale;
+  const su2double xk = config->GetParamDV(iDV, 1);
+  const su2double t2 =
+      config->GetHicksHenne_T2_ByCenter()
+          ? (xk <= config->GetHicksHenne_T2_SwitchX() ? config->GetHicksHenne_T2_Forward()
+                                                       : config->GetHicksHenne_T2_Aft())
+          : config->GetHicksHenne_T2();
 
   if (config->GetParamDV(iDV, 0) == NO) {
     upper = false;

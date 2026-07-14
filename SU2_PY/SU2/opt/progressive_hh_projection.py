@@ -2,13 +2,39 @@
 
 import os
 import copy
+import csv
 import glob
+import json
+import math
 import shutil
 import contextlib
 
 import numpy as np
 import SU2
 from scipy.optimize import lsq_linear
+
+from SU2.opt.bspline_driver.geometry_constraints import (
+    is_geometry_constraint_name,
+    normalize_geometry_constraint_name,
+)
+from SU2.opt.progressive_ffd_tangent import (
+    airfoil_area_value_and_field,
+    airfoil_thickness_value_and_field,
+    fit_surface_ikkt_signal,
+    internal_constraint_field,
+)
+from SU2.opt.progressive_hh_tangent import (
+    COMPONENT,
+    VIRTUAL_TANGENT,
+    HHTangentError,
+    build_hh_tangent_state,
+    compare_tangent_spaces,
+    load_design_gradient_csv,
+    load_surface_sensitivity_vector,
+    normalize_hh_scoring_mode,
+    project_surface_field,
+    validate_surface_projection,
+)
 
 
 def get_midpoint_candidates(centers, nsamples=1):
@@ -1063,7 +1089,7 @@ def _compute_ikkt_residual_vector(
     return residual, lam
 
 
-def _compute_dot_candidate_scores_symmetric(level, opts):
+def _compute_component_dot_candidate_scores_symmetric(level, opts):
     cfg_path = os.path.join(level.workdir, level.config_filename)
     cfg_level = SU2.io.Config(cfg_path)
 
@@ -1303,9 +1329,9 @@ def _compute_dot_candidate_scores_symmetric(level, opts):
     }
 
 
-def _compute_dot_candidate_scores(level, opts):
+def _compute_component_dot_candidate_scores(level, opts):
     if _is_symmetric_reduced(opts):
-        return _compute_dot_candidate_scores_symmetric(level, opts)
+        return _compute_component_dot_candidate_scores_symmetric(level, opts)
 
     cfg_path = os.path.join(level.workdir, level.config_filename)
     cfg_level = SU2.io.Config(cfg_path)
@@ -1541,3 +1567,840 @@ def _compute_dot_candidate_scores(level, opts):
         "active_upper_scores": active_upper_scores,
         "active_lower_scores": active_lower_scores,
     }
+
+
+def _find_hh_projection_mesh_source(mesh_name, adjoint_dir, design_dir, level_dir):
+    mesh_name = str(mesh_name).strip()
+    candidates = []
+    if os.path.isabs(mesh_name):
+        candidates.append(mesh_name)
+    else:
+        candidates.extend(
+            os.path.join(root, mesh_name)
+            for root in (adjoint_dir, design_dir, level_dir)
+        )
+    for path in candidates:
+        if os.path.isfile(path):
+            return os.path.abspath(path)
+    raise FileNotFoundError(
+        f"Could not resolve HH projection mesh {mesh_name!r}; tried {candidates}"
+    )
+
+
+def _resolve_hh_surface_sensitivity_file(adjoint_dir, function_name):
+    direct = os.path.join(adjoint_dir, "surface_sens.csv")
+    if os.path.isfile(direct):
+        return direct
+    candidates = sorted(
+        path
+        for path in glob.glob(os.path.join(adjoint_dir, "*surface*sens*.csv"))
+        if os.path.isfile(path)
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No surface_sens.csv found for {function_name} in {adjoint_dir}"
+        )
+    raise RuntimeError(
+        f"Ambiguous surface sensitivity files for {function_name}: {candidates}"
+    )
+
+
+def _resolve_hh_saved_gradient_file(adjoint_dir):
+    candidates = sorted(
+        path
+        for path in glob.glob(os.path.join(adjoint_dir, "*of_grad*.csv"))
+        if os.path.isfile(path)
+    )
+    if len(candidates) > 1:
+        raise RuntimeError(
+            f"Ambiguous saved SU2 gradient files in {adjoint_dir}: {candidates}"
+        )
+    return candidates[0] if candidates else None
+
+
+def _validate_hh_saved_surface_projection(
+    tangent_state,
+    field,
+    adjoint_dir,
+    function_name,
+):
+    reference_file = _resolve_hh_saved_gradient_file(adjoint_dir)
+    if reference_file is None:
+        return {
+            "status": "reference_unavailable",
+            "function": str(function_name).upper(),
+            "reference_file": None,
+        }
+    try:
+        validation = validate_surface_projection(
+            tangent_state,
+            field,
+            load_design_gradient_csv(reference_file),
+            absolute_tolerance=5.0e-6,
+        )
+    except Exception as exc:
+        return {
+            "status": "reference_parameterization_differs",
+            "function": str(function_name).upper(),
+            "reference_file": reference_file,
+            "detail": str(exc),
+        }
+    validation.update(
+        {
+            "status": "passed" if validation["passed"] else "failed",
+            "function": str(function_name).upper(),
+            "reference_file": reference_file,
+        }
+    )
+    return validation
+
+
+def _hh_config_tangent_records(cfg_level, symmetry_mode="NONE", symmetry_sign=-1.0):
+    definition = cfg_level.get("DEFINITION_DV")
+    if not isinstance(definition, dict):
+        return None
+    upper = []
+    lower = []
+    for kind, raw_params in zip(
+        definition.get("KIND", []),
+        definition.get("PARAM", []),
+    ):
+        if str(kind).strip().upper() != "HICKS_HENNE":
+            return None
+        values = [float(value) for value in raw_params]
+        if len(values) < 2:
+            return None
+        (upper if bool(round(values[-2])) else lower).append(values[-1])
+    upper = sorted(upper)
+    lower = sorted(lower)
+    if str(symmetry_mode).upper() == "REDUCED":
+        if len(upper) != len(lower) or any(
+            abs(xu - xl) > 1.0e-12 for xu, xl in zip(upper, lower)
+        ):
+            return None
+        _ = symmetry_sign
+        return [("PAIR", float(x)) for x in upper]
+    return [
+        *(("UPPER", float(x)) for x in upper),
+        *(("LOWER", float(x)) for x in lower),
+    ]
+
+
+def _hh_tangent_records_match_config(tangent_state, cfg_level):
+    configured = _hh_config_tangent_records(
+        cfg_level,
+        tangent_state.get("symmetry_mode", "NONE"),
+        tangent_state.get("symmetry_sign", -1.0),
+    )
+    actual = list(tangent_state.get("records", []))
+    if configured is None or len(configured) != len(actual):
+        return False
+    return all(
+        str(side_a).upper() == str(side_b).upper()
+        and abs(float(x_a) - float(x_b)) <= 1.0e-12
+        for (side_a, x_a), (side_b, x_b) in zip(configured, actual)
+    )
+
+
+def _constraint_active_from_hh_value(spec, current_value, active_tol):
+    sign = str(spec.get("sign", "")).strip()
+    target = spec.get("target")
+    if target is None:
+        return True, None, "active_status_unknown"
+    if sign == ">":
+        c_value = float(current_value) - float(target)
+    elif sign == "<":
+        c_value = float(target) - float(current_value)
+    elif sign == "=":
+        c_value = float(current_value) - float(target)
+        return True, c_value, "active_equality"
+    else:
+        return True, None, "active_status_unknown"
+    active = bool(c_value <= float(active_tol))
+    return active, c_value, "active_inequality" if active else "inactive"
+
+
+def _prepare_hh_virtual_signal(
+    level,
+    opts,
+    cfg_level,
+    baseline_state,
+    obj_name,
+    obj_adj_dir,
+    design_dir,
+):
+    objective_file = _resolve_hh_surface_sensitivity_file(obj_adj_dir, obj_name)
+    objective_field = load_surface_sensitivity_vector(objective_file, baseline_state)
+    objective_validation = _validate_hh_saved_surface_projection(
+        baseline_state,
+        objective_field,
+        obj_adj_dir,
+        obj_name,
+    )
+    strict_projection_validation = _hh_tangent_records_match_config(
+        baseline_state,
+        cfg_level,
+    )
+    if objective_validation.get("status") not in ("passed", "reference_unavailable"):
+        if strict_projection_validation:
+            raise HHTangentError(
+                "HH surface sensitivity does not reproduce the saved SU2_DOT "
+                f"gradient for {obj_name}: {objective_validation}"
+            )
+        objective_validation["status"] = "parameterization_differs_expected"
+        objective_validation["note"] = (
+            "The active HH centers were redistributed after the saved adjoint "
+            "gradient was written; the surface field remains the scoring source."
+        )
+    indicator_mode = str(opts.get("adaptive_indicator", "ABS_GRAD")).upper()
+    requested_names = _extract_constraint_names(cfg_level)
+    active_names, constraint_status = _select_active_ikkt_constraints(
+        cfg_level,
+        requested_names,
+        design_dir=design_dir,
+        active_tol=opts.get("ikkt_active_tol", 1.0e-6),
+        verbose=False,
+    )
+    status_by_name = {
+        str(record["name"]).upper(): dict(record)
+        for record in constraint_status
+    }
+    specs = {
+        spec["name"]: spec
+        for spec in _extract_constraint_specs(cfg_level, requested_names)
+    }
+    constraint_records = []
+    inactive_records = [
+        dict(record)
+        for record in constraint_status
+        if not bool(record.get("included", False))
+    ]
+    unsupported = []
+
+    if indicator_mode == "IKKT":
+        for name in active_names:
+            name = str(name).upper()
+            spec = dict(specs.get(name, {"name": name}))
+            spec.setdefault("name", name)
+            status = status_by_name.get(name, {})
+            provider = None
+            provider_metadata = {}
+            provider_value = status.get("current_value")
+            field_file = None
+
+            if is_geometry_constraint_name(name):
+                canonical = normalize_geometry_constraint_name(name)
+                if canonical == "AIRFOIL_AREA":
+                    provider_value, raw_field = airfoil_area_value_and_field(
+                        baseline_state
+                    )
+                    provider = "analytic_airfoil_area"
+                elif canonical == "AIRFOIL_THICKNESS":
+                    provider_value, raw_field, provider_metadata = (
+                        airfoil_thickness_value_and_field(baseline_state)
+                    )
+                    provider = "analytic_airfoil_thickness"
+                else:
+                    unsupported.append(
+                        {
+                            "name": name,
+                            "source": "GEOMETRY",
+                            "reason": "unsupported_geometry_constraint",
+                        }
+                    )
+                    continue
+                active, c_value, active_status = _constraint_active_from_hh_value(
+                    spec,
+                    provider_value,
+                    opts.get("ikkt_active_tol", 1.0e-6),
+                )
+                if not active:
+                    inactive_records.append(
+                        {
+                            **status,
+                            "name": name,
+                            "provider": provider,
+                            "provider_current_value": float(provider_value),
+                            "c_value": c_value,
+                            "status": active_status,
+                        }
+                    )
+                    continue
+            else:
+                try:
+                    constraint_adj_dir, constraint_design_dir = (
+                        _find_real_adjoint_assets(level.workdir, name)
+                    )
+                except Exception as exc:
+                    unsupported.append(
+                        {
+                            "name": name,
+                            "source": "AERO",
+                            "reason": "active_field_unavailable",
+                            "detail": str(exc),
+                        }
+                    )
+                    continue
+                if os.path.abspath(constraint_design_dir) != os.path.abspath(design_dir):
+                    unsupported.append(
+                        {
+                            "name": name,
+                            "source": "AERO",
+                            "reason": "adjoint_baseline_mismatch",
+                        }
+                    )
+                    continue
+                field_file = _resolve_hh_surface_sensitivity_file(
+                    constraint_adj_dir,
+                    name,
+                )
+                raw_field = load_surface_sensitivity_vector(
+                    field_file,
+                    baseline_state,
+                )
+                provider = "adjoint_surface_sensitivity"
+                if provider_value is None:
+                    unsupported.append(
+                        {
+                            "name": name,
+                            "source": "AERO",
+                            "reason": "current_value_unavailable",
+                        }
+                    )
+                    continue
+                provider_metadata["projection_validation"] = (
+                    _validate_hh_saved_surface_projection(
+                        baseline_state,
+                        raw_field,
+                        constraint_adj_dir,
+                        name,
+                    )
+                )
+                if provider_metadata["projection_validation"].get("status") not in (
+                    "passed",
+                    "reference_unavailable",
+                ):
+                    if strict_projection_validation:
+                        unsupported.append(
+                            {
+                                "name": name,
+                                "source": "AERO",
+                                "reason": "surface_projection_validation_failed",
+                                "detail": provider_metadata[
+                                    "projection_validation"
+                                ],
+                            }
+                        )
+                        continue
+                    provider_metadata["projection_validation"]["status"] = (
+                        "parameterization_differs_expected"
+                    )
+
+            internal = internal_constraint_field(spec, provider_value, raw_field)
+            constraint_records.append(
+                {
+                    "name": name,
+                    "source": (
+                        "GEOMETRY" if is_geometry_constraint_name(name) else "AERO"
+                    ),
+                    "provider": provider,
+                    "provider_metadata": provider_metadata,
+                    "field_file": field_file,
+                    "current_value": float(provider_value),
+                    "target": spec.get("target"),
+                    "original_operator": str(spec.get("sign", "")),
+                    **internal,
+                }
+            )
+
+    if unsupported:
+        detail = "; ".join(
+            f"{record['name']}:{record['reason']}" for record in unsupported
+        )
+        raise RuntimeError(
+            "Virtual HH IKKT requires every active constraint field; " + detail
+        )
+
+    if indicator_mode == "IKKT":
+        signal, lambdas, fit_diagnostics = fit_surface_ikkt_signal(
+            objective_field,
+            constraint_records,
+            baseline_state,
+        )
+        signal_source = (
+            "IKKT_SURFACE_RESIDUAL"
+            if constraint_records
+            else "OBJECTIVE_ONLY_NO_ACTIVE_CONSTRAINTS"
+        )
+    else:
+        signal = np.asarray(objective_field, dtype=float)
+        lambdas = np.zeros(0, dtype=float)
+        fit_diagnostics = {
+            "status": "objective_only",
+            "objective_gradient": project_surface_field(
+                baseline_state,
+                objective_field,
+            ).tolist(),
+        }
+        signal_source = "OBJECTIVE_SURFACE_SENSITIVITY"
+
+    return {
+        "objective_function": str(obj_name).upper(),
+        "objective_field_file": objective_file,
+        "objective_field": objective_field,
+        "objective_projection_validation": objective_validation,
+        "constraint_records": constraint_records,
+        "inactive_constraints": inactive_records,
+        "unsupported_constraints": unsupported,
+        "signal": np.asarray(signal, dtype=float),
+        "signal_source": signal_source,
+        "lambdas": np.asarray(lambdas, dtype=float),
+        "fit_diagnostics": fit_diagnostics,
+    }
+
+
+def _hh_active_map(level):
+    return {
+        side: sorted(float(value) for value in values)
+        for side, values in (
+            ("UPPER", level.upper),
+            ("LOWER", level.lower),
+        )
+        if values
+    }
+
+
+def _generate_hh_virtual_candidates(active_by_side, opts):
+    nsamples = int(opts.get("candidate_samples", 1))
+    min_spacing = float(opts.get("min_center_spacing", 0.0))
+    if _is_symmetric_reduced(opts):
+        centers = active_by_side.get("UPPER", [])
+        raw = get_midpoint_candidates(centers, nsamples=nsamples)
+        for candidate in raw:
+            candidate["side"] = "PAIR"
+        return _filter_candidates_by_min_spacing(
+            raw,
+            {"PAIR": centers},
+            min_spacing,
+        )
+
+    raw = []
+    for side in ("UPPER", "LOWER"):
+        if side not in active_by_side:
+            continue
+        side_candidates = get_midpoint_candidates(
+            active_by_side[side],
+            nsamples=nsamples,
+        )
+        for candidate in side_candidates:
+            candidate["side"] = side
+        raw.extend(side_candidates)
+    return _filter_candidates_by_min_spacing(
+        raw,
+        active_by_side,
+        min_spacing,
+    )
+
+
+def _hh_virtual_insertion_target(level, opts, candidate_count):
+    mode = str(opts.get("nadd_mode", "GROWTH_RATIO")).upper()
+    symmetric = _is_symmetric_reduced(opts)
+    current = len(level.upper) if symmetric else int(level.ndv)
+    if mode == "GROWTH_RATIO":
+        ratio = float(opts.get("growth_ratio", 2.0))
+        target_count = current + 1 if ratio <= 1.0 else int(math.ceil(ratio * current))
+        target = max(1, target_count - current)
+    elif mode == "FIXED":
+        target = int(opts.get("fixed_nadd", 1))
+    elif mode == "SCORE_BATCH":
+        target = int(opts.get("batch_size_max", 1))
+    else:
+        raise ValueError(f"Unknown progressive HH candidate addition mode: {mode}")
+
+    nfinal = opts.get("nfinal", None)
+    if nfinal is not None:
+        remaining_full = max(0, int(nfinal) - int(level.ndv))
+        remaining = remaining_full // 2 if symmetric else remaining_full
+        target = min(target, remaining)
+    return max(0, min(int(target), int(candidate_count)))
+
+
+def _hh_virtual_rank_key(candidate):
+    side_rank = {"UPPER": 0, "LOWER": 1, "PAIR": 2}
+    return (
+        -float(candidate["indicator"]),
+        side_rank.get(str(candidate.get("side", "")).upper(), 99),
+        float(candidate["x"]),
+    )
+
+
+def _hh_candidate_active_map(active_by_side, side, x):
+    updated = {key: list(values) for key, values in active_by_side.items()}
+    if str(side).upper() == "PAIR":
+        updated.setdefault("UPPER", []).append(float(x))
+        updated.setdefault("LOWER", []).append(float(x))
+    else:
+        updated.setdefault(str(side).upper(), []).append(float(x))
+    for key in updated:
+        updated[key] = sorted(updated[key])
+    return updated
+
+
+def _hh_record_index(state, side, x):
+    for index, (record_side, record_x) in enumerate(state["records"]):
+        if str(record_side).upper() == str(side).upper() and abs(
+            float(record_x) - float(x)
+        ) <= 1.0e-12:
+            return index
+    raise HHTangentError(f"Candidate record {side}@{x} absent from HH tangent state")
+
+
+def _json_safe_hh(value):
+    if isinstance(value, np.ndarray):
+        return [_json_safe_hh(item) for item in value.tolist()]
+    if isinstance(value, np.generic):
+        return _json_safe_hh(value.item())
+    if isinstance(value, dict):
+        return {str(key): _json_safe_hh(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_hh(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _write_hh_virtual_scores(level, candidates, metadata):
+    csv_path = os.path.join(
+        level.workdir,
+        f"hh_candidate_scores_level{level.level_id}.csv",
+    )
+    fields = [
+        "scoring_mode",
+        "scoring_basis",
+        "signal_source",
+        "insertion_step",
+        "insertion_target",
+        "rank",
+        "selected",
+        "side",
+        "x",
+        "t2",
+        "interval_id",
+        "interval_left",
+        "interval_right",
+        "sample_index",
+        "sample_fraction",
+        "objective_gradient",
+        "surface_residual_component",
+        "indicator",
+        "energy_current",
+        "energy_candidate",
+        "signal_energy",
+        "score_net",
+        "score_net_normalized",
+        "score_pure",
+        "score_pure_normalized",
+        "rank_current",
+        "rank_candidate",
+        "rank_gain",
+        "pure_rank",
+        "nesting_rms",
+        "nesting_max",
+        "locality",
+        "innovation_center_x",
+        "admissible",
+        "rejected_reason",
+    ]
+    with open(csv_path, "w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for candidate in candidates:
+            writer.writerow(
+                {key: candidate.get(key, "") for key in fields}
+            )
+
+    json_path = os.path.join(
+        level.workdir,
+        f"hh_virtual_tangent_level{level.level_id}.json",
+    )
+    with open(json_path, "w") as stream:
+        json.dump(
+            _json_safe_hh(metadata),
+            stream,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        )
+    return csv_path, json_path
+
+
+def _compute_virtual_tangent_candidate_scores(level, opts):
+    cfg_path = os.path.join(level.workdir, level.config_filename)
+    cfg_level = SU2.io.Config(cfg_path)
+    obj_name = str(cfg_level.get("OBJECTIVE_FUNCTION", "DRAG")).upper()
+    obj_adj_dir, design_dir = _find_real_adjoint_assets(level.workdir, obj_name)
+    real_dot_cfg_path, dot_kind = _select_dot_config_path(obj_adj_dir, cfg_level)
+    real_dot_cfg = SU2.io.Config(real_dot_cfg_path)
+    mesh_path = _find_hh_projection_mesh_source(
+        real_dot_cfg["MESH_FILENAME"],
+        obj_adj_dir,
+        design_dir,
+        level.workdir,
+    )
+    active = _hh_active_map(level)
+    symmetry_mode = "REDUCED" if _is_symmetric_reduced(opts) else "NONE"
+    symmetry_sign = float(opts.get("symmetry_sign", -1.0))
+    baseline = build_hh_tangent_state(
+        mesh_path,
+        opts.get("marker", "AIRFOIL"),
+        active,
+        cfg_level,
+        scale=opts.get("scale", 1.0),
+        symmetry_mode=symmetry_mode,
+        symmetry_sign=symmetry_sign,
+    )
+    virtual = _prepare_hh_virtual_signal(
+        level,
+        opts,
+        cfg_level,
+        baseline,
+        obj_name,
+        obj_adj_dir,
+        design_dir,
+    )
+    initial_candidates = _generate_hh_virtual_candidates(active, opts)
+    target = _hh_virtual_insertion_target(level, opts, len(initial_candidates))
+    signal = virtual["signal"]
+    objective_field = virtual["objective_field"]
+    initial_projection = np.abs(project_surface_field(baseline, signal)).tolist()
+    initial_records = list(baseline["records"])
+    initial_scores = {
+        (str(side).upper(), float(x)): float(initial_projection[index])
+        for index, (side, x) in enumerate(initial_records)
+    }
+
+    print(
+        "[PROGRESSIVE_HH] Candidate scoring | "
+        f"indicator={str(opts.get('adaptive_indicator', 'ABS_GRAD')).upper()} "
+        f"scoring_mode={VIRTUAL_TANGENT} kind={dot_kind} "
+        f"signal={virtual['signal_source']} target_insertions={target}"
+    )
+
+    current_active = {key: list(values) for key, values in active.items()}
+    selected = []
+    all_candidates = []
+    first_best = None
+    mode = str(opts.get("nadd_mode", "GROWTH_RATIO")).upper()
+    for insertion_step in range(1, target + 1):
+        raw_candidates = (
+            initial_candidates
+            if insertion_step == 1
+            else _generate_hh_virtual_candidates(current_active, opts)
+        )
+        if not raw_candidates:
+            break
+        baseline_step = build_hh_tangent_state(
+            mesh_path,
+            opts.get("marker", "AIRFOIL"),
+            current_active,
+            cfg_level,
+            scale=opts.get("scale", 1.0),
+            symmetry_mode=symmetry_mode,
+            symmetry_sign=symmetry_sign,
+        )
+        step_candidates = []
+        for candidate_number, raw in enumerate(raw_candidates):
+            side = str(raw["side"]).upper()
+            x = float(raw["x"])
+            candidate_active = _hh_candidate_active_map(
+                current_active,
+                side,
+                x,
+            )
+            candidate_state = build_hh_tangent_state(
+                mesh_path,
+                opts.get("marker", "AIRFOIL"),
+                candidate_active,
+                cfg_level,
+                scale=opts.get("scale", 1.0),
+                symmetry_mode=symmetry_mode,
+                symmetry_sign=symmetry_sign,
+            )
+            metrics = compare_tangent_spaces(
+                baseline_step,
+                candidate_state,
+                signal,
+                x,
+            )
+            candidate_index = _hh_record_index(candidate_state, side, x)
+            objective_gradient = project_surface_field(
+                candidate_state,
+                objective_field,
+            )
+            residual_gradient = project_surface_field(candidate_state, signal)
+            admissible = bool(
+                int(metrics["rank_gain"]) == 1
+                and int(metrics["pure_rank"]) == 1
+            )
+            rejected_reason = str(raw.get("rejected_reason", ""))
+            if not admissible:
+                rejected_reason = (
+                    "VIRTUAL_TANGENT_RANK_MISMATCH:"
+                    f"rank_gain={metrics['rank_gain']},pure_rank={metrics['pure_rank']}"
+                )
+            record = {
+                "scoring_mode": VIRTUAL_TANGENT,
+                "scoring_basis": "HH_VIRTUAL_TANGENT_SPACE",
+                "signal_source": virtual["signal_source"],
+                "insertion_step": int(insertion_step),
+                "insertion_target": int(target),
+                "candidate_number": int(candidate_number),
+                "side": side,
+                "x": x,
+                "t2": float(candidate_state["t2_by_record"][candidate_index]),
+                "grad": float(objective_gradient[candidate_index]),
+                "objective_gradient": float(objective_gradient[candidate_index]),
+                "surface_residual_component": float(
+                    residual_gradient[candidate_index]
+                ),
+                # For nested HH spaces score_pure and score_net agree up to
+                # roundoff.  The residualized pure energy is the stable rank key.
+                "indicator": float(metrics["score_pure"]),
+                "interval_id": raw["interval_id"],
+                "interval_left": float(raw["interval_left"]),
+                "interval_right": float(raw["interval_right"]),
+                "sample_index": int(raw["sample_index"]),
+                "sample_fraction": float(raw["sample_fraction"]),
+                "admissible": admissible,
+                "rejected_reason": rejected_reason,
+                "selected": "NO",
+                **metrics,
+            }
+            step_candidates.append(record)
+
+        admissible = [
+            candidate
+            for candidate in step_candidates
+            if candidate.get("admissible", False)
+        ]
+        reduced = _reduce_candidates_to_interval_best(admissible)
+        ranked = sorted(reduced, key=_hh_virtual_rank_key)
+        for rank, candidate in enumerate(ranked, start=1):
+            candidate["rank"] = rank
+        all_candidates.extend(step_candidates)
+        if not ranked:
+            raise RuntimeError(
+                "Virtual HH tangent scoring found no rank-one admissible candidate"
+            )
+
+        chosen = None
+        for candidate in ranked:
+            if mode == "SCORE_BATCH":
+                score = float(candidate["indicator"])
+                if first_best is not None and score < float(
+                    opts.get("batch_score_rel_tol", 0.85)
+                ) * first_best:
+                    continue
+                side = str(candidate["side"])
+                if opts.get("batch_max_per_side", None) is not None:
+                    count = sum(str(item["side"]) == side for item in selected)
+                    if count >= int(opts["batch_max_per_side"]):
+                        continue
+                separation = float(opts.get("batch_min_separation", 0.04))
+                if any(
+                    str(item["side"]) == side
+                    and abs(float(item["x"]) - float(candidate["x"])) < separation
+                    for item in selected
+                ):
+                    continue
+            chosen = candidate
+            break
+        if chosen is None:
+            break
+        if first_best is None:
+            first_best = float(chosen["indicator"])
+        chosen["selected"] = "YES"
+        selected.append(chosen)
+        current_active = _hh_candidate_active_map(
+            current_active,
+            chosen["side"],
+            chosen["x"],
+        )
+        print(
+            "[PROGRESSIVE_HH] VIRTUAL_TANGENT selected | "
+            f"insertion={insertion_step}/{target} side={chosen['side']} "
+            f"x={chosen['x']:.8f} t2={chosen['t2']:.6g} "
+            f"pure_energy={chosen['score_pure']:.8e} "
+            f"net_energy={chosen['score_net']:.8e}"
+        )
+
+    if not selected and target > 0:
+        raise RuntimeError("Virtual HH tangent scoring selected no candidates")
+
+    active_upper_scores = [
+        initial_scores.get(("UPPER", float(x)), 0.0) for x in level.upper
+    ]
+    active_lower_scores = [
+        initial_scores.get(("LOWER", float(x)), 0.0) for x in level.lower
+    ]
+    active_pair_scores = [
+        initial_scores.get(("PAIR", float(x)), 0.0) for x in level.upper
+    ] if _is_symmetric_reduced(opts) else []
+    metadata = {
+        "scoring_mode": VIRTUAL_TANGENT,
+        "scoring_basis": "HH_VIRTUAL_TANGENT_SPACE",
+        "level_id": int(level.level_id),
+        "mesh": mesh_path,
+        "marker": baseline["marker"],
+        "t2_policy": baseline["t2_policy"],
+        "symmetry_mode": symmetry_mode,
+        "symmetry_sign": symmetry_sign,
+        "signal_source": virtual["signal_source"],
+        "objective_function": virtual["objective_function"],
+        "objective_field_file": virtual["objective_field_file"],
+        "objective_projection_validation": virtual[
+            "objective_projection_validation"
+        ],
+        "fit_diagnostics": virtual["fit_diagnostics"],
+        "lambdas": virtual["lambdas"],
+        "included_constraints": [
+            {key: value for key, value in record.items() if key != "field"}
+            for record in virtual["constraint_records"]
+        ],
+        "inactive_constraints": virtual["inactive_constraints"],
+        "insertion_target": int(target),
+        "insertions_completed": len(selected),
+        "selected_candidates": selected,
+    }
+    csv_path, json_path = _write_hh_virtual_scores(
+        level,
+        all_candidates,
+        metadata,
+    )
+    return {
+        "candidates": list(selected),
+        "raw_candidates": all_candidates,
+        "selected_candidates": selected,
+        "sequential_selection": True,
+        "scoring_basis": "HH_VIRTUAL_TANGENT_SPACE",
+        "scoring_mode": VIRTUAL_TANGENT,
+        "signal_source": virtual["signal_source"],
+        "active_upper_scores": active_upper_scores,
+        "active_lower_scores": active_lower_scores,
+        "active_pair_scores": active_pair_scores,
+        "candidate_scores_csv": csv_path,
+        "metadata_json": json_path,
+        "insertion_target": int(target),
+        "insertions_completed": len(selected),
+    }
+
+
+def _compute_dot_candidate_scores(level, opts):
+    """Dispatch the legacy component score or the opt-in HH tangent score."""
+
+    mode = normalize_hh_scoring_mode(opts.get("scoring_mode", COMPONENT))
+    if mode == VIRTUAL_TANGENT:
+        return _compute_virtual_tangent_candidate_scores(level, opts)
+    return _compute_component_dot_candidate_scores(level, opts)

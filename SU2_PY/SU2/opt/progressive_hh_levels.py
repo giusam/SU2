@@ -493,6 +493,7 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_HH_CANDIDATE_SAMPLES",
         "PROGRESSIVE_HH_MIN_CENTER_SPACING",
         "PROGRESSIVE_HH_ADAPTIVE_INDICATOR",
+        "PROGRESSIVE_HH_SCORING_MODE",
         "PROGRESSIVE_HH_IKKT_ACTIVE_TOL",
         "PROGRESSIVE_HH_SPRING",
         "PROGRESSIVE_HH_SPRING_A",
@@ -723,9 +724,11 @@ def append_selection_history_csv(
         "trigger_mode",
         "refinement",
         "ffd_scoring_mode",
+        "hh_scoring_mode",
         "spring_enabled",
         "side",
         "x",
+        "t2",
         "indicator",
         "indicator_ratio_to_best",
         "interval_id",
@@ -788,11 +791,17 @@ def append_selection_history_csv(
                     "ffd_scoring_mode": selection_metadata.get(
                         "ffd_scoring_mode", c.get("ffd_scoring_mode", "")
                     ),
+                    "hh_scoring_mode": selection_metadata.get(
+                        "scoring_mode", c.get("scoring_mode", "")
+                    ),
                     "spring_enabled": "YES"
                     if selection_metadata.get("spring_enabled")
                     else "NO",
                     "side": c.get("side"),
                     "x": f"{float(c.get('x')):.12g}",
+                    "t2": ""
+                    if c.get("t2") in (None, "")
+                    else f"{float(c.get('t2')):.12g}",
                     "indicator": f"{float(c.get('indicator')):.12e}",
                     "indicator_ratio_to_best": (
                         f"{float(c.get('indicator_ratio_to_best')):.12e}"

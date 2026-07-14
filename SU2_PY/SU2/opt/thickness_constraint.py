@@ -35,6 +35,84 @@ def _as_bool(value, default=False):
     return str(value).strip().upper() in ("YES", "TRUE", "1", "ON")
 
 
+def _hicks_henne_config_bool(value):
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    text = str(value).strip().upper()
+    if text in ("YES", "TRUE", "1", "ON"):
+        return True
+    if text in ("NO", "FALSE", "0", "OFF"):
+        return False
+    raise ValueError(
+        "HICKS_HENNE_T2_BY_CENTER must be a YES/NO boolean value; "
+        f"got {value!r}"
+    )
+
+
+def _positive_finite_hicks_henne_value(value, name):
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number greater than zero") from exc
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"{name} must be a finite number greater than zero")
+    return result
+
+
+def _hicks_henne_t2_policy(config=None):
+    config = {} if config is None else config
+    by_center = _hicks_henne_config_bool(
+        config.get("HICKS_HENNE_T2_BY_CENTER", "NO")
+    )
+    if not by_center:
+        return (
+            "UNIFORM",
+            _positive_finite_hicks_henne_value(
+                config.get("HICKS_HENNE_T2", 1.0), "HICKS_HENNE_T2"
+            ),
+        )
+
+    forward = _positive_finite_hicks_henne_value(
+        config.get("HICKS_HENNE_T2_FORWARD", 3.0),
+        "HICKS_HENNE_T2_FORWARD",
+    )
+    aft = _positive_finite_hicks_henne_value(
+        config.get("HICKS_HENNE_T2_AFT", 1.0),
+        "HICKS_HENNE_T2_AFT",
+    )
+    try:
+        switch_x = float(config.get("HICKS_HENNE_T2_SWITCH_X", 0.5))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "HICKS_HENNE_T2_SWITCH_X must be finite and strictly between zero and one"
+        ) from exc
+    if not math.isfinite(switch_x) or not 0.0 < switch_x < 1.0:
+        raise ValueError(
+            "HICKS_HENNE_T2_SWITCH_X must be finite and strictly between zero and one"
+        )
+    return ("BY_CENTER", forward, aft, switch_x)
+
+
+def _hicks_henne_t2_for_center(center, config=None, policy=None):
+    policy = _hicks_henne_t2_policy(config) if policy is None else policy
+    if policy[0] == "UNIFORM":
+        return policy[1]
+    return policy[1] if float(center) <= policy[3] else policy[2]
+
+
+def _config_uses_hicks_henne(cfg):
+    definition = cfg.get("DEFINITION_DV", {})
+    if isinstance(definition, dict):
+        kinds = definition.get("KIND", [])
+        if any(str(kind).strip().upper() == "HICKS_HENNE" for kind in kinds):
+            return True
+
+    kinds = cfg.get("DV_KIND", "")
+    if not isinstance(kinds, (list, tuple)):
+        kinds = [kinds]
+    return any(str(kind).strip().upper() == "HICKS_HENNE" for kind in kinds)
+
+
 def _normalize_gradient_mode(value):
     mode = str(value or "AUTO").strip().upper()
     aliases = {
@@ -296,9 +374,10 @@ def _read_su2_points_and_marker_segments_with_ids(mesh_filename, marker_name):
     raise ValueError(f"Marker {marker_name!r} was not found in {mesh_filename}")
 
 
-def _hicks_henne_bump(x, center):
+def _hicks_henne_bump(x, center, t2=1.0):
     x = float(x)
     center = float(center)
+    t2 = _positive_finite_hicks_henne_value(t2, "HICKS_HENNE_T2")
     if not 0.0 < center < 1.0:
         return 0.0
     if not 0.0 < x < 1.0:
@@ -306,9 +385,8 @@ def _hicks_henne_bump(x, center):
 
     exponent = math.log(0.5) / math.log(center)
     value = math.sin(math.pi * (x ** exponent))
-    # Keep this kernel aligned with CSurfaceMovement::SetHicksHenne,
-    # where the native SU2 exponent is t2 = 1.
-    return value
+    # Keep this kernel aligned with CSurfaceMovement::SetHicksHenne.
+    return value**t2
 
 
 def _bernstein(n, i, t):
@@ -683,6 +761,9 @@ class ThicknessConstraint:
         self._fallback_warned = False
 
     def _cache_key(self, x_eval, cfg):
+        hicks_henne_t2_policy = (
+            _hicks_henne_t2_policy(cfg) if _config_uses_hicks_henne(cfg) else None
+        )
         payload = repr(
             {
                 "mesh": os.path.abspath(str(cfg.get("MESH_FILENAME", ""))),
@@ -691,6 +772,7 @@ class ThicknessConstraint:
                 "definition_dv": cfg.get("DEFINITION_DV", ""),
                 "dv_value_old": cfg.get("DV_VALUE_OLD", ""),
                 "opt_relax_factor": cfg.get("OPT_RELAX_FACTOR", 1.0),
+                "hicks_henne_t2_policy": hicks_henne_t2_policy,
                 "x": np.asarray(x_eval, dtype=float).tolist(),
             }
         ).encode("utf-8")
@@ -829,6 +911,7 @@ class ThicknessConstraint:
         n_dv = _definition_dv_size(def_dv)
         jac = np.zeros((len(self.x_stations), n_dv), dtype=float)
         relax_factor = float(project.config.get("OPT_RELAX_FACTOR", 1.0))
+        t2_policy = _hicks_henne_t2_policy(project.config)
 
         k = 0
         for i_dv, kind in enumerate(def_dv["KIND"]):
@@ -843,9 +926,10 @@ class ThicknessConstraint:
             side = "UPPER" if float(params[0]) >= 0.5 else "LOWER"
             center = float(params[1])
             scale = float(def_dv["SCALE"][i_dv])
+            t2 = _hicks_henne_t2_for_center(center, policy=t2_policy)
 
             for i_x, x in enumerate(self.x_stations):
-                bump = scale * relax_factor * _hicks_henne_bump(x, center)
+                bump = scale * relax_factor * _hicks_henne_bump(x, center, t2=t2)
                 if self.domain_mode == "FULL":
                     jac[i_x, k] = bump
                 elif self.domain_mode == "HALF_UPPER":

@@ -16,7 +16,6 @@ from SU2.opt.bspline_dot import (
     read_sensitivity_file,
 )
 from SU2.opt.progressive_ffd_blending import basis_values
-from SU2.opt.progressive_ffd_core import ordered_ffd_records
 from SU2.opt.progressive_ffd_split import (
     _parse_curved_surface_lines,
     _parse_existing_dual_box,
@@ -34,6 +33,26 @@ LOCALITY_RADIUS = 0.10
 
 class FFDTangentError(RuntimeError):
     pass
+
+
+def _ordered_ffd_records(columns_by_side, active_sides=None):
+    """Dependency-light copy of the stable optimizer ordering contract."""
+
+    if active_sides is None:
+        active_sides = tuple(columns_by_side)
+    active_sides = {str(side).upper() for side in active_sides}
+    records = []
+    for side in ("UPPER", "LOWER"):
+        if side not in active_sides:
+            continue
+        records.extend(
+            (side, float(x))
+            for x in sorted(columns_by_side.get(side, []))
+        )
+    unknown = active_sides - {"UPPER", "LOWER"}
+    if unknown:
+        raise ValueError(f"Unknown progressive FFD sides: {sorted(unknown)}")
+    return records
 
 
 def normalize_ffd_scoring_mode(value):
@@ -97,7 +116,7 @@ def build_ffd_tangent_state(mesh_path, marker, active_by_side, opts):
         side: sorted(float(value) for value in active_by_side[side])
         for side in active_sides
     }
-    records = ordered_ffd_records(normalized_active, active_sides)
+    records = _ordered_ffd_records(normalized_active, active_sides)
     if not records:
         raise FFDTangentError("Virtual FFD tangent state has no active DVs")
 

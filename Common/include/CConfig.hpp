@@ -153,6 +153,11 @@ private:
   TIME_MARCHING TimeMarching;        /*!< \brief Steady or unsteady (time stepping or dual time stepping) computation. */
   su2double FixAzimuthalLine;        /*!< \brief Fix an azimuthal line due to misalignments of the nearfield. */
   su2double **DV_Value;              /*!< \brief Previous value of the design variable. */
+  bool HicksHenne_T2_ByCenter;       /*!< \brief Select the Hicks-Henne t2 exponent from the bump center. */
+  su2double HicksHenne_T2;           /*!< \brief Uniform Hicks-Henne t2 exponent. */
+  su2double HicksHenne_T2_Forward;   /*!< \brief Hicks-Henne t2 exponent for forward bump centers. */
+  su2double HicksHenne_T2_Aft;       /*!< \brief Hicks-Henne t2 exponent for aft bump centers. */
+  su2double HicksHenne_T2_SwitchX;   /*!< \brief Center coordinate separating forward and aft exponents. */
   su2double Venkat_LimiterCoeff;     /*!< \brief Limiter coefficient */
   unsigned long LimiterIter;         /*!< \brief Freeze the value of the limiter after a number of iterations */
   su2double AdjSharp_LimiterCoeff;   /*!< \brief Coefficient to identify the limit of a sharp edge. */
@@ -2962,6 +2967,21 @@ public:
    * \return Design variable parameter.
    */
   su2double GetParamDV(unsigned short val_dv, unsigned short val_param) const { return ParamDV[val_dv][val_param]; }
+
+  /*! \brief Get the uniform Hicks-Henne t2 exponent. */
+  su2double GetHicksHenne_T2(void) const { return HicksHenne_T2; }
+
+  /*! \brief Get whether the Hicks-Henne t2 exponent is selected from the bump center. */
+  bool GetHicksHenne_T2_ByCenter(void) const { return HicksHenne_T2_ByCenter; }
+
+  /*! \brief Get the Hicks-Henne t2 exponent for forward bump centers. */
+  su2double GetHicksHenne_T2_Forward(void) const { return HicksHenne_T2_Forward; }
+
+  /*! \brief Get the Hicks-Henne t2 exponent for aft bump centers. */
+  su2double GetHicksHenne_T2_Aft(void) const { return HicksHenne_T2_Aft; }
+
+  /*! \brief Get the Hicks-Henne center coordinate separating the two exponents. */
+  su2double GetHicksHenne_T2_SwitchX(void) const { return HicksHenne_T2_SwitchX; }
 
   /*!
    * \brief Get the coordinates of the FFD corner points.

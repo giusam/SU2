@@ -18,7 +18,9 @@ from SU2.opt.bspline_def import (
     read_su2_mesh,
 )
 from SU2.opt.progressive_ffd_core import (
+    _with_selected_ffd_offset_endpoints,
     _with_ffd_offset_endpoints,
+    ffd_offset_endpoint_flags_from_opts,
     validate_active_ffd_columns,
     validate_ffd_mesh_blending,
 )
@@ -699,22 +701,25 @@ def _marker_groups(geometry):
 def _update_runtime_options(base_config, opts, prepared_mesh, geometry):
     opts["ffd_active_xmin"] = float(geometry["x_le"])
     opts["ffd_active_xmax"] = float(geometry["x_te"])
-    optimize_endpoints = bool(opts.get("ffd_optimize_offset_endpoints", False))
-    opts["ffd_active_include_bounds"] = optimize_endpoints
+    optimize_le, optimize_te = ffd_offset_endpoint_flags_from_opts(opts)
+    endpoint_count = int(optimize_le) + int(optimize_te)
+    opts["ffd_active_include_bounds"] = bool(endpoint_count)
     opts["ffd_prepared_mesh_resolved"] = os.path.abspath(prepared_mesh)
-    if optimize_endpoints:
+    if endpoint_count:
         interior = validate_active_ffd_columns(
             opts.get("ffd_initial_interior_columns", []),
             xmin=geometry["x_le"],
             xmax=geometry["x_te"],
             include_bounds=False,
-            min_count=0,
+            min_count=max(0, 2 - endpoint_count),
         )
         opts["ffd_initial_interior_columns"] = interior
-        opts["ffd_initial_columns"] = _with_ffd_offset_endpoints(
+        opts["ffd_initial_columns"] = _with_selected_ffd_offset_endpoints(
             interior,
             geometry["x_le"],
             geometry["x_te"],
+            optimize_le,
+            optimize_te,
         )
     else:
         opts["ffd_initial_columns"] = validate_active_ffd_columns(
@@ -727,6 +732,7 @@ def _update_runtime_options(base_config, opts, prepared_mesh, geometry):
 
 
 def _build_prepare_request(source_mesh, prepared_mesh, geometry, opts):
+    optimize_le, optimize_te = ffd_offset_endpoint_flags_from_opts(opts)
     request = {
         "schema_version": 3,
         "raw_mesh": os.path.abspath(source_mesh),
@@ -739,8 +745,10 @@ def _build_prepare_request(source_mesh, prepared_mesh, geometry, opts):
             float(x) for x in opts.get("ffd_initial_interior_columns", [])
         ],
         "optimize_offset_endpoints": bool(
-            opts.get("ffd_optimize_offset_endpoints", False)
+            optimize_le and optimize_te
         ),
+        "optimize_le_offset_endpoints": bool(optimize_le),
+        "optimize_te_offset_endpoints": bool(optimize_te),
         "bootstrap_tag": opts["ffd_bootstrap_tag"],
         "bootstrap_y_padding_chord": float(
             opts["ffd_bootstrap_y_padding_chord"]
@@ -789,20 +797,23 @@ def prepare_progressive_ffd_input(base_config, opts, partitions=1):
         opts["ffd_marker"],
         domain_mode=opts["ffd_domain_mode"],
     )
-    optimize_endpoints = bool(opts.get("ffd_optimize_offset_endpoints", False))
-    if optimize_endpoints:
+    optimize_le, optimize_te = ffd_offset_endpoint_flags_from_opts(opts)
+    endpoint_count = int(optimize_le) + int(optimize_te)
+    if endpoint_count:
         interior = validate_active_ffd_columns(
             opts.get("ffd_initial_interior_columns", []),
             xmin=geometry["x_le"],
             xmax=geometry["x_te"],
             include_bounds=False,
-            min_count=0,
+            min_count=max(0, 2 - endpoint_count),
         )
         opts["ffd_initial_interior_columns"] = interior
-        opts["ffd_initial_columns"] = _with_ffd_offset_endpoints(
+        opts["ffd_initial_columns"] = _with_selected_ffd_offset_endpoints(
             interior,
             geometry["x_le"],
             geometry["x_te"],
+            optimize_le,
+            optimize_te,
         )
         opts["ffd_active_include_bounds"] = True
     else:

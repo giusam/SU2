@@ -940,6 +940,95 @@ def test_su2_def_moves_offset_endpoints_but_keeps_airfoil_edges_fixed(
     or os.environ.get("RUN_SU2_DEF_SMOKE", "NO").upper() != "YES",
     reason="set RUN_SU2_DEF_SMOKE=YES to enable the native SU2_DEF smoke test",
 )
+@pytest.mark.parametrize(
+    "blending,bspline_orders",
+    [
+        ("BEZIER", (2, 2, 2)),
+        ("BSPLINE_UNIFORM", (4, 2, 2)),
+    ],
+)
+def test_su2_def_moves_te_offset_endpoint_without_le_dv(
+    tmp_path,
+    blending,
+    bspline_orders,
+):
+    columns = [0.0, 0.25, 0.5, 0.75, 1.0]
+    mesh_in = _write_bootstrap_mesh(
+        tmp_path / "bootstrap.su2",
+        columns=columns,
+    )
+    mesh_out = tmp_path / "dual.su2"
+    _split(
+        mesh_in,
+        mesh_out,
+        output_blending=blending,
+        bspline_orders=bspline_orders,
+    )
+
+    config = tmp_path / "te_offset_endpoints.cfg"
+    config.write_text(
+        "\n".join(
+            [
+                "SOLVER= EULER",
+                "MATH_PROBLEM= DIRECT",
+                "MESH_FILENAME= dual.su2",
+                "MESH_FORMAT= SU2",
+                "MESH_OUT_FILENAME= te_offset_endpoints_out",
+                "MARKER_EULER= ( AIRFOIL )",
+                "MARKER_FAR= ( FARFIELD )",
+                "MARKER_PLOTTING= ( AIRFOIL )",
+                "MARKER_MONITORING= ( AIRFOIL )",
+                "DV_KIND= FFD_CONTROL_POINT_2D, FFD_CONTROL_POINT_2D",
+                "DV_MARKER= ( AIRFOIL )",
+                "DV_PARAM= ( UPPER_BOX, 4, 1, 0.0, 1.0 ); "
+                "( LOWER_BOX, 4, 0, 0.0, -1.0 )",
+                "DV_VALUE= 0.002, 0.002",
+                "FFD_CONTINUITY= USER_INPUT",
+                "DEFORM_LINEAR_SOLVER= FGMRES",
+                "DEFORM_LINEAR_SOLVER_PREC= LU_SGS",
+                "DEFORM_LINEAR_SOLVER_ITER= 100",
+                "DEFORM_NONLINEAR_ITER= 1",
+                "DEFORM_LINEAR_SOLVER_ERROR= 1E-14",
+                "DEFORM_STIFFNESS_TYPE= INVERSE_VOLUME",
+                "FFD_TOLERANCE= 1E-12",
+                "FFD_ITERATIONS= 200",
+                f"FFD_BLENDING= {blending}",
+                "FFD_BSPLINE_ORDER= "
+                + ", ".join(str(value) for value in bspline_orders),
+                "OUTPUT_FILES= ( PARAVIEW_ASCII )",
+                "",
+            ]
+        )
+    )
+    env = dict(os.environ)
+    env.setdefault("OMPI_MCA_osc", "pt2pt")
+    result = subprocess.run(
+        [shutil.which("SU2_DEF"), config.name],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    combined_output = result.stdout + result.stderr
+    assert result.returncode == 0, combined_output
+
+    original = read_su2_mesh(mesh_out)["points"]
+    deformed = read_su2_mesh(
+        tmp_path / "te_offset_endpoints_out.su2"
+    )["points"]
+    for edge_id in (0, 4):
+        assert deformed[edge_id] == pytest.approx(original[edge_id], abs=1.0e-12)
+    assert deformed[1][1] > original[1][1]
+    assert deformed[7][1] < original[7][1]
+
+
+@pytest.mark.skipif(
+    shutil.which("SU2_DEF") is None
+    or os.environ.get("RUN_SU2_DEF_SMOKE", "NO").upper() != "YES",
+    reason="set RUN_SU2_DEF_SMOKE=YES to enable the native SU2_DEF smoke test",
+)
 def test_su2_def_dual_box_line_search_does_not_reverse_lower_box(tmp_path):
     mesh_in = _write_bootstrap_mesh(tmp_path / "bootstrap.su2")
     mesh_out = tmp_path / "dual.su2"

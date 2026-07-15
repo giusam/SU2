@@ -325,10 +325,22 @@ def ffd_active_range_from_opts(opts):
     return 0.0, 1.0
 
 
+def ffd_offset_endpoint_flags_from_opts(opts):
+    if opts is None:
+        return False, False
+    legacy = _as_bool(opts.get("ffd_optimize_offset_endpoints", False))
+    optimize_le = _as_bool(
+        opts.get("ffd_optimize_le_offset_endpoints", legacy)
+    )
+    optimize_te = _as_bool(
+        opts.get("ffd_optimize_te_offset_endpoints", legacy)
+    )
+    return optimize_le, optimize_te
+
+
 def ffd_active_include_bounds_from_opts(opts):
-    if opts is not None and _as_bool(
-        opts.get("ffd_optimize_offset_endpoints", False)
-    ):
+    optimize_le, optimize_te = ffd_offset_endpoint_flags_from_opts(opts)
+    if optimize_le or optimize_te:
         return True
     if opts is not None and str(opts.get("ffd_domain_mode", "")).upper() in (
         "FULL",
@@ -343,6 +355,43 @@ def _with_ffd_offset_endpoints(columns, xmin, xmax):
     return _sorted_unique_with_tolerance(
         [float(xmin)] + [float(x) for x in columns] + [float(xmax)]
     )
+
+
+def _with_selected_ffd_offset_endpoints(
+    columns,
+    xmin,
+    xmax,
+    optimize_le,
+    optimize_te,
+):
+    values = [float(x) for x in columns]
+    if optimize_le:
+        values.append(float(xmin))
+    if optimize_te:
+        values.append(float(xmax))
+    return _sorted_unique_with_tolerance(values)
+
+
+def _validate_selected_ffd_offset_endpoints(
+    columns,
+    xmin,
+    xmax,
+    optimize_le,
+    optimize_te,
+):
+    tolerance = 1.0e-10
+    for value in columns:
+        value = float(value)
+        if abs(value - float(xmin)) <= tolerance and not optimize_le:
+            raise ValueError(
+                "Active FFD column at the LE requires "
+                "PROGRESSIVE_FFD_OPTIMIZE_LE_OFFSET_ENDPOINTS=YES"
+            )
+        if abs(value - float(xmax)) <= tolerance and not optimize_te:
+            raise ValueError(
+                "Active FFD column at the TE requires "
+                "PROGRESSIVE_FFD_OPTIMIZE_TE_OFFSET_ENDPOINTS=YES"
+            )
 
 
 def _sorted_unique_with_tolerance(values, tol=1.0e-10):
@@ -372,15 +421,26 @@ def build_ffd_mesh_columns(mesh_in, box_tag, active_columns, opts=None):
     allow_external_columns = _ffd_allow_external_columns_from_opts(opts)
     active_xmin, active_xmax = ffd_active_range_from_opts(opts)
     include_bounds = ffd_active_include_bounds_from_opts(opts)
+    optimize_le, optimize_te = ffd_offset_endpoint_flags_from_opts(opts)
+
+    if not allow_external_columns or optimize_le or optimize_te:
+        _validate_selected_ffd_offset_endpoints(
+            raw_active_columns,
+            active_xmin,
+            active_xmax,
+            optimize_le,
+            optimize_te,
+        )
 
     for boundary in boundary_columns:
         for active in raw_active_columns:
             if abs(float(active) - float(boundary)) <= 1.0e-10:
-                is_enabled_offset_endpoint = _as_bool(
-                    (opts or {}).get("ffd_optimize_offset_endpoints", False)
-                ) and (
-                    abs(float(active) - active_xmin) <= 1.0e-10
-                    or abs(float(active) - active_xmax) <= 1.0e-10
+                is_enabled_offset_endpoint = (
+                    optimize_le
+                    and abs(float(active) - active_xmin) <= 1.0e-10
+                ) or (
+                    optimize_te
+                    and abs(float(active) - active_xmax) <= 1.0e-10
                 )
                 if is_enabled_offset_endpoint:
                     continue
@@ -609,8 +669,26 @@ def get_progressive_ffd_options(config, hh_opts):
     allow_external_columns = _as_bool(
         config.get("PROGRESSIVE_FFD_ALLOW_EXTERNAL_COLUMNS", "NO")
     )
-    optimize_offset_endpoints = _as_bool(
+    legacy_optimize_offset_endpoints = _as_bool(
         config.get("PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS", "NO")
+    )
+    optimize_le_offset_endpoints = _as_bool(
+        config.get(
+            "PROGRESSIVE_FFD_OPTIMIZE_LE_OFFSET_ENDPOINTS",
+            legacy_optimize_offset_endpoints,
+        )
+    )
+    optimize_te_offset_endpoints = _as_bool(
+        config.get(
+            "PROGRESSIVE_FFD_OPTIMIZE_TE_OFFSET_ENDPOINTS",
+            legacy_optimize_offset_endpoints,
+        )
+    )
+    optimize_offset_endpoints = bool(
+        optimize_le_offset_endpoints and optimize_te_offset_endpoints
+    )
+    active_offset_endpoint_count = int(optimize_le_offset_endpoints) + int(
+        optimize_te_offset_endpoints
     )
     active_xmin = float(config.get("PROGRESSIVE_FFD_ACTIVE_XMIN", 0.0))
     active_xmax = float(config.get("PROGRESSIVE_FFD_ACTIVE_XMAX", 1.0))
@@ -619,7 +697,7 @@ def get_progressive_ffd_options(config, hh_opts):
             "PROGRESSIVE_FFD_ACTIVE_XMIN must be less than "
             "PROGRESSIVE_FFD_ACTIVE_XMAX"
         )
-    initial_include_bounds = bool(optimize_offset_endpoints) or (
+    initial_include_bounds = bool(active_offset_endpoint_count) or (
         bool(allow_external_columns) if not dual_box else False
     )
 
@@ -816,25 +894,26 @@ def get_progressive_ffd_options(config, hh_opts):
 
     explicit_initial_columns = _parse_ffd_initial_columns_unbounded(
         config.get("PROGRESSIVE_FFD_INITIAL_COLUMNS", None),
-        min_count=0 if optimize_offset_endpoints else 2,
+        min_count=max(0, 2 - active_offset_endpoint_count),
     )
     if explicit_initial_columns is None:
         fallback = config.get("PROGRESSIVE_HH_INITIAL_UPPER", None)
         explicit_initial_columns = _parse_ffd_initial_columns_unbounded(
             fallback,
-            min_count=0 if optimize_offset_endpoints else 2,
+            min_count=max(0, 2 - active_offset_endpoint_count),
         )
     if explicit_initial_columns is None:
         n0 = int(opts.get("n0", 3))
-        if optimize_offset_endpoints:
+        if active_offset_endpoint_count:
             if n0 < 2:
                 raise ValueError(
-                    "PROGRESSIVE_HH_N0 must be >= 2 when "
-                    "PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS=YES"
+                    "PROGRESSIVE_HH_N0 must be >= 2 when one or more "
+                    "FFD offset endpoints are optimized"
                 )
             span = active_xmax - active_xmin
             initial_interior_columns = [
-                active_xmin + span * value for value in initial_centers(n0 - 2)
+                active_xmin + span * value
+                for value in initial_centers(n0 - active_offset_endpoint_count)
             ]
         else:
             initial_interior_columns = initial_centers(n0)
@@ -844,14 +923,16 @@ def get_progressive_ffd_options(config, hh_opts):
             xmin=active_xmin,
             xmax=active_xmax,
             include_bounds=False,
-            min_count=0 if optimize_offset_endpoints else 2,
+            min_count=max(0, 2 - active_offset_endpoint_count),
         )
 
-    if optimize_offset_endpoints:
-        initial_columns = _with_ffd_offset_endpoints(
+    if active_offset_endpoint_count:
+        initial_columns = _with_selected_ffd_offset_endpoints(
             initial_interior_columns,
             active_xmin,
             active_xmax,
+            optimize_le_offset_endpoints,
+            optimize_te_offset_endpoints,
         )
     else:
         initial_columns = list(initial_interior_columns)
@@ -891,6 +972,8 @@ def get_progressive_ffd_options(config, hh_opts):
             "ffd_direction": direction,
             "ffd_allow_external_columns": allow_external_columns,
             "ffd_optimize_offset_endpoints": optimize_offset_endpoints,
+            "ffd_optimize_le_offset_endpoints": optimize_le_offset_endpoints,
+            "ffd_optimize_te_offset_endpoints": optimize_te_offset_endpoints,
             "ffd_active_xmin": active_xmin,
             "ffd_active_xmax": active_xmax,
             "ffd_active_include_bounds": initial_include_bounds,
@@ -938,7 +1021,8 @@ def get_progressive_ffd_options(config, hh_opts):
             )
         print(
             "[PROGRESSIVE_FFD] optimize offset endpoints = "
-            f"{'YES' if optimize_offset_endpoints else 'NO'}"
+            f"LE={'YES' if optimize_le_offset_endpoints else 'NO'} "
+            f"TE={'YES' if optimize_te_offset_endpoints else 'NO'}"
         )
         print(
             "[PROGRESSIVE_FFD] initial interior columns = "
@@ -1523,14 +1607,21 @@ def _spring_redistribute_ffd_columns(columns, scores, opts):
         scores,
         A=float(opts.get("spring_A", 20.0)),
     )
+    optimize_le, optimize_te = ffd_offset_endpoint_flags_from_opts(opts)
     include_bounds = ffd_active_include_bounds_from_opts(opts)
-    if include_bounds and redistributed:
-        if abs(min(normalized)) > 1.0e-10 or abs(max(normalized) - 1.0) > 1.0e-10:
-            raise ValueError(
-                "Endpoint-enabled FFD spring requires exact xmin/xmax anchors"
-            )
-        redistributed[0] = 0.0
-        redistributed[-1] = 1.0
+    if redistributed:
+        if optimize_le:
+            if abs(min(normalized)) > 1.0e-10:
+                raise ValueError(
+                    "LE-endpoint-enabled FFD spring requires an exact xmin anchor"
+                )
+            redistributed[0] = 0.0
+        if optimize_te:
+            if abs(max(normalized) - 1.0) > 1.0e-10:
+                raise ValueError(
+                    "TE-endpoint-enabled FFD spring requires an exact xmax anchor"
+                )
+            redistributed[-1] = 1.0
     return validate_active_ffd_columns(
         [float(xmin) + span * float(x) for x in redistributed],
         xmin=xmin,

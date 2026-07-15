@@ -508,6 +508,8 @@ def _remove_progressive_keys(cfg):
         "PROGRESSIVE_FFD_DIRECTION",
         "PROGRESSIVE_FFD_INITIAL_COLUMNS",
         "PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS",
+        "PROGRESSIVE_FFD_OPTIMIZE_LE_OFFSET_ENDPOINTS",
+        "PROGRESSIVE_FFD_OPTIMIZE_TE_OFFSET_ENDPOINTS",
     ]
 
     for key in progressive_keys:

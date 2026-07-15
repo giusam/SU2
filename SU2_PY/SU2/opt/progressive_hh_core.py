@@ -392,20 +392,35 @@ def get_progressive_hh_options(config):
         ffd_initial_count = _count_initial_points(ffd_initial_value)
         if ffd_initial_count is None:
             ffd_initial_count = upper_count
-        optimize_ffd_endpoints = _as_bool(
+        legacy_optimize_ffd_endpoints = _as_bool(
             config.get("PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS", "NO")
         )
+        optimize_ffd_le_endpoint = _as_bool(
+            config.get(
+                "PROGRESSIVE_FFD_OPTIMIZE_LE_OFFSET_ENDPOINTS",
+                legacy_optimize_ffd_endpoints,
+            )
+        )
+        optimize_ffd_te_endpoint = _as_bool(
+            config.get(
+                "PROGRESSIVE_FFD_OPTIMIZE_TE_OFFSET_ENDPOINTS",
+                legacy_optimize_ffd_endpoints,
+            )
+        )
+        optimized_ffd_endpoint_count = int(optimize_ffd_le_endpoint) + int(
+            optimize_ffd_te_endpoint
+        )
         if ffd_initial_count is None:
-            if optimize_ffd_endpoints and n0 < 2:
+            if optimized_ffd_endpoint_count and n0 < 2:
                 raise ValueError(
-                    "PROGRESSIVE_HH_N0 must be >= 2 when "
-                    "PROGRESSIVE_FFD_OPTIMIZE_OFFSET_ENDPOINTS=YES"
+                    "PROGRESSIVE_HH_N0 must be >= 2 when one or more "
+                    "FFD offset endpoints are optimized"
                 )
             ffd_initial_count = n0
-        elif optimize_ffd_endpoints:
-            # Explicit FFD lists contain interior columns only.  The two
+        elif optimized_ffd_endpoint_count:
+            # Explicit FFD lists contain interior columns only.  The selected
             # offset endpoints are added by the FFD option parser.
-            ffd_initial_count += 2
+            ffd_initial_count += optimized_ffd_endpoint_count
 
         ffd_domain_mode = str(
             config.get("PROGRESSIVE_FFD_DOMAIN_MODE", "FULL")

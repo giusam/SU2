@@ -16,6 +16,7 @@ from SU2.opt.progressive_hh_tangent import (
     VIRTUAL_TANGENT as HH_VIRTUAL_TANGENT,
     normalize_hh_scoring_mode,
 )
+from SU2.opt.progressive_surface_scoring import parse_te_closure_node_eps
 
 
 class HHLevel:
@@ -260,6 +261,21 @@ def get_progressive_hh_options(config):
     scoring_mode = normalize_hh_scoring_mode(
         config.get("PROGRESSIVE_HH_SCORING_MODE", HH_COMPONENT)
     )
+    scoring_te_closure_node_eps = parse_te_closure_node_eps(
+        config.get("PROGRESSIVE_HH_SCORING_TE_CLOSURE_NODE_EPS", 0.0),
+        "PROGRESSIVE_HH_SCORING_TE_CLOSURE_NODE_EPS",
+    )
+    if scoring_te_closure_node_eps > 0.0:
+        if param_kind != "HICKS_HENNE":
+            raise ValueError(
+                "PROGRESSIVE_HH_SCORING_TE_CLOSURE_NODE_EPS is valid only "
+                "for PROGRESSIVE_PARAM_KIND=HICKS_HENNE"
+            )
+        if scoring_mode != HH_VIRTUAL_TANGENT:
+            raise ValueError(
+                "PROGRESSIVE_HH_SCORING_TE_CLOSURE_NODE_EPS > 0 requires "
+                "PROGRESSIVE_HH_SCORING_MODE=VIRTUAL_TANGENT"
+            )
     refinement = str(config.get("PROGRESSIVE_HH_REFINEMENT", "UNIFORM")).upper()
     adaptive_indicator = str(
         config.get("PROGRESSIVE_HH_ADAPTIVE_INDICATOR", "ABS_GRAD")
@@ -481,6 +497,11 @@ def get_progressive_hh_options(config):
         print(f"[PROGRESSIVE_HH][SYMMETRY] sign = {symmetry_sign}")
         print(f"[PROGRESSIVE_HH] refine state mode = {refine_state_mode}")
         print(f"[PROGRESSIVE_HH] scoring mode = {scoring_mode}")
+        if param_kind == "HICKS_HENNE":
+            print(
+                "[PROGRESSIVE_HH] scoring TE closure-node epsilon = "
+                f"{scoring_te_closure_node_eps:.16g}"
+            )
         if param_kind == "HICKS_HENNE" and symmetry_mode == "REDUCED":
             print(f"[PROGRESSIVE_HH][SYMMETRY] pair count = {pair_count}")
             print(f"[PROGRESSIVE_HH][SYMMETRY] full SU2 HH = {initial_ndv}")
@@ -523,6 +544,7 @@ def get_progressive_hh_options(config):
         "min_center_spacing": min_center_spacing,
         "adaptive_indicator": adaptive_indicator,
         "scoring_mode": scoring_mode,
+        "scoring_te_closure_node_eps": scoring_te_closure_node_eps,
         "ikkt_active_tol": ikkt_active_tol,
         "marker": str(config.get("DV_MARKER", "Airfoil")),
         "scale": scale,
@@ -1010,6 +1032,7 @@ def _refine_adaptive_symmetric(prev_level, result, opts):
         "scoring_basis": scoring.get("scoring_basis", "COMPONENT"),
         "candidate_scores_csv": scoring.get("candidate_scores_csv"),
         "scoring_metadata_json": scoring.get("metadata_json"),
+        "surface_scoring_mask": scoring.get("surface_scoring_mask"),
         "spring_enabled": spring_enabled,
         "spring_timing": spring_timing,
         "spring_score_mode": spring_score_mode,
@@ -1254,6 +1277,7 @@ def refine_adaptive(prev_level, result, opts):
         "scoring_basis": scoring.get("scoring_basis", "COMPONENT"),
         "candidate_scores_csv": scoring.get("candidate_scores_csv"),
         "scoring_metadata_json": scoring.get("metadata_json"),
+        "surface_scoring_mask": scoring.get("surface_scoring_mask"),
         "spring_enabled": spring_enabled,
         "spring_timing": spring_timing,
         "spring_score_mode": spring_score_mode,

@@ -20,6 +20,7 @@ from SU2.opt.progressive_ffd_envelope import (
     FFDEnvelopeError,
     normalize_ffd_envelope_mode,
 )
+from SU2.opt.progressive_surface_scoring import parse_te_closure_node_eps
 
 
 FFD_SCORING_COMPONENT = "COMPONENT"
@@ -665,6 +666,18 @@ def get_progressive_ffd_options(config, hh_opts):
     scoring_mode = _normalize_ffd_scoring_mode(
         config.get("PROGRESSIVE_FFD_SCORING_MODE", FFD_SCORING_COMPONENT)
     )
+    scoring_te_closure_node_eps = parse_te_closure_node_eps(
+        config.get("PROGRESSIVE_FFD_SCORING_TE_CLOSURE_NODE_EPS", 0.0),
+        "PROGRESSIVE_FFD_SCORING_TE_CLOSURE_NODE_EPS",
+    )
+    if (
+        scoring_te_closure_node_eps > 0.0
+        and scoring_mode != FFD_SCORING_VIRTUAL_TANGENT
+    ):
+        raise ValueError(
+            "PROGRESSIVE_FFD_SCORING_TE_CLOSURE_NODE_EPS > 0 requires "
+            "PROGRESSIVE_FFD_SCORING_MODE=VIRTUAL_TANGENT"
+        )
     marker = str(config.get("PROGRESSIVE_FFD_MARKER", opts.get("marker", "AIRFOIL"))).strip()
     allow_external_columns = _as_bool(
         config.get("PROGRESSIVE_FFD_ALLOW_EXTERNAL_COLUMNS", "NO")
@@ -963,6 +976,7 @@ def get_progressive_ffd_options(config, hh_opts):
         {
             "ffd_dv_kind": ffd_dv_kind,
             "ffd_scoring_mode": scoring_mode,
+            "ffd_scoring_te_closure_node_eps": scoring_te_closure_node_eps,
             "ffd_box_tag": box_tag,
             "ffd_marker": marker,
             "ffd_domain_mode": domain_mode,
@@ -1013,6 +1027,10 @@ def get_progressive_ffd_options(config, hh_opts):
         print(f"[PROGRESSIVE_FFD] domain mode = {domain_mode}")
         print(f"[PROGRESSIVE_FFD] blending = {blending_spec.kind}")
         print(f"[PROGRESSIVE_FFD] scoring mode = {scoring_mode}")
+        print(
+            "[PROGRESSIVE_FFD] scoring TE closure-node epsilon = "
+            f"{scoring_te_closure_node_eps:.16g}"
+        )
         print(f"[PROGRESSIVE_FFD] envelope mode = {envelope_mode}")
         if envelope_spec is not None:
             print(
@@ -1830,6 +1848,7 @@ def _refine_ffd_adaptive_sided(prev_level, result, opts):
         "ffd_scoring_mode": scoring.get(
             "ffd_scoring_mode", opts.get("ffd_scoring_mode", FFD_SCORING_COMPONENT)
         ),
+        "surface_scoring_mask": scoring.get("surface_scoring_mask"),
         "spring_enabled": spring_enabled,
         "spring_timing": "POST_OPT",
         "spring_score_mode": "COEFFICIENT",
@@ -2061,6 +2080,7 @@ def _refine_ffd_adaptive_dual(prev_level, result, opts):
         "ffd_scoring_mode": scoring.get(
             "ffd_scoring_mode", opts.get("ffd_scoring_mode", FFD_SCORING_COMPONENT)
         ),
+        "surface_scoring_mask": scoring.get("surface_scoring_mask"),
         "spring_enabled": False,
         "upper_before": sorted(prev_level.upper_columns),
         "lower_before": sorted(prev_level.lower_columns),

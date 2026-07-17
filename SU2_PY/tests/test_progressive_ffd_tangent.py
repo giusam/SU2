@@ -20,10 +20,16 @@ from SU2.opt.progressive_ffd_tangent import (
 )
 from SU2.opt.progressive_hh_core import get_progressive_hh_options
 from SU2.opt.progressive_ffd_levels import build_next_ffd_level
+from SU2.opt.progressive_ffd_levels import _remove_ffd_progressive_keys
 from SU2.opt.progressive_ffd_projection import (
     _compute_dual_bezier_exact_candidate_scores,
     _compute_dual_virtual_tangent_candidate_scores_impl,
     _initialize_virtual_tangent_context,
+)
+from SU2.opt.progressive_surface_scoring import (
+    build_surface_scoring_view,
+    mask_surface_constraint_records,
+    mask_surface_field,
 )
 from tests.test_progressive_ffd_dual import _dual_config
 from tests.test_progressive_ffd_split import _split, _write_bootstrap_mesh
@@ -66,7 +72,112 @@ def test_virtual_scoring_mode_is_explicit_and_component_remains_default():
         get_progressive_hh_options(default_cfg),
     )
     assert default["ffd_scoring_mode"] == COMPONENT
-    assert _virtual_opts()["ffd_scoring_mode"] == VIRTUAL_TANGENT
+    assert default["ffd_scoring_te_closure_node_eps"] == pytest.approx(0.0)
+    virtual = _virtual_opts(
+        PROGRESSIVE_FFD_SCORING_TE_CLOSURE_NODE_EPS=0.01
+    )
+    assert virtual["ffd_scoring_mode"] == VIRTUAL_TANGENT
+    assert virtual["ffd_scoring_te_closure_node_eps"] == pytest.approx(0.01)
+
+
+def test_ffd_scoring_mask_requires_virtual_tangent_and_valid_width():
+    with pytest.raises(ValueError, match="requires.*VIRTUAL_TANGENT"):
+        config = _dual_config(
+            PROGRESSIVE_FFD_SCORING_TE_CLOSURE_NODE_EPS=0.01
+        )
+        get_progressive_ffd_options(config, get_progressive_hh_options(config))
+
+    for value in (-0.01, 1.0, "NOT_A_NUMBER"):
+        with pytest.raises(ValueError, match="finite number in"):
+            _virtual_opts(
+                PROGRESSIVE_FFD_SCORING_TE_CLOSURE_NODE_EPS=value
+            )
+
+
+def test_native_ffd_level_config_does_not_receive_scoring_mask_key():
+    config = {
+        "PROGRESSIVE_FFD_SCORING_MODE": VIRTUAL_TANGENT,
+        "PROGRESSIVE_FFD_SCORING_TE_CLOSURE_NODE_EPS": 0.01,
+        "OBJECTIVE_FUNCTION": "DRAG",
+    }
+    _remove_ffd_progressive_keys(config)
+    assert "PROGRESSIVE_FFD_SCORING_MODE" not in config
+    assert "PROGRESSIVE_FFD_SCORING_TE_CLOSURE_NODE_EPS" not in config
+    assert config["OBJECTIVE_FUNCTION"] == "DRAG"
+
+
+def test_surface_scoring_view_filters_complete_cartesian_node_rows():
+    matrix = np.arange(24, dtype=float).reshape((8, 3))
+    state = {
+        "node_ids": [10, 11, 12, 13],
+        "x_over_c": np.asarray([0.0, 0.989, 0.99, 1.0]),
+        "coordinates": np.asarray(
+            [[0.0, 0.0], [0.989, 0.01], [0.99, 0.005], [1.0, 0.0]]
+        ),
+        "sides": ["upper", "upper", "upper", "upper"],
+        "matrix": matrix,
+    }
+    view, node_mask, diagnostics = build_surface_scoring_view(state, 0.01)
+    assert node_mask.tolist() == [True, True, False, False]
+    assert view["node_ids"] == [10, 11]
+    assert view["matrix"] == pytest.approx(matrix[:4, :])
+    assert view["coordinates"] == pytest.approx(state["coordinates"][:2, :])
+    assert view["sides"] == ["upper", "upper"]
+    assert diagnostics["node_count_removed"] == 2
+    assert diagnostics["cutoff_x_over_c"] == pytest.approx(0.99)
+
+    field = np.arange(8, dtype=float)
+    assert mask_surface_field(field, node_mask) == pytest.approx(field[:4])
+    records = mask_surface_constraint_records(
+        [{"name": "LIFT", "field": field, "lambda_lower": 0.0}],
+        node_mask,
+    )
+    assert records[0]["field"] == pytest.approx(field[:4])
+    assert state["matrix"] == pytest.approx(matrix)
+
+
+def test_te_spike_cannot_drive_virtual_score_after_surface_mask():
+    baseline = {
+        "node_ids": [0, 1],
+        "x_over_c": np.asarray([0.5, 0.995]),
+        "matrix": np.asarray([[1.0], [0.0], [0.0], [0.0]]),
+    }
+    interior = {
+        **baseline,
+        "matrix": np.asarray(
+            [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0]]
+        ),
+    }
+    trailing = {
+        **baseline,
+        "matrix": np.asarray(
+            [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [0.0, 0.0]]
+        ),
+    }
+    signal = np.asarray([0.0, 2.0, 100.0, 0.0])
+    full_interior = compare_tangent_spaces(baseline, interior, signal, 0.5)
+    full_trailing = compare_tangent_spaces(baseline, trailing, signal, 0.9)
+    assert full_trailing["score_pure"] > full_interior["score_pure"]
+
+    masked_baseline, node_mask, _ = build_surface_scoring_view(baseline, 0.01)
+    masked_interior, _, _ = build_surface_scoring_view(interior, 0.01)
+    masked_trailing, _, _ = build_surface_scoring_view(trailing, 0.01)
+    masked_signal = mask_surface_field(signal, node_mask)
+    masked_interior_score = compare_tangent_spaces(
+        masked_baseline,
+        masked_interior,
+        masked_signal,
+        0.5,
+    )
+    masked_trailing_score = compare_tangent_spaces(
+        masked_baseline,
+        masked_trailing,
+        masked_signal,
+        0.9,
+    )
+    assert masked_interior_score["score_pure"] == pytest.approx(4.0)
+    assert masked_trailing_score["score_pure"] == pytest.approx(0.0)
+    assert masked_trailing_score["rank_gain"] == 0
 
 
 @pytest.mark.parametrize(
@@ -437,7 +548,7 @@ def test_virtual_pass_fits_ikkt_once_and_reuses_signal_for_all_candidates(
         states[str(mesh)] = {
             "node_ids": [0, 1],
             "matrix": matrix,
-            "x_over_c": np.asarray([0.25, 0.75]),
+            "x_over_c": np.asarray([0.25, 0.995]),
         }
         return {
             "mesh": str(mesh),
@@ -479,7 +590,7 @@ def test_virtual_pass_fits_ikkt_once_and_reuses_signal_for_all_candidates(
 
     def fake_fit(objective, constraints, baseline):
         fit_calls.append((objective.copy(), list(constraints), baseline["matrix"].copy()))
-        return np.asarray([0.0, 2.0, 1.0, 0.0]), np.asarray([0.5]), {
+        return np.asarray([0.0, 2.0]), np.asarray([0.5]), {
             "status": "ok",
             "residual_gradient_norm": 1.0,
         }
@@ -523,6 +634,7 @@ def test_virtual_pass_fits_ikkt_once_and_reuses_signal_for_all_candidates(
             "adaptive_indicator": "IKKT",
             "ffd_marker": "AIRFOIL",
             "ffd_blending": "BEZIER",
+            "ffd_scoring_te_closure_node_eps": 0.01,
         },
         {"OBJECTIVE_FUNCTION": "DRAG"},
         raw,
@@ -530,9 +642,20 @@ def test_virtual_pass_fits_ikkt_once_and_reuses_signal_for_all_candidates(
         context,
     )
     assert len(fit_calls) == 1
+    fit_objective, fit_constraints, fit_matrix = fit_calls[0]
+    assert fit_objective == pytest.approx([1.0, 2.0])
+    assert fit_constraints[0]["field"] == pytest.approx([1.0, 0.0])
+    assert fit_matrix == pytest.approx(baseline_matrix[:2, :])
     assert len(result["raw_candidates"]) == 2
     assert result["selected_candidate"]["x"] == pytest.approx(0.25)
     assert result["ikkt_lambdas"] == pytest.approx([0.5])
+    assert result["surface_scoring_mask"]["node_count_removed"] == 1
+    rejected = next(
+        candidate
+        for candidate in result["raw_candidates"]
+        if candidate["x"] == pytest.approx(0.75)
+    )
+    assert rejected["admissible"] is False
 
 
 def test_sequential_virtual_selection_reinvokes_pass_with_updated_baseline(

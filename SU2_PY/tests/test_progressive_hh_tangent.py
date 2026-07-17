@@ -83,22 +83,46 @@ def _base_config(**overrides):
 
 
 def test_component_remains_default_and_virtual_mode_is_explicit():
-    assert get_progressive_hh_options(_base_config())["scoring_mode"] == COMPONENT
+    default = get_progressive_hh_options(_base_config())
+    assert default["scoring_mode"] == COMPONENT
+    assert default["scoring_te_closure_node_eps"] == pytest.approx(0.0)
     opts = get_progressive_hh_options(
-        _base_config(PROGRESSIVE_HH_SCORING_MODE=VIRTUAL_TANGENT)
+        _base_config(
+            PROGRESSIVE_HH_SCORING_MODE=VIRTUAL_TANGENT,
+            PROGRESSIVE_HH_SCORING_TE_CLOSURE_NODE_EPS=0.01,
+        )
     )
     assert opts["scoring_mode"] == VIRTUAL_TANGENT
+    assert opts["scoring_te_closure_node_eps"] == pytest.approx(0.01)
     with pytest.raises(ValueError, match="PROGRESSIVE_HH_SCORING_MODE"):
         normalize_hh_scoring_mode("UNKNOWN")
+
+
+def test_hh_scoring_mask_requires_virtual_tangent_and_valid_width():
+    with pytest.raises(ValueError, match="requires.*VIRTUAL_TANGENT"):
+        get_progressive_hh_options(
+            _base_config(PROGRESSIVE_HH_SCORING_TE_CLOSURE_NODE_EPS=0.01)
+        )
+
+    for value in (-0.01, 1.0, "NOT_A_NUMBER"):
+        with pytest.raises(ValueError, match="finite number in"):
+            get_progressive_hh_options(
+                _base_config(
+                    PROGRESSIVE_HH_SCORING_MODE=VIRTUAL_TANGENT,
+                    PROGRESSIVE_HH_SCORING_TE_CLOSURE_NODE_EPS=value,
+                )
+            )
 
 
 def test_native_level_config_does_not_receive_python_scoring_key():
     config = {
         "PROGRESSIVE_HH_SCORING_MODE": VIRTUAL_TANGENT,
+        "PROGRESSIVE_HH_SCORING_TE_CLOSURE_NODE_EPS": 0.01,
         "HICKS_HENNE_T2_BY_CENTER": "YES",
     }
     _remove_progressive_keys(config)
     assert "PROGRESSIVE_HH_SCORING_MODE" not in config
+    assert "PROGRESSIVE_HH_SCORING_TE_CLOSURE_NODE_EPS" not in config
     assert config["HICKS_HENNE_T2_BY_CENTER"] == "YES"
 
 
@@ -309,11 +333,13 @@ def test_production_virtual_score_selects_the_residualized_center(tmp_path):
         "nadd_mode": "GROWTH_RATIO",
         "growth_ratio": 1.25,
         "nfinal": None,
+        "scoring_te_closure_node_eps": 0.01,
     }
     result = _compute_dot_candidate_scores(level, opts)
     assert result["sequential_selection"] is True
     assert len(result["selected_candidates"]) == 1
     assert result["selected_candidates"][0]["x"] == pytest.approx(0.5)
     assert result["selected_candidates"][0]["side"] == "UPPER"
+    assert result["surface_scoring_mask"]["node_count_removed"] == 1
     assert (tmp_path / "hh_candidate_scores_level0.csv").is_file()
     assert (tmp_path / "hh_virtual_tangent_level0.json").is_file()

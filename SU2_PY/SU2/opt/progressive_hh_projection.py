@@ -35,6 +35,11 @@ from SU2.opt.progressive_hh_tangent import (
     project_surface_field,
     validate_surface_projection,
 )
+from SU2.opt.progressive_surface_scoring import (
+    build_surface_scoring_view,
+    mask_surface_constraint_records,
+    mask_surface_field,
+)
 
 
 def get_midpoint_candidates(centers, nsamples=1):
@@ -1923,11 +1928,26 @@ def _prepare_hh_virtual_signal(
             "Virtual HH IKKT requires every active constraint field; " + detail
         )
 
+    baseline_scoring_state, scoring_node_mask, scoring_mask_metadata = (
+        build_surface_scoring_view(
+            baseline_state,
+            opts.get("scoring_te_closure_node_eps", 0.0),
+        )
+    )
+    scoring_objective_field = mask_surface_field(
+        objective_field,
+        scoring_node_mask,
+        label="objective surface field",
+    )
+    scoring_constraint_records = mask_surface_constraint_records(
+        constraint_records,
+        scoring_node_mask,
+    )
     if indicator_mode == "IKKT":
         signal, lambdas, fit_diagnostics = fit_surface_ikkt_signal(
-            objective_field,
-            constraint_records,
-            baseline_state,
+            scoring_objective_field,
+            scoring_constraint_records,
+            baseline_scoring_state,
         )
         signal_source = (
             "IKKT_SURFACE_RESIDUAL"
@@ -1935,13 +1955,13 @@ def _prepare_hh_virtual_signal(
             else "OBJECTIVE_ONLY_NO_ACTIVE_CONSTRAINTS"
         )
     else:
-        signal = np.asarray(objective_field, dtype=float)
+        signal = np.asarray(scoring_objective_field, dtype=float)
         lambdas = np.zeros(0, dtype=float)
         fit_diagnostics = {
             "status": "objective_only",
             "objective_gradient": project_surface_field(
-                baseline_state,
-                objective_field,
+                baseline_scoring_state,
+                scoring_objective_field,
             ).tolist(),
         }
         signal_source = "OBJECTIVE_SURFACE_SENSITIVITY"
@@ -1952,6 +1972,8 @@ def _prepare_hh_virtual_signal(
         "objective_field": objective_field,
         "objective_projection_validation": objective_validation,
         "constraint_records": constraint_records,
+        "baseline_scoring_state": baseline_scoring_state,
+        "surface_scoring_mask": scoring_mask_metadata,
         "inactive_constraints": inactive_records,
         "unsupported_constraints": unsupported,
         "signal": np.asarray(signal, dtype=float),
@@ -2174,7 +2196,9 @@ def _compute_virtual_tangent_candidate_scores(level, opts):
     target = _hh_virtual_insertion_target(level, opts, len(initial_candidates))
     signal = virtual["signal"]
     objective_field = virtual["objective_field"]
-    initial_projection = np.abs(project_surface_field(baseline, signal)).tolist()
+    initial_projection = np.abs(
+        project_surface_field(virtual["baseline_scoring_state"], signal)
+    ).tolist()
     initial_records = list(baseline["records"])
     initial_scores = {
         (str(side).upper(), float(x)): float(initial_projection[index])
@@ -2185,7 +2209,9 @@ def _compute_virtual_tangent_candidate_scores(level, opts):
         "[PROGRESSIVE_HH] Candidate scoring | "
         f"indicator={str(opts.get('adaptive_indicator', 'ABS_GRAD')).upper()} "
         f"scoring_mode={VIRTUAL_TANGENT} kind={dot_kind} "
-        f"signal={virtual['signal_source']} target_insertions={target}"
+        f"signal={virtual['signal_source']} target_insertions={target} "
+        "te_closure_node_eps="
+        f"{virtual['surface_scoring_mask']['te_closure_node_eps']:.16g}"
     )
 
     current_active = {key: list(values) for key, values in active.items()}
@@ -2210,6 +2236,12 @@ def _compute_virtual_tangent_candidate_scores(level, opts):
             symmetry_mode=symmetry_mode,
             symmetry_sign=symmetry_sign,
         )
+        baseline_scoring_step, _baseline_mask, _baseline_mask_metadata = (
+            build_surface_scoring_view(
+                baseline_step,
+                opts.get("scoring_te_closure_node_eps", 0.0),
+            )
+        )
         step_candidates = []
         for candidate_number, raw in enumerate(raw_candidates):
             side = str(raw["side"]).upper()
@@ -2228,9 +2260,15 @@ def _compute_virtual_tangent_candidate_scores(level, opts):
                 symmetry_mode=symmetry_mode,
                 symmetry_sign=symmetry_sign,
             )
+            candidate_scoring_state, _candidate_mask, _candidate_mask_metadata = (
+                build_surface_scoring_view(
+                    candidate_state,
+                    opts.get("scoring_te_closure_node_eps", 0.0),
+                )
+            )
             metrics = compare_tangent_spaces(
-                baseline_step,
-                candidate_state,
+                baseline_scoring_step,
+                candidate_scoring_state,
                 signal,
                 x,
             )
@@ -2239,7 +2277,10 @@ def _compute_virtual_tangent_candidate_scores(level, opts):
                 candidate_state,
                 objective_field,
             )
-            residual_gradient = project_surface_field(candidate_state, signal)
+            residual_gradient = project_surface_field(
+                candidate_scoring_state,
+                signal,
+            )
             admissible = bool(
                 int(metrics["rank_gain"]) == 1
                 and int(metrics["pure_rank"]) == 1
@@ -2365,6 +2406,7 @@ def _compute_virtual_tangent_candidate_scores(level, opts):
         ],
         "fit_diagnostics": virtual["fit_diagnostics"],
         "lambdas": virtual["lambdas"],
+        "surface_scoring_mask": virtual["surface_scoring_mask"],
         "included_constraints": [
             {key: value for key, value in record.items() if key != "field"}
             for record in virtual["constraint_records"]
@@ -2387,6 +2429,7 @@ def _compute_virtual_tangent_candidate_scores(level, opts):
         "scoring_basis": "HH_VIRTUAL_TANGENT_SPACE",
         "scoring_mode": VIRTUAL_TANGENT,
         "signal_source": virtual["signal_source"],
+        "surface_scoring_mask": virtual["surface_scoring_mask"],
         "active_upper_scores": active_upper_scores,
         "active_lower_scores": active_lower_scores,
         "active_pair_scores": active_pair_scores,

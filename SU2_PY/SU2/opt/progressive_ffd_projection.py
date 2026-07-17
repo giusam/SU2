@@ -57,6 +57,12 @@ from SU2.opt.progressive_ffd_split import (
     rewrite_dual_ffd_boxes_with_columns_and_reembed,
     rewrite_single_ffd_box_with_columns_and_reembed,
 )
+from SU2.opt.progressive_surface_scoring import (
+    SurfaceScoringMaskError,
+    build_surface_scoring_view,
+    mask_surface_constraint_records,
+    mask_surface_field,
+)
 from SU2.opt.progressive_hh_projection import (
     _compute_ikkt_residual_vector,
     _dot_problem_kind,
@@ -1919,6 +1925,9 @@ def _virtual_ikkt_metadata(
         ),
         "sensitivity_metric": "DISCRETE_EUCLIDEAN",
         "sensitivity_weighting": "NONE",
+        "surface_scoring_mask": virtual_context.get(
+            "surface_scoring_mask", {}
+        ),
         "sign_convention": "C_GE_ZERO_LAGRANGIAN_MINUS_LAMBDA_C",
         "included_constraints": included,
         "inactive_constraints": virtual_context.get("inactive_constraints", []),
@@ -2045,12 +2054,28 @@ def _compute_dual_virtual_tangent_candidate_scores_impl(
             baseline_state,
             virtual_context,
         )
+        baseline_scoring_state, scoring_node_mask, scoring_mask_metadata = (
+            build_surface_scoring_view(
+                baseline_state,
+                opts.get("ffd_scoring_te_closure_node_eps", 0.0),
+            )
+        )
+        scoring_objective_field = mask_surface_field(
+            virtual_context["objective_field"],
+            scoring_node_mask,
+            label="objective surface field",
+        )
+        scoring_constraint_records = mask_surface_constraint_records(
+            virtual_context["constraint_records"],
+            scoring_node_mask,
+        )
+        virtual_context["surface_scoring_mask"] = scoring_mask_metadata
         indicator_mode = str(opts.get("adaptive_indicator", "ABS_GRAD")).upper()
         if indicator_mode == "IKKT":
             signal, lambdas, fit_diagnostics = fit_surface_ikkt_signal(
-                virtual_context["objective_field"],
-                virtual_context["constraint_records"],
-                baseline_state,
+                scoring_objective_field,
+                scoring_constraint_records,
+                baseline_scoring_state,
             )
             signal_source = (
                 "IKKT_SURFACE_RESIDUAL"
@@ -2058,12 +2083,12 @@ def _compute_dual_virtual_tangent_candidate_scores_impl(
                 else "OBJECTIVE_ONLY_NO_ACTIVE_CONSTRAINTS"
             )
         else:
-            signal = np.asarray(virtual_context["objective_field"], dtype=float)
+            signal = np.asarray(scoring_objective_field, dtype=float)
             lambdas = np.zeros(0, dtype=float)
             fit_diagnostics = {
                 "status": "objective_only",
                 "objective_gradient": project_surface_field(
-                    baseline_state,
+                    baseline_scoring_state,
                     signal,
                 ).tolist(),
             }
@@ -2114,13 +2139,24 @@ def _compute_dual_virtual_tangent_candidate_scores_impl(
                     candidate_active,
                     opts,
                 )
+                candidate_scoring_state, _candidate_node_mask, _mask_metadata = (
+                    build_surface_scoring_view(
+                        candidate_state,
+                        opts.get("ffd_scoring_te_closure_node_eps", 0.0),
+                    )
+                )
                 metrics = compare_tangent_spaces(
-                    baseline_state,
-                    candidate_state,
+                    baseline_scoring_state,
+                    candidate_scoring_state,
                     signal,
                     x,
                 )
-            except (FFDBoxSplitError, FFDEnvelopeError, FFDTangentError) as exc:
+            except (
+                FFDBoxSplitError,
+                FFDEnvelopeError,
+                FFDTangentError,
+                SurfaceScoringMaskError,
+            ) as exc:
                 _remove_artifact_path(
                     variant.get("mesh") if variant is not None else candidate_mesh_path
                 )
@@ -2146,7 +2182,10 @@ def _compute_dual_virtual_tangent_candidate_scores_impl(
                 candidate_state,
                 virtual_context["objective_field"],
             )
-            residual_gradient = project_surface_field(candidate_state, signal)
+            residual_gradient = project_surface_field(
+                candidate_scoring_state,
+                signal,
+            )
             constraint_components = {}
             for record in virtual_context["constraint_records"]:
                 projected = project_surface_field(candidate_state, record["field"])
@@ -2280,6 +2319,7 @@ def _compute_dual_virtual_tangent_candidate_scores_impl(
             ],
             "ikkt_lambdas": np.asarray(lambdas, dtype=float).tolist(),
             "ikkt_metadata": ikkt_metadata,
+            "surface_scoring_mask": scoring_mask_metadata,
             "selected_candidate": best_candidate,
         }
     finally:
@@ -2727,6 +2767,7 @@ def _compute_dual_bezier_exact_candidate_scores(
         }
         selected_candidates = []
         all_candidates = []
+        surface_scoring_mask = None
         selected_root = os.path.join(
             level.workdir,
             "FFD_SELECTED_CANDIDATE",
@@ -2773,6 +2814,11 @@ def _compute_dual_bezier_exact_candidate_scores(
                     insertion_target=insertion_target,
                 )
             selected = pass_result["selected_candidate"]
+            if scoring_mode == VIRTUAL_TANGENT:
+                surface_scoring_mask = pass_result.get(
+                    "surface_scoring_mask",
+                    surface_scoring_mask,
+                )
             side = str(selected["side"]).upper()
             selected_x = float(selected["x"])
             if any(
@@ -2844,6 +2890,7 @@ def _compute_dual_bezier_exact_candidate_scores(
             "insertion_target": insertion_target,
             "insertions_completed": len(selected_candidates),
             "active_by_side_after": current_active,
+            "surface_scoring_mask": surface_scoring_mask,
         }
     except Exception:
         _cleanup_exact_scoring_artifacts(level, opts)

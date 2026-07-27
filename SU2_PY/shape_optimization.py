@@ -76,6 +76,10 @@ def _build_online_trigger_opts(hh_opts, ilevel, current_ndv=None):
         stagnation_tolerance=hh_opts["stag_tol"],
         stagnation_band=hh_opts["stag_band"],
         stagnation_window=hh_opts["stag_window"],
+        dwell=hh_opts.get("econ_dwell", 4),
+        min_ref=hh_opts.get("econ_min_ref", 4),
+        n_max=hh_opts.get("econ_n_max", 40),
+        rate_floor=hh_opts.get("econ_rate_floor", 1.0e-4),
     )
 
 
@@ -600,6 +604,14 @@ def progressive_hh_shape_optimization(
             refine_now = bool(getattr(project, "refinement_triggered", False))
 
         if not refine_now:
+            if (
+                hh_opts.get("nfinal", None) is not None
+                and level.ndv < int(hh_opts["nfinal"])
+            ):
+                raise RuntimeError(
+                    "Progressive HH stopped before reaching "
+                    f"NFINAL={hh_opts['nfinal']} (current NDV={level.ndv})"
+                )
             sys.stdout.write(f"[PROGRESSIVE_HH] Stop after level {ilevel}\n")
             break
 

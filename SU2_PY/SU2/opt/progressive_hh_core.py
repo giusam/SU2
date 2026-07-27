@@ -312,6 +312,7 @@ def get_progressive_hh_options(config):
         "SLOPE_EFFICIENCY_FILTERED",
         "SLOPE_EFFICIENCY_BEST_LOG",
         "STAGNATION_TRIGGER",
+        "ECONOMIC_TRIGGER",
     )
     if trigger not in allowed_triggers:
         raise ValueError(
@@ -525,6 +526,12 @@ def get_progressive_hh_options(config):
         "stag_band": float(config.get("PROGRESSIVE_HH_STAG_BAND", 0.02)),
         "stag_window": int(config.get("PROGRESSIVE_HH_STAG_WINDOW", 3)),
         "warmup_iter": int(config.get("PROGRESSIVE_HH_WARMUP_ITER", 0)),
+        "econ_dwell": int(config.get("PROGRESSIVE_HH_ECON_DWELL", 4)),
+        "econ_min_ref": int(config.get("PROGRESSIVE_HH_ECON_MIN_REF", 4)),
+        "econ_n_max": int(config.get("PROGRESSIVE_HH_ECON_N_MAX", 40)),
+        "econ_rate_floor": float(
+            config.get("PROGRESSIVE_HH_ECON_RATE_FLOOR", 1.0e-4)
+        ),
         "max_iter_per_level": int(
             config.get(
                 "PROGRESSIVE_HH_MAX_ITER_PER_LEVEL",

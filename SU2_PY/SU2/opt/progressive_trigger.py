@@ -16,6 +16,7 @@ ALLOWED_TRIGGERS = (
     "SLOPE_EFFICIENCY_FILTERED",
     "SLOPE_EFFICIENCY_BEST_LOG",
     "STAGNATION_TRIGGER",
+    "ECONOMIC_TRIGGER",
 )
 
 
@@ -225,6 +226,122 @@ def _check_slope_best_log_trigger(project, obj_value, opts):
         raise RefinementTriggered()
 
 
+def _check_economic_trigger(project, obj_value, opts):
+    """Robust-saturation condition of the economic trigger.
+
+    Fires when the recent log-rate of the best-so-far objective falls below
+    alpha times a transient-free reference rate:
+
+        r_now < alpha * r_ref
+
+    r_now  = mean drop of log(best obj) per evaluation over the last k;
+    r_ref  = median of the rolling rates whose windows do not touch the
+             first 2 evaluations of the level (the initial transient can
+             never enter the reference — the structural defect of the
+             slope criterion);
+    r_ref is usable only after min_ref clean rates exist.
+
+    Forced exits: level length >= n_max evaluations, or r_now below an
+    absolute floor once the reference is usable.
+
+    Calibrated offline on the 8 W2/4/6/8 runs (replay 26/07/2026):
+    alpha=0.2, k=4, dwell=4, min_ref=4, patience=2.
+    """
+    _init_trigger_state(project)
+
+    state = project.trigger_state
+    state.setdefault("econ_log_best", [])
+    state.setdefault("econ_clean_rates", [])
+    state.setdefault("econ_bad_count", 0)
+
+    alpha = float(opts.get("tol", 0.2))
+    k = max(1, int(opts.get("window", 4)))
+    dwell = max(1, int(opts.get("dwell", 4)))
+    min_ref = max(1, int(opts.get("min_ref", 4)))
+    patience = max(1, int(opts.get("patience", 2)))
+    n_max = int(opts.get("n_max", 40))
+    rate_floor = float(opts.get("rate_floor", 1.0e-4))
+    eps = float(opts.get("eps", 1.0e-300))
+
+    best_obj = state.get("best_obj", None)
+    if best_obj is None or obj_value < best_obj:
+        best_obj = obj_value
+        state["best_obj"] = best_obj
+
+    log_best = state["econ_log_best"]
+    log_best.append(math.log(max(best_obj, eps)))
+    i = len(log_best)
+
+    if i <= k:
+        return
+
+    r_now = (log_best[i - k - 1] - log_best[i - 1]) / float(k)
+
+    # the window [i-k, i] is transient-free if it starts at evaluation 3+
+    if i - k >= 3:
+        state["econ_clean_rates"].append(r_now)
+
+    clean = state["econ_clean_rates"]
+
+    if i < dwell:
+        return
+
+    if not _trigger_can_fire(project, opts):
+        _log_trigger_warmup("ECONOMIC_TRIGGER", project, opts)
+        return
+
+    if i >= n_max:
+        project.refinement_triggered = True
+        _write(project, f"ECONOMIC_TRIGGER | forced exit: n_max={n_max} reached -> STOP")
+        raise RefinementTriggered()
+
+    if len(clean) < min_ref:
+        _write(
+            project,
+            f"ECONOMIC_TRIGGER | reference not ready ({len(clean)}/{min_ref} clean rates)",
+        )
+        return
+
+    if r_now < rate_floor:
+        project.refinement_triggered = True
+        _write(
+            project,
+            f"ECONOMIC_TRIGGER | forced exit: rate {r_now:.6e} < floor {rate_floor:.6e} -> STOP",
+        )
+        raise RefinementTriggered()
+
+    sorted_rates = sorted(clean)
+    n = len(sorted_rates)
+    if n % 2 == 1:
+        r_ref = sorted_rates[n // 2]
+    else:
+        r_ref = 0.5 * (sorted_rates[n // 2 - 1] + sorted_rates[n // 2])
+
+    if r_ref <= 0.0:
+        _write(project, "ECONOMIC_TRIGGER | non-positive reference rate, skip check")
+        return
+
+    saturated = r_now < alpha * r_ref
+
+    if saturated:
+        state["econ_bad_count"] += 1
+    else:
+        state["econ_bad_count"] = 0
+
+    _write(
+        project,
+        "ECONOMIC_TRIGGER | "
+        f"r_now={r_now:.6e} r_ref={r_ref:.6e} alpha={alpha:.3f} "
+        f"ratio={r_now / r_ref:.6e} "
+        f"bad_count={state['econ_bad_count']}/{patience}",
+    )
+
+    if state["econ_bad_count"] >= patience:
+        project.refinement_triggered = True
+        _write(project, "ECONOMIC_TRIGGER | robust saturation -> STOP")
+        raise RefinementTriggered()
+
+
 def _check_stagnation_trigger(project, obj_value, opts):
     _init_trigger_state(project)
     can_fire = _trigger_can_fire(project, opts)
@@ -306,6 +423,8 @@ def check_project_trigger(project, obj_value, opts=None):
         _check_slope_best_log_trigger(project, obj_value, opts)
     elif trigger == "STAGNATION_TRIGGER":
         _check_stagnation_trigger(project, obj_value, opts)
+    elif trigger == "ECONOMIC_TRIGGER":
+        _check_economic_trigger(project, obj_value, opts)
 
 
 def record_objective_and_check(project, obj_value, opts=None):
@@ -338,6 +457,10 @@ def build_online_trigger_opts(
     stagnation_tolerance=1.0e-3,
     stagnation_band=0.02,
     stagnation_window=3,
+    dwell=4,
+    min_ref=4,
+    n_max=40,
+    rate_floor=1.0e-4,
     **_unused,
 ):
     if _is_final_level(
@@ -384,6 +507,20 @@ def build_online_trigger_opts(
             "stag_band": float(stagnation_band),
             "stag_window": int(stagnation_window),
             "warmup_iter": warmup_iter,
+        }
+
+    if trigger == "ECONOMIC_TRIGGER":
+        return {
+            "trigger": trigger,
+            "window": int(window),
+            "tol": float(tolerance),
+            "dwell": int(dwell),
+            "min_ref": int(min_ref),
+            "patience": int(patience),
+            "n_max": int(n_max),
+            "rate_floor": float(rate_floor),
+            "warmup_iter": warmup_iter,
+            "eps": float(eps),
         }
 
     return None

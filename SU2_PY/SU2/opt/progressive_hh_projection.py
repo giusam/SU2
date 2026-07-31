@@ -40,6 +40,7 @@ from SU2.opt.progressive_surface_scoring import (
     mask_surface_constraint_records,
     mask_surface_field,
 )
+from SU2.opt.progressive_design import read_ranking_design_directory
 
 
 def get_midpoint_candidates(centers, nsamples=1):
@@ -242,6 +243,17 @@ def _find_real_adjoint_assets(level_dir, func_name):
 
     adjoint_folder_name = f"ADJOINT_{func_name}"
 
+    ranking_design = read_ranking_design_directory(level_dir)
+    if ranking_design is not None:
+        adjoint_dir = os.path.join(ranking_design, adjoint_folder_name)
+        if not os.path.isdir(adjoint_dir):
+            raise FileNotFoundError(
+                "The accepted/converged ranking DSN lacks a required adjoint; "
+                "refusing to borrow one from another design: "
+                f"{adjoint_dir}"
+            )
+        return adjoint_dir, ranking_design
+
     candidates = sorted(
         glob.glob(os.path.join(level_dir, "DESIGNS", "DSN_*", adjoint_folder_name))
     )
@@ -260,7 +272,11 @@ def _find_latest_design_with_geometry(level_dir, func_name=None):
     """
     Return the most recent DSN_* directory that contains usable geometry data.
     """
-    designs = sorted(glob.glob(os.path.join(level_dir, "DESIGNS", "DSN_*")))
+    ranking_design = read_ranking_design_directory(level_dir)
+    if ranking_design is not None:
+        designs = [ranking_design]
+    else:
+        designs = sorted(glob.glob(os.path.join(level_dir, "DESIGNS", "DSN_*")))
     if not designs:
         raise FileNotFoundError(
             f"No DSN_* folders found in {os.path.join(level_dir, 'DESIGNS')}"

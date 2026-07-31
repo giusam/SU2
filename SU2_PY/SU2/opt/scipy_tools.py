@@ -16,6 +16,7 @@ from SU2.opt.progressive_hh_core import (
     full_to_reduced_symmetric,
     reduce_symmetric_gradient,
 )
+from SU2.opt.progressive_design import find_project_design
 
 
 class RefinementTriggered(Exception):
@@ -75,6 +76,26 @@ def _reduce_jac_if_needed(J, project):
             for row in J
         ]
     )
+
+
+def _record_slsqp_accepted_iterate(project, x):
+    """Record an SLSQP major iterate in full-DV space.
+
+    SLSQP calls its callback only for accepted major iterates.  Objective
+    evaluations performed by its line search never enter this history.
+    """
+
+    x_optimizer = [float(value) for value in x]
+    x_full = [float(value) for value in _expand_if_needed(x_optimizer, project)]
+    history = getattr(project, "accepted_dv_history", None)
+    if history is None:
+        history = []
+        project.accepted_dv_history = history
+    if not history or history[-1] != x_full:
+        history.append(x_full)
+    project.last_accepted_dv_values = x_full
+    if _is_reduced_symmetry(project):
+        project.last_accepted_reduced_dv_values = x_optimizer
 
 
 def _validate_reduced_bounds(xb, n_pairs, sign):
@@ -418,6 +439,8 @@ _check_stagnation_trigger = _progressive_trigger._check_stagnation_trigger
 def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
     from scipy.optimize import fmin_slsqp
 
+    project.scipy_optimizer = "SLSQP"
+
     if x0 is None:
         x0 = []
     if xb is None:
@@ -524,11 +547,19 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
     project.last_reduced_dv_values = None
     project.opt_dv_values = None
     project.opt_reduced_dv_values = None
+    project.accepted_dv_history = []
+    project.last_accepted_dv_values = None
+    project.last_accepted_reduced_dv_values = None
+    project.refinement_dv_values = None
+    project.refinement_reduced_dv_values = None
+    project.last_obj_grad_design_folder = None
 
     if reduced_symmetry:
         project.last_dv_values = expand_symmetric_dv(x0, symmetry["sign"])
         project.last_reduced_dv_values = [float(v) for v in x0]
         project.initial_full_dv_values = x0_full_scaled
+
+    _record_slsqp_accepted_iterate(project, x0)
 
     if not hasattr(project, "trigger_opts"):
         project.trigger_opts = None
@@ -551,6 +582,7 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
             full_output=True,
             acc=accu,
             epsilon=eps,
+            callback=lambda x: _record_slsqp_accepted_iterate(project, x),
         )
     except RefinementTriggered:
         sys.stdout.write(
@@ -561,6 +593,7 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
 
     if outputs is not None:
         try:
+            _record_slsqp_accepted_iterate(project, outputs[0])
             if reduced_symmetry:
                 z_opt = [float(v) for v in outputs[0]]
                 project.opt_reduced_dv_values = z_opt
@@ -568,14 +601,21 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
             else:
                 project.opt_dv_values = [float(v) for v in outputs[0]]
         except Exception:
-            project.opt_dv_values = getattr(project, "last_dv_values", None)
-    else:
-        project.opt_dv_values = getattr(project, "last_dv_values", None)
-        if reduced_symmetry:
-            project.opt_reduced_dv_values = getattr(
+            project.opt_dv_values = getattr(
                 project,
-                "last_reduced_dv_values",
+                "last_accepted_dv_values",
                 None,
+            )
+    else:
+        trigger_state = getattr(project, "trigger_state", None) or {}
+        project.opt_dv_values = trigger_state.get(
+            "trigger_dv_values",
+            getattr(project, "last_accepted_dv_values", None),
+        )
+        if reduced_symmetry:
+            project.opt_reduced_dv_values = trigger_state.get(
+                "trigger_reduced_dv_values",
+                getattr(project, "last_accepted_reduced_dv_values", None),
             )
 
     return outputs
@@ -588,6 +628,8 @@ def scipy_slsqp(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
 
 def scipy_cg(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
     from scipy.optimize import fmin_cg
+
+    project.scipy_optimizer = "CG"
 
     if _is_reduced_symmetry(project):
         raise ValueError(
@@ -657,6 +699,8 @@ def scipy_cg(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
 def scipy_bfgs(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
     from scipy.optimize import fmin_bfgs
 
+    project.scipy_optimizer = "BFGS"
+
     if _is_reduced_symmetry(project):
         raise ValueError(
             "PROGRESSIVE_HH_SYMMETRY_MODE=REDUCED currently supports only SLSQP"
@@ -718,6 +762,8 @@ def scipy_bfgs(project, x0=None, xb=None, its=100, accu=1e-10, grads=True):
 
 
 def scipy_powell(project, x0=None, xb=None, its=100, accu=1e-10, grads=False):
+    project.scipy_optimizer = "POWELL"
+
     from scipy.optimize import fmin_powell
 
     if _is_reduced_symmetry(project):
@@ -802,9 +848,27 @@ def obj_df(x, project):
     # Store the last objective gradient evaluated by scipy
     project.last_obj_grad = dobj.tolist()
     project.last_obj_grad_x = list(x)
-    if _is_reduced_symmetry(project):
-        project.last_obj_grad_full = dobj_full.tolist()
-        project.last_obj_grad_x_full = [float(v) for v in x_eval]
+    project.last_obj_grad_full = dobj_full.tolist()
+    project.last_obj_grad_x_full = [float(v) for v in x_eval]
+
+    # Gradient requests in SLSQP occur at major iterates, not at rejected
+    # line-search trials.  Recording here also covers the initial iterate,
+    # whose gradient precedes the first callback.
+    if getattr(project, "scipy_optimizer", None) == "SLSQP":
+        _record_slsqp_accepted_iterate(project, x)
+
+    try:
+        design = find_project_design(project, x_eval)
+        project.last_obj_grad_design_folder = design.folder
+    except Exception as exc:
+        project.last_obj_grad_design_folder = None
+        project.last_obj_grad_design_error = str(exc)
+
+    # Post-adjoint refinement hooks sample only accepted, adjoint-backed DSNs.
+    _progressive_trigger.record_gradient_and_check(
+        project,
+        getattr(project, "trigger_history", [None])[-1],
+    )
 
     return dobj
 

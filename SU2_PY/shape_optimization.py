@@ -2,6 +2,8 @@
 ## \file shape_optimization.py
 ## \brief Python script for performing the shape optimization.
 
+import contextlib
+import copy
 import os
 import sys
 import shutil
@@ -28,10 +30,143 @@ from SU2.opt.progressive_ffd import (
     build_initial_ffd_level,
     build_next_ffd_level,
     build_ffd_spring_reallocated_level,
-    refresh_ffd_scoring_baseline,
+    refresh_adaptive_scoring_baseline,
     prepare_progressive_ffd_input,
     write_ffd_level_config,
 )
+from SU2.opt.progressive_hh_projection import (
+    _compute_dot_candidate_scores as _hh_scorer,
+)
+from SU2.opt.progressive_ffd_projection import (
+    _compute_ffd_dot_candidate_scores as _ffd_scorer,
+)
+from SU2.opt.progressive_design import (
+    find_design_mesh,
+    require_direct_convergence,
+    resolve_design_directory,
+    write_ranking_design_manifest,
+)
+
+
+def _verify_trigger_batch_consistency(project, new_level, label):
+    """Compare the post-adjoint trigger batch with the real refine batch.
+
+    Logs a warning on mismatch; does not abort (the refine result is
+    authoritative — the probe ran on an earlier adjoint snapshot).
+    """
+    trigger_state = getattr(project, "trigger_state", None) or {}
+    if trigger_state.get("trajectory_trigger_batch"):
+        trigger_name = "TRAJECTORY_READY"
+        trigger_batch = trigger_state["trajectory_trigger_batch"]
+    else:
+        trigger_name = "BATCH_STABILITY"
+        trigger_batch = trigger_state.get("trigger_batch")
+    if not trigger_batch:
+        return
+
+    metadata = getattr(new_level, "selection_metadata", None) or {}
+    selected = metadata.get("selected", [])
+    refine_batch = tuple(
+        (str(c.get("side", "")).upper(), round(float(c.get("x", 0.0)), 12))
+        for c in selected
+    )
+
+    if refine_batch == tuple(trigger_batch):
+        sys.stdout.write(
+            f"[{label}] {trigger_name} | refine batch matches trigger batch\n"
+        )
+    else:
+        sys.stdout.write(
+            f"[{label}] {trigger_name} | WARNING: refine batch differs from "
+            f"trigger batch\n"
+            f"[{label}]   trigger: {list(trigger_batch)}\n"
+            f"[{label}]   refine : {list(refine_batch)}\n"
+        )
+
+
+def _make_post_adjoint_probe(level, opts, scorer, trigger_name):
+    """Build an isolated scorer closure for a post-adjoint trigger.
+
+    The scorer normally writes artifacts (candidate meshes, DOT_ONLY_* dirs,
+    FFD_SELECTED_CANDIDATE, score CSV/JSON) into level.workdir.  To keep probe
+    calls from touching the real level directory, each call runs on a shallow
+    clone of the level whose workdir is a scratch directory containing:
+      - a symlink to the real DESIGNS tree (adjoint assets, read-only usage)
+      - a copy of the level config
+      - symlinks to any root-level mesh files the scorer may resolve
+    All scorer outputs then land inside the scratch directory, which is
+    recreated on every call.
+    """
+    trigger_name = str(trigger_name).upper()
+    probe_directories = {
+        "BATCH_STABILITY": "BATCH_STABILITY_PROBE",
+        "TRAJECTORY_READY": "TRAJECTORY_READY_PROBE",
+    }
+    if trigger_name not in probe_directories:
+        raise ValueError(f"Unsupported post-adjoint trigger {trigger_name!r}")
+
+    real_workdir = os.path.abspath(level.workdir)
+    probe_root = os.path.join(real_workdir, probe_directories[trigger_name])
+
+    def _probe(design_folder=None):
+        if not design_folder:
+            raise RuntimeError(
+                f"{trigger_name} cannot identify the DSN of the current adjoint"
+            )
+        real_design_dir = resolve_design_directory(real_workdir, design_folder)
+        require_direct_convergence(real_design_dir)
+        real_design_mesh = find_design_mesh(real_design_dir)
+
+        if os.path.isdir(probe_root):
+            shutil.rmtree(probe_root)
+        os.makedirs(probe_root)
+
+        designs_src = os.path.join(real_workdir, "DESIGNS")
+        if os.path.isdir(designs_src):
+            os.symlink(designs_src, os.path.join(probe_root, "DESIGNS"))
+
+        cfg_src = os.path.join(real_workdir, level.config_filename)
+        if os.path.isfile(cfg_src):
+            shutil.copy2(cfg_src, os.path.join(probe_root, level.config_filename))
+
+        for entry in os.listdir(real_workdir):
+            if entry.endswith(".su2") and os.path.isfile(
+                os.path.join(real_workdir, entry)
+            ):
+                os.symlink(
+                    os.path.join(real_workdir, entry),
+                    os.path.join(probe_root, entry),
+                )
+
+        probe_level = copy.copy(level)
+        probe_level.workdir = probe_root
+        probe_design_dir = os.path.join(
+            probe_root,
+            "DESIGNS",
+            os.path.basename(real_design_dir),
+        )
+        probe_design_mesh = os.path.join(
+            probe_design_dir,
+            os.path.basename(real_design_mesh),
+        )
+        cfg_probe = SU2.io.Config(os.path.join(probe_root, level.config_filename))
+        objective_name = str(
+            cfg_probe.get("OBJECTIVE_FUNCTION", "DRAG")
+        ).split(",", 1)[0].strip().upper()
+        write_ranking_design_manifest(
+            probe_root,
+            probe_design_dir,
+            probe_design_mesh,
+            [],
+            objective_name,
+        )
+        # The scorer prints its full per-candidate trace; during a trigger
+        # probe only the compact trigger recap line is of interest.
+        with open(os.devnull, "w") as devnull:
+            with contextlib.redirect_stdout(devnull):
+                return scorer(probe_level, opts)
+
+    return _probe
 
 
 HH_TE_BOUND_SCALE_KEYS = (
@@ -345,6 +480,8 @@ def run_single_level(
     progressive_hh_opts=None,
     thickness_constraint=None,
     progressive_label=None,
+    batch_stability_scorer_fn=None,
+    trajectory_ready_scorer_fn=None,
 ):
     config = SU2.io.Config(filename)
     if thickness_constraint is None:
@@ -419,6 +556,47 @@ def run_single_level(
 
     project.refinement_triggered = False
 
+    def _bind_current_adjoint_scorer(scorer_fn, trigger_name):
+        if scorer_fn is None:
+            return None
+
+        def _score_current_adjoint_design():
+            design_folder = getattr(
+                project,
+                "last_obj_grad_design_folder",
+                None,
+            )
+            if not design_folder:
+                detail = getattr(project, "last_obj_grad_design_error", "unknown")
+                raise RuntimeError(
+                    f"{trigger_name} cannot resolve the current adjoint "
+                    "to an exact DSN: "
+                    f"{detail}"
+                )
+            return scorer_fn(design_folder)
+
+        return _score_current_adjoint_design
+
+    project.batch_stability_scorer_fn = _bind_current_adjoint_scorer(
+        batch_stability_scorer_fn,
+        "BATCH_STABILITY",
+    )
+    project.trajectory_ready_scorer_fn = _bind_current_adjoint_scorer(
+        trajectory_ready_scorer_fn,
+        "TRAJECTORY_READY",
+    )
+    # Trigger CSV logs live in the level workdir (cwd at this point).
+    project.batch_stability_log_path = (
+        os.path.abspath("batch_stability_log.csv")
+        if batch_stability_scorer_fn is not None
+        else None
+    )
+    project.trajectory_ready_log_path = (
+        os.path.abspath("trajectory_ready_log.csv")
+        if trajectory_ready_scorer_fn is not None
+        else None
+    )
+
     if (
         progressive_hh_opts is not None
         and is_symmetric_reduced(progressive_hh_opts)
@@ -443,6 +621,11 @@ def run_single_level(
         SU2.opt.BFGS(project, x0, xb, its, accu)
     if optimization == "POWELL":
         SU2.opt.POWELL(project, x0, xb, its, accu)
+
+    # Project._eval saves before SLSQP's callback/final return.  Save once more
+    # so the accepted-iterate history and canonical optimizer result used by
+    # the level transition are also present in project.pkl.
+    project.save()
 
     if projectname:
         shutil.move("project.pkl", projectname)
@@ -529,6 +712,28 @@ def progressive_hh_shape_optimization(
             current_ndv=level.ndv,
         )
 
+        _hh_trigger_name = str(hh_opts.get("trigger", "")).upper()
+        _hh_batch_scorer_fn = (
+            _make_post_adjoint_probe(
+                level,
+                hh_opts,
+                _hh_scorer,
+                "BATCH_STABILITY",
+            )
+            if _hh_trigger_name == "BATCH_STABILITY"
+            else None
+        )
+        _hh_trajectory_scorer_fn = (
+            _make_post_adjoint_probe(
+                level,
+                hh_opts,
+                _hh_scorer,
+                "TRAJECTORY_READY",
+            )
+            if _hh_trigger_name == "TRAJECTORY_READY"
+            else None
+        )
+
         cwd = os.getcwd()
         try:
             os.chdir(level.workdir)
@@ -544,17 +749,14 @@ def progressive_hh_shape_optimization(
                 progressive_hh_opts=hh_opts,
                 thickness_constraint=thickness_constraint,
                 progressive_label="PROGRESSIVE_HH",
+                batch_stability_scorer_fn=_hh_batch_scorer_fn,
+                trajectory_ready_scorer_fn=_hh_trajectory_scorer_fn,
             )
         finally:
             os.chdir(cwd)
 
         final_project = level_project
-        result = collect_level_result(level)
-        result["dv_values"] = getattr(
-            project,
-            "opt_dv_values",
-            getattr(project, "last_dv_values", None),
-        )
+        result = collect_level_result(level, project=project)
 
         force_refine_after_spring = False
 
@@ -619,8 +821,35 @@ def progressive_hh_shape_optimization(
             sys.stdout.write(f"[PROGRESSIVE_HH] Reached maximum level {ilevel}\n")
             break
 
+        if str(hh_opts.get("refinement", "UNIFORM")).upper() == "ADAPTIVE":
+            refresh_adaptive_scoring_baseline(
+                project,
+                level,
+                result.get("dv_values"),
+                hh_opts,
+                label="PROGRESSIVE_HH",
+            )
+            result = collect_level_result(
+                level,
+                project=project,
+                require_adjoint=True,
+            )
+            manifest = write_ranking_design_manifest(
+                level.workdir,
+                result["accepted_design_dir"],
+                result["final_mesh"],
+                result["dv_values"],
+                result["ranking_objective"],
+            )
+            sys.stdout.write(
+                "[PROGRESSIVE_HH] Ranking anchor locked | "
+                f"design={result['accepted_design_folder']} "
+                f"manifest={manifest}\n"
+            )
+
         ndv_before_refine = level.ndv
         level = build_next_level(level, result, hh_opts)
+        _verify_trigger_batch_consistency(project, level, "PROGRESSIVE_HH")
         append_selection_history_csv(
             selection_history_csv,
             getattr(level, "selection_metadata", None),
@@ -731,6 +960,28 @@ def progressive_ffd_shape_optimization(
             current_ndv=level.ndv,
         )
 
+        _ffd_trigger_name = str(ffd_opts.get("trigger", "")).upper()
+        _ffd_batch_scorer_fn = (
+            _make_post_adjoint_probe(
+                level,
+                ffd_opts,
+                _ffd_scorer,
+                "BATCH_STABILITY",
+            )
+            if _ffd_trigger_name == "BATCH_STABILITY"
+            else None
+        )
+        _ffd_trajectory_scorer_fn = (
+            _make_post_adjoint_probe(
+                level,
+                ffd_opts,
+                _ffd_scorer,
+                "TRAJECTORY_READY",
+            )
+            if _ffd_trigger_name == "TRAJECTORY_READY"
+            else None
+        )
+
         cwd = os.getcwd()
         try:
             os.chdir(level.workdir)
@@ -746,17 +997,14 @@ def progressive_ffd_shape_optimization(
                 progressive_hh_opts=None,
                 thickness_constraint=thickness_constraint,
                 progressive_label="PROGRESSIVE_FFD",
+                batch_stability_scorer_fn=_ffd_batch_scorer_fn,
+                trajectory_ready_scorer_fn=_ffd_trajectory_scorer_fn,
             )
         finally:
             os.chdir(cwd)
 
         final_project = level_project
-        result = collect_level_result(level)
-        result["dv_values"] = getattr(
-            project,
-            "opt_dv_values",
-            getattr(project, "last_dv_values", None),
-        )
+        result = collect_level_result(level, project=project)
 
         force_refine_after_spring = False
 
@@ -822,17 +1070,34 @@ def progressive_ffd_shape_optimization(
             break
 
         if str(ffd_opts.get("refinement", "UNIFORM")).upper() == "ADAPTIVE":
-            refresh_ffd_scoring_baseline(
+            refresh_adaptive_scoring_baseline(
                 project,
                 level,
                 result.get("dv_values"),
                 ffd_opts,
+                label="PROGRESSIVE_FFD",
             )
-            refreshed_result = collect_level_result(level)
-            result.update(refreshed_result)
+            result = collect_level_result(
+                level,
+                project=project,
+                require_adjoint=True,
+            )
+            manifest = write_ranking_design_manifest(
+                level.workdir,
+                result["accepted_design_dir"],
+                result["final_mesh"],
+                result["dv_values"],
+                result["ranking_objective"],
+            )
+            sys.stdout.write(
+                "[PROGRESSIVE_FFD] Ranking anchor locked | "
+                f"design={result['accepted_design_folder']} "
+                f"manifest={manifest}\n"
+            )
 
         ndv_before_refine = level.ndv
         level = build_next_ffd_level(level, result, ffd_opts)
+        _verify_trigger_batch_consistency(project, level, "PROGRESSIVE_FFD")
         append_selection_history_csv(
             selection_history_csv,
             getattr(level, "selection_metadata", None),

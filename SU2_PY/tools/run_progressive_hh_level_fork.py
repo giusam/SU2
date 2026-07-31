@@ -105,7 +105,14 @@ def _source_result(level_dir, config_path, upper, lower):
         config_filename=os.path.basename(config_path),
         project_filename="project.pkl",
     )
-    return collect_level_result(source_level)
+    projects = sorted(Path(level_dir).glob("project*.pkl"))
+    if len(projects) != 1:
+        raise RuntimeError(
+            "Could not identify one source-level project pickle required to "
+            "resolve an accepted SLSQP design"
+        )
+    source_project = SU2.io.load_data(str(projects[0]))
+    return collect_level_result(source_level, project=source_project)
 
 
 def main(argv=None):
@@ -245,11 +252,8 @@ def main(argv=None):
         )
     finally:
         os.chdir(cwd)
-    result = collect_level_result(level)
-    dv_values = getattr(project, "opt_dv_values", None)
-    if dv_values is None:
-        dv_values = getattr(project, "last_dv_values", None)
-    result["dv_values"] = dv_values
+    result = collect_level_result(level, project=project)
+    dv_values = result["dv_values"]
     spring_level = None
     if (
         bool(opts.get("spring_enabled", False))

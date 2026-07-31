@@ -666,6 +666,14 @@ def get_progressive_ffd_options(config, hh_opts):
     scoring_mode = _normalize_ffd_scoring_mode(
         config.get("PROGRESSIVE_FFD_SCORING_MODE", FFD_SCORING_COMPONENT)
     )
+    if (
+        str(opts.get("trigger", "")).upper() == "TRAJECTORY_READY"
+        and scoring_mode != FFD_SCORING_VIRTUAL_TANGENT
+    ):
+        raise ValueError(
+            "PROGRESSIVE_HH_TRIGGER=TRAJECTORY_READY with FFD requires "
+            "PROGRESSIVE_FFD_SCORING_MODE=VIRTUAL_TANGENT"
+        )
     scoring_te_closure_node_eps = parse_te_closure_node_eps(
         config.get("PROGRESSIVE_FFD_SCORING_TE_CLOSURE_NODE_EPS", 0.0),
         "PROGRESSIVE_FFD_SCORING_TE_CLOSURE_NODE_EPS",

@@ -9,6 +9,13 @@ import shutil
 import SU2
 
 from SU2.opt.thickness_constraint import clean_progressive_thickness_keys
+from SU2.opt.progressive_design import (
+    direct_convergence_status,
+    find_design_mesh,
+    find_project_design,
+    require_objective_adjoint,
+    resolve_design_directory,
+)
 from SU2.opt.progressive_hh_core import (
     HHLevel,
     assert_symmetric_centers,
@@ -644,41 +651,171 @@ def _read_history_values(history_file):
     return history
 
 
-def _find_final_mesh(level):
-    design_deform = glob.glob(
-        os.path.join(level.workdir, "DESIGNS", "**", "*_deform.su2"),
-        recursive=True,
+def _objective_name(project):
+    value = project.config.get("OBJECTIVE_FUNCTION", "DRAG")
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else "DRAG"
+    return str(value).split(",", 1)[0].strip().upper()
+
+
+def _accepted_dv_candidates(project):
+    """Return candidate anchors newest-first, excluding objective-only trials."""
+
+    trigger_values = getattr(project, "refinement_dv_values", None)
+    if trigger_values is not None:
+        # Post-adjoint ranking triggers pin the transition to the exact sample
+        # that fired.  Rolling this case back would invalidate their metrics
+        # and saved batch.
+        return [[float(value) for value in trigger_values]], True
+
+    candidates = []
+    for values in getattr(project, "accepted_dv_history", []) or []:
+        try:
+            vector = [float(value) for value in values]
+        except (TypeError, ValueError):
+            continue
+        if not candidates or candidates[-1] != vector:
+            candidates.append(vector)
+
+    if not candidates:
+        for attribute in (
+            "opt_dv_values",
+            "last_accepted_dv_values",
+            "last_obj_grad_x_full",
+            "last_obj_grad_x",
+        ):
+            values = getattr(project, attribute, None)
+            if values is None:
+                continue
+            candidates.append([float(value) for value in values])
+            break
+
+    return list(reversed(candidates)), False
+
+
+def _select_accepted_converged_design(level, project):
+    candidates, pinned = _accepted_dv_candidates(project)
+    if not candidates:
+        raise RuntimeError(
+            "Progressive level ended without an accepted SLSQP design vector"
+        )
+
+    rejected = []
+    for index, values in enumerate(candidates):
+        try:
+            design = find_project_design(project, values)
+            design_dir = resolve_design_directory(level.workdir, design)
+        except Exception as exc:
+            rejected.append({"dv_values": values, "reason": str(exc)})
+            if pinned:
+                break
+            continue
+
+        converged, convergence_detail = direct_convergence_status(design_dir)
+        if not converged:
+            rejected.append(
+                {
+                    "dv_values": values,
+                    "design_dir": design_dir,
+                    "reason": convergence_detail,
+                }
+            )
+            if pinned:
+                break
+            continue
+
+        mesh = find_design_mesh(design_dir)
+        if index:
+            print(
+                "[PROGRESSIVE] Accepted-design rollback | "
+                f"skipped={index} selected={os.path.basename(design_dir)} "
+                f"reason=latest accepted DIRECT was not usable"
+            )
+        else:
+            print(
+                "[PROGRESSIVE] Accepted-design anchor | "
+                f"selected={os.path.basename(design_dir)}"
+            )
+        return {
+            "design": design,
+            "design_dir": design_dir,
+            "dv_values": values,
+            "mesh": mesh,
+            "direct_converged": True,
+            "convergence_detail": convergence_detail,
+            "rejected_accepted_designs": rejected,
+            "trigger_pinned": pinned,
+        }
+
+    detail = "; ".join(record.get("reason", "unknown") for record in rejected)
+    raise RuntimeError(
+        "No accepted SLSQP design has a verified converged DIRECT solution; "
+        f"refusing the progressive level transition ({detail})"
     )
-    if design_deform:
-        return sorted(design_deform)[-1]
-
-    design_all = glob.glob(
-        os.path.join(level.workdir, "DESIGNS", "**", "*.su2"),
-        recursive=True,
-    )
-    if design_all:
-        return sorted(design_all)[-1]
-
-    root_deform = glob.glob(os.path.join(level.workdir, "*_deform.su2"))
-    if root_deform:
-        return sorted(root_deform)[-1]
-
-    root_all = glob.glob(os.path.join(level.workdir, "*.su2"))
-    if root_all:
-        return sorted(root_all)[-1]
-
-    return None
 
 
-def collect_level_result(level):
+def _find_final_mesh(level, project=None, dv_values=None):
+    """Resolve only the mesh belonging to an accepted, converged SLSQP DSN."""
+
+    if project is None:
+        raise RuntimeError(
+            "_find_final_mesh now requires the SLSQP project; arbitrary DSN "
+            "selection is unsafe"
+        )
+    if dv_values is None:
+        selected = _select_accepted_converged_design(level, project)
+        return selected["mesh"]
+    design = find_project_design(project, dv_values)
+    design_dir = resolve_design_directory(level.workdir, design)
+    converged, detail = direct_convergence_status(design_dir)
+    if not converged:
+        raise RuntimeError(
+            f"Accepted SLSQP DSN is not DIRECT-converged: {design_dir} ({detail})"
+        )
+    return find_design_mesh(design_dir)
+
+
+def collect_level_result(level, project=None, require_adjoint=False):
+    """Collect a level result from one accepted and DIRECT-converged DSN.
+
+    Rejected line-search trials are absent from ``accepted_dv_history``.  When
+    the latest accepted iterate has a non-converged DIRECT solve, selection
+    rolls back to the latest earlier accepted/converged iterate.  A
+    A post-adjoint ranking-trigger transition is pinned and fails instead of
+    rolling back, because its decision was computed at that exact adjoint
+    snapshot.
+    """
+
+    if project is None:
+        raise RuntimeError(
+            "collect_level_result requires the optimization project so it can "
+            "distinguish accepted SLSQP iterates from line-search trials"
+        )
+
     history_file = _find_history_file(level)
     history = _read_history_values(history_file)
-    final_mesh = _find_final_mesh(level)
+    selected = _select_accepted_converged_design(level, project)
+    objective = _objective_name(project)
+    adjoint_dir = None
+    if require_adjoint:
+        adjoint_dir = require_objective_adjoint(
+            selected["design_dir"],
+            objective,
+        )
 
     return {
         "history": history,
         "history_file": history_file,
-        "final_mesh": final_mesh,
+        "final_mesh": selected["mesh"],
+        "dv_values": selected["dv_values"],
+        "accepted_design_dir": selected["design_dir"],
+        "accepted_design_folder": selected["design"].folder,
+        "direct_converged": selected["direct_converged"],
+        "direct_convergence_detail": selected["convergence_detail"],
+        "rejected_accepted_designs": selected["rejected_accepted_designs"],
+        "trigger_pinned": selected["trigger_pinned"],
+        "ranking_objective": objective,
+        "objective_adjoint_dir": adjoint_dir,
     }
 
 

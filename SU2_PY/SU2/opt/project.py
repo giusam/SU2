@@ -96,6 +96,14 @@ class Project(object):
     _design_folder = "DESIGNS/DSN_*"
     _design_number = "%03d"
 
+    def __getstate__(self):
+        """Exclude runtime-only progressive scorer closures from project.pkl."""
+
+        state = dict(self.__dict__)
+        state["batch_stability_scorer_fn"] = None
+        state["trajectory_ready_scorer_fn"] = None
+        return state
+
     def __init__(self, config, state=None, designs=None, folder=".", warn=True):
 
         folder = folder.rstrip("/") + "/"

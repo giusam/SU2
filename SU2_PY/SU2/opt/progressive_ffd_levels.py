@@ -28,6 +28,7 @@ from SU2.opt.progressive_hh_levels import (
     _remove_progressive_keys as _remove_hh_progressive_keys,
     _resolve_from_cfg_dir,
 )
+from SU2.opt.progressive_design import find_project_design
 
 
 def _remove_ffd_progressive_keys(cfg):
@@ -317,14 +318,20 @@ def build_ffd_spring_reallocated_level(prev_level, result, opts, reoptimize=True
     )
 
 
-def refresh_ffd_scoring_baseline(project, level, dv_values, opts):
-    """Materialize adjoint assets at the accepted design before exact scoring."""
+def refresh_adaptive_scoring_baseline(
+    project,
+    level,
+    dv_values,
+    opts,
+    label="PROGRESSIVE_FFD",
+):
+    """Materialize ranking adjoints at one accepted/converged design."""
 
     if str(opts.get("refinement", "UNIFORM")).upper() != "ADAPTIVE":
         return False
     if dv_values is None or len(dv_values) != level.ndv:
         raise RuntimeError(
-            "Cannot refresh the exact FFD scoring baseline: accepted DV values "
+            "Cannot refresh the adaptive scoring baseline: accepted DV values "
             f"have size {0 if dv_values is None else len(dv_values)}, "
             f"expected {level.ndv}"
         )
@@ -339,7 +346,7 @@ def refresh_ffd_scoring_baseline(project, level, dv_values, opts):
         )
 
     print(
-        "[PROGRESSIVE_FFD] Refreshing exact-scoring baseline at accepted DV"
+        f"[{label}] Refreshing ranking adjoints at accepted/converged DV"
         + (
             f" | max_gap_from_last_gradient={max_parameter_gap:.6e}"
             if max_parameter_gap is not None
@@ -359,13 +366,38 @@ def refresh_ffd_scoring_baseline(project, level, dv_values, opts):
     except Exception as exc:
         raise RuntimeError(
             "Failed to build objective/constraint adjoint assets at the "
-            "accepted FFD design before exact scoring"
+            "accepted/converged design before adaptive ranking"
         ) from exc
     finally:
         os.chdir(cwd)
 
-    project.last_obj_grad_x = list(dv_values)
+    symmetry = getattr(project, "progressive_hh_symmetry", None) or {}
+    if str(symmetry.get("mode", "NONE")).upper() == "REDUCED":
+        project.last_obj_grad_x_full = list(dv_values)
+    else:
+        project.last_obj_grad_x = list(dv_values)
+        project.last_obj_grad_x_full = list(dv_values)
+    if hasattr(project, "designs"):
+        try:
+            design = find_project_design(project, dv_values)
+        except Exception as exc:
+            raise RuntimeError(
+                "Adjoint refresh did not resolve to the accepted SLSQP DSN"
+            ) from exc
+        project.last_obj_grad_design_folder = design.folder
     return True
+
+
+def refresh_ffd_scoring_baseline(project, level, dv_values, opts):
+    """Backward-compatible FFD wrapper for the shared refresh operation."""
+
+    return refresh_adaptive_scoring_baseline(
+        project,
+        level,
+        dv_values,
+        opts,
+        label="PROGRESSIVE_FFD",
+    )
 
 
 def _ffd_mesh_basename(level):

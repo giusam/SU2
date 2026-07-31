@@ -313,12 +313,29 @@ def get_progressive_hh_options(config):
         "SLOPE_EFFICIENCY_BEST_LOG",
         "STAGNATION_TRIGGER",
         "ECONOMIC_TRIGGER",
+        "BATCH_STABILITY",
+        "TRAJECTORY_READY",
     )
     if trigger not in allowed_triggers:
         raise ValueError(
             "Invalid PROGRESSIVE_HH_TRIGGER "
             f"{trigger!r}; allowed values are {allowed_triggers}"
         )
+
+    if trigger == "TRAJECTORY_READY":
+        if refinement != "ADAPTIVE":
+            raise ValueError(
+                "PROGRESSIVE_HH_TRIGGER=TRAJECTORY_READY requires "
+                "PROGRESSIVE_HH_REFINEMENT=ADAPTIVE"
+            )
+        if (
+            param_kind == "HICKS_HENNE"
+            and scoring_mode != HH_VIRTUAL_TANGENT
+        ):
+            raise ValueError(
+                "PROGRESSIVE_HH_TRIGGER=TRAJECTORY_READY requires "
+                "PROGRESSIVE_HH_SCORING_MODE=VIRTUAL_TANGENT"
+            )
 
     allowed_symmetry_modes = ("NONE", "REDUCED")
     if symmetry_mode not in allowed_symmetry_modes:
